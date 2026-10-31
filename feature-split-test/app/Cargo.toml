@@ -1,0 +1,14 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[dependencies]
+fake-cosmic = { path = "../fake-cosmic", default-features = false, features = ["wgpu"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fake-cosmic = { path = "../fake-cosmic", default-features = false, features = ["wayland"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+fake-cosmic = { path = "../fake-cosmic", default-features = false, features = ["winit"] }
