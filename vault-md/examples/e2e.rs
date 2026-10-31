@@ -1,5 +1,5 @@
-use acrylic_notes::inline::{extract, lower_text};
 use comrak::{nodes::NodeValue, parse_document, Arena, Options};
+use vault_md::inline::{extract, lower_text};
 fn main() {
     for src in [
         "[[a *b* c]] and [[Note|*alias*]]",

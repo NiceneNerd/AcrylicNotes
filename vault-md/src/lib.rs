@@ -1,15 +1,12 @@
-//! `vault-md` — Markdown pipeline: comrak + Obsidian extensions -> IR -> HTML.
+//! `vault-md` — Markdown pipeline: comrak parse + Obsidian extensions -> IR.
+//!
+//! The IR (`ir.rs`) is the contract between frontends: an IR-to-HTML renderer
+//! (web) and an IR-to-widgets renderer (GUI) both consume `Doc`.
+//!
+//! Modules:
+//! * `ir` — the document/inline model.
+//! * `inline` — pre-comrak extraction of Obsidian syntax (sentinel pass) and
+//!   lowering of comrak text nodes back into IR inlines.
 
-pub mod ir {
-    pub use vault_core::ir::*;
-}
-
-pub mod inline {
-    pub use vault_core::inline::*;
-}
-
-// Re-export vault-core types
-pub use vault_core::{
-    atomic_write, atomic_write_raw, FrontmatterMeta, Heading, Note, SplitFrontmatter, Vault,
-    VaultIndex, WriteError, WriteResult,
-};
+pub mod inline;
+pub mod ir;

@@ -7,10 +7,10 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::SystemTime;
 
-use crate::frontmatter::{split_frontmatter, SplitFrontmatter};
+use crate::frontmatter::split_frontmatter;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -38,7 +38,7 @@ pub fn atomic_write(
     let split = split_frontmatter(original);
 
     // Detect external modification.
-    if let Ok(meta) = fs::metadata(path) {
+    if fs::metadata(path).is_ok() {
         let current = fs::read_to_string(path)?;
         if current != original {
             return Err(WriteError::ExternallyModified);

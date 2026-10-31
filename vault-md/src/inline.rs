@@ -5,6 +5,12 @@
 //! replaced by an opaque sentinel so comrak can't split it (e.g. `[[a *b* c]]`).
 //! Stage 2 (`lower_text`): runs on comrak Text nodes. Swaps sentinels back to
 //! IR inlines and recognizes `#tags`.
+//!
+//! For whole documents prefer [`extract_document`], which splits YAML
+//! frontmatter off FIRST so properties like `related: "[[Note]]"` are never
+//! scanned for links (HANDOFF 4.3: definite gap).
+use vault_core::split_frontmatter;
+
 use crate::ir::*;
 
 const OPEN: char = '\u{E000}';
@@ -22,11 +28,40 @@ pub struct Extracted {
     pub tokens: Vec<Token>,
 }
 
+/// Result of [`extract_document`]: frontmatter bytes verbatim plus the
+/// extraction of the body only.
+#[derive(Debug)]
+pub struct ExtractedDoc {
+    /// Full frontmatter block including delimiters, byte-for-byte, or `None`.
+    pub frontmatter_raw: Option<String>,
+    pub extracted: Extracted,
+}
+
+/// Extract links/embeds from a full document, frontmatter excluded.
+pub fn extract_document(src: &str) -> ExtractedDoc {
+    let split = split_frontmatter(src);
+    let extracted = extract(&split.body);
+    ExtractedDoc {
+        frontmatter_raw: split.raw,
+        extracted,
+    }
+}
+
 pub fn extract(src: &str) -> Extracted {
     let chars: Vec<char> = src.chars().filter(|c| *c != OPEN && *c != CLOSE).collect();
+    let code_mask = indented_code_mask(&chars);
     let (mut out, mut tokens) = (String::new(), Vec::new());
     let (mut i, mut at_line_start) = (0, true);
     while i < chars.len() {
+        // top-level indented code block: copy verbatim (HANDOFF 4.3: definite
+        // gap — wikilinks inside indented code must not become tokens)
+        if code_mask[i] {
+            let c = chars[i];
+            out.push(c);
+            at_line_start = c == '\n';
+            i += 1;
+            continue;
+        }
         // fenced code block: copy verbatim through the closing fence
         if at_line_start {
             if let Some((fc, flen)) = fence_at(&chars, i) {
@@ -136,9 +171,7 @@ fn is_tag_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | '-' | '/')
 }
 fn tag_boundary(prev: Option<&char>) -> bool {
-    prev.map_or(true, |p| {
-        !(p.is_alphanumeric() || matches!(p, '_' | '-' | '/' | '#'))
-    })
+    prev.is_none_or(|p| !(p.is_alphanumeric() || matches!(p, '_' | '-' | '/' | '#')))
 }
 
 pub fn parse_target(s: &str) -> WikiTarget {
@@ -278,6 +311,52 @@ fn fence_end(c: &[char], start: usize, fc: char, flen: usize) -> usize {
     c.len()
 }
 
+/// Per-char mask of top-level indented code blocks (CommonMark): a block can
+/// only start after a blank line (indent >= 4 spaces or a tab cannot interrupt
+/// a paragraph) and continues while lines are blank or indented >= 4.
+///
+/// KNOWN LIMITATION (HANDOFF 4.3): list-item continuation is not modeled, so
+/// a 4-space-indented line inside a list item after a blank line is treated
+/// as top-level indented code. Whether Obsidian agrees must be confirmed in
+/// M3 against a real vault before this is relied on.
+fn indented_code_mask(chars: &[char]) -> Vec<bool> {
+    let mut mask = vec![false; chars.len()];
+    let (mut prev_blank, mut in_code) = (true, false);
+    let mut i = 0;
+    while i < chars.len() {
+        let start = i;
+        while i < chars.len() && chars[i] != '\n' {
+            i += 1;
+        }
+        let has_nl = i < chars.len();
+        let line = &chars[start..i];
+        let indent = line.iter().take_while(|&&c| c == ' ').count();
+        let blank = line.iter().all(|&c| c == ' ' || c == '\t' || c == '\r');
+        let indented = indent >= 4 || line.first() == Some(&'\t');
+        let is_code_line = if in_code {
+            blank || indented
+        } else {
+            prev_blank && !blank && indented
+        };
+        if is_code_line {
+            in_code = true;
+            for slot in mask.iter_mut().take(i).skip(start) {
+                *slot = true;
+            }
+            if has_nl {
+                mask[i] = true;
+            }
+        } else {
+            in_code = false;
+        }
+        prev_blank = blank;
+        if has_nl {
+            i += 1;
+        }
+    }
+    mask
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +420,41 @@ mod tests {
     fn comments_dropped_unterminated_kept() {
         assert_eq!(extract("a %%hidden [[x]]%% b").tokens.len(), 0);
         assert_eq!(extract("a %%hidden b").text, "a %%hidden b");
+    }
+
+    #[test]
+    fn indented_code_is_untouched() {
+        // HANDOFF 4.3 definite gap: 4-space indented block after a blank line.
+        let e = extract("para\n\n    [[in-code]]\n");
+        assert_eq!(e.tokens.len(), 0);
+        assert!(e.text.contains("[[in-code]]"));
+        // tab-indented too
+        assert_eq!(extract("\t[[in-code]]\n").tokens.len(), 0);
+        // 4-space indent cannot interrupt a paragraph: still code-skipped? No —
+        // it is a lazy continuation, so the link is real text there.
+        let e2 = extract("para\n    [[lazy]]\n");
+        assert_eq!(e2.tokens.len(), 1);
+        // blank line inside the block keeps it code
+        let e3 = extract("a\n\n    [[x]]\n\n    [[y]]\n\n[[z]]");
+        assert_eq!(e3.tokens.len(), 1);
+    }
+
+    #[test]
+    fn frontmatter_is_never_scanned() {
+        // HANDOFF 4.3 definite gap: Obsidian properties often hold quoted
+        // "[[Note]]"; extraction must run on the body only.
+        let src = "---\nrelated: \"[[Note]]\"\ntags: a\n---\nbody [[Real]]\n";
+        let doc = extract_document(src);
+        assert_eq!(doc.extracted.tokens.len(), 1);
+        assert!(matches!(doc.extracted.tokens[0], Token::Wiki(_)));
+        assert_eq!(
+            doc.frontmatter_raw.as_deref(),
+            Some("---\nrelated: \"[[Note]]\"\ntags: a\n---\n")
+        );
+        // no frontmatter: raw is None, extraction still works
+        let doc2 = extract_document("[[X]]");
+        assert!(doc2.frontmatter_raw.is_none());
+        assert_eq!(doc2.extracted.tokens.len(), 1);
     }
 
     #[test]

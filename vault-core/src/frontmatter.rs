@@ -25,6 +25,9 @@ pub struct SplitFrontmatter {
 /// Metadata extracted from frontmatter YAML.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FrontmatterMeta {
+    /// Note title (`title:` field), if present.
+    #[serde(default)]
+    pub title: Option<String>,
     /// Tags as a list of strings (Obsidian `tags: [a, b]` or `tags: a`).
     #[serde(default, deserialize_with = "deserialize_tags")]
     pub tags: Vec<String>,
@@ -129,8 +132,13 @@ fn skip_line(bytes: &[u8], mut pos: usize) -> usize {
 /// Returns `None` if the YAML is invalid or not a mapping.
 pub fn parse_frontmatter_meta(content: &str) -> Result<FrontmatterMeta, FrontmatterError> {
     let mapping: Mapping = serde_norway::from_str(content)?;
-    let mut meta = FrontmatterMeta::default();
-
+    let mut meta = FrontmatterMeta {
+        title: mapping
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        ..Default::default()
+    };
     // tags
     if let Some(val) = mapping.get("tags") {
         meta.tags = deserialize_tags_value(val)?;

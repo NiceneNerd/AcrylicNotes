@@ -3,38 +3,65 @@
 //! ASSUMPTIONS to confirm against real Obsidian with a test vault:
 //!   * ambiguous basename tie-break (proximity to the linking note)
 //!   * aliases do NOT resolve links (they feed autocomplete / unlinked mentions)
+//!   * non-`.md` targets require their extension (`[[cat]]` does not find
+//!     `cat.png` — unconfirmed)
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
-use std::sync::Arc;
+
+use unicode_normalization::UnicodeNormalization;
 
 /// In-memory index of vault files for link resolution.
 #[derive(Debug, Clone)]
 pub struct VaultIndex {
     files: Vec<String>,
-    // Maps lowercased stem -> list of indices into `files`
-    by_stem: HashMap<String, Vec<usize>>,
 }
 
 impl VaultIndex {
     /// Create an index from an iterator of vault-relative paths (using '/' separators).
     pub fn new(files: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        let files: Vec<String> = files.into_iter().map(Into::into).collect();
-        let mut by_stem: HashMap<String, Vec<usize>> = HashMap::new();
-        for (idx, f) in files.iter().enumerate() {
-            let stem = Self::stem(f);
-            by_stem.entry(stem).or_default().push(idx);
+        Self {
+            files: files.into_iter().map(Into::into).collect(),
         }
-        Self { files, by_stem }
     }
 
+    /// Matching key: strip `.md`, Unicode NFC-normalize, case-fold.
+    /// NFC handles macOS filenames stored NFD; lowercase handles
+    /// case-insensitive matching.
     fn stem(p: &str) -> String {
-        p.strip_suffix(".md").unwrap_or(p).to_lowercase()
+        p.strip_suffix(".md")
+            .unwrap_or(p)
+            .nfc()
+            .collect::<String>()
+            .to_lowercase()
     }
 
     /// All files a target could mean, best first.
     pub fn candidates(&self, target: &str, from: &str) -> Vec<&str> {
         let t = target.trim().trim_start_matches('/');
+
+        // Relative targets (`../x`, `./x`): resolve against the source note's
+        // folder, then require an exact (NFC, case-folded) match. Wikilinks to
+        // notes omit `.md`, so try both with and without the extension.
+        // ASSUMPTION (confirm in M3): no basename fallback when the relative
+        // path does not resolve; `..` beyond the root clamps at the root.
+        if t.split('/').any(|c| c == "." || c == "..") {
+            let from_dir = from.rsplit_once('/').map_or("", |(d, _)| d);
+            let joined = normalize_rel(&format!("{from_dir}/{t}"));
+            for cand in [joined.clone(), format!("{joined}.md")] {
+                let key = Self::stem(&cand);
+                let hits: Vec<&str> = self
+                    .files
+                    .iter()
+                    .filter(|f| Self::stem(f) == key)
+                    .map(|s| s.as_str())
+                    .collect();
+                if !hits.is_empty() {
+                    return hits;
+                }
+            }
+            return Vec::new();
+        }
+
         let t = Self::stem(t);
         if t.is_empty() {
             return self
@@ -84,6 +111,22 @@ fn common_dirs(file: &str, dir: &str) -> usize {
         .zip(dir.split('/'))
         .take_while(|(a, b)| a == b && !a.is_empty())
         .count()
+}
+
+/// Lexically normalize a '/'-separated path: drop empty and `.` components,
+/// resolve `..` against the previous component (clamped at the root).
+fn normalize_rel(p: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for c in p.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
 }
 
 #[cfg(test)]
@@ -141,5 +184,48 @@ mod tests {
         let i = idx();
         assert_eq!(i.resolve("Nope", "x.md"), None);
         assert_eq!(i.resolve("", "Notes/Rust.md"), Some("Notes/Rust.md"));
+    }
+
+    #[test]
+    fn unicode_nfc_and_casefold_matching() {
+        // A filename stored NFD (as macOS may present it) matches an NFC query.
+        let nfd_name = "Cafe\u{0301}.md"; // Café decomposed
+        let i = VaultIndex::new([nfd_name]);
+        assert_eq!(i.resolve("Caf\u{e9}", "x.md"), Some(nfd_name)); // composed query
+        assert_eq!(i.resolve("caf\u{e9}", "x.md"), Some(nfd_name)); // case-folded
+    }
+
+    #[test]
+    fn relative_targets_resolve_against_source_folder() {
+        // Forms observed in the user's real vault (192 `../` wikilinks).
+        let i = VaultIndex::new([
+            "Creans/Teretz/posts/nations.md",
+            "Creans/Teretz/media/meim.png",
+            "Creans/Substack/Like Father, Like Son.md",
+            "Journal/2026/10/d.md",
+        ]);
+        // attachment with extension, one level up
+        assert_eq!(
+            i.resolve("../media/meim.png", "Creans/Teretz/posts/nations.md"),
+            Some("Creans/Teretz/media/meim.png")
+        );
+        // note without extension, several levels up
+        assert_eq!(
+            i.resolve(
+                "../../../Creans/Substack/Like Father, Like Son",
+                "Journal/2026/10/d.md"
+            ),
+            Some("Creans/Substack/Like Father, Like Son.md")
+        );
+        // `..` beyond the root clamps at the root (assumption)
+        assert_eq!(
+            i.resolve("../../nope/../../Journal/2026/10/d", "x.md"),
+            Some("Journal/2026/10/d.md")
+        );
+        // a relative path that matches nothing stays unresolved
+        assert_eq!(
+            i.resolve("../missing", "Creans/Teretz/posts/nations.md"),
+            None
+        );
     }
 }
