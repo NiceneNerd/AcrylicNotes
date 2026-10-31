@@ -1,8 +1,17 @@
-# Cross-compilation settings. xargo/cargo-xargo is gone (removed from
-# crates.io; the archived japaric/xargo no longer compiles on Rust 1.95), and
-# rustup's precompiled std has taken over its job: `rustup target add
-# x86_64-pc-windows-gnu` + this linker config is the modern equivalent.
+# Windows cross-compilation.
+#
+# Primary tool: `cross` (cargo install cross), which supplies its own
+# mingw linker and runs tests under Wine inside a Docker container:
+#   cross check --target x86_64-pc-windows-gnu -p vault-core -p vault-md
+#   cross test  --target x86_64-pc-windows-gnu -p vault-core -p vault-md
+# (cross's container env overrides the linker/runner below.)
+#
+# The settings below are the no-Docker fallback on this machine, where
+# gcc-mingw-w64-x86-64 and wine are installed directly:
+#   cargo test --target x86_64-pc-windows-gnu -p vault-core -p vault-md
+# (xargo/cargo-xargo was considered first but is dead: removed from
+# crates.io and the archived japaric/xargo no longer compiles on Rust 1.95;
+# rustup's precompiled std has taken over its job.)
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
-# Run the Windows test binaries under Wine on a Linux host.
 runner = "wine"

@@ -73,9 +73,13 @@ either verified by a test or still unimplemented.
 
 ## Windows / macOS status (M0-M2)
 
-- **Windows:** cross-compiled with `x86_64-pc-windows-gnu`; all 53 vault-core
-  and vault-md unit tests RUN and PASS under Wine (2026-10-31). Caveat: Wine
-  is not real Windows. libcosmic itself does not compile for Windows yet
-  (fails in upstream `accesskit_winit`, E0782) — the GUI remains unbuildable
-  there.
+- **Windows:** cross-compiled with [`cross`](https://github.com/cross-rs/cross)
+  (Docker container, `:main` windows-gnu image — the 0.2.5 default image's
+  binutils rejects modern rustc `.drectve` directives). **71 vault-core +
+  vault-md tests, including the golden suite, run and PASS under Wine in the
+  container** (2026-10-31). Caveat: Wine is not real Windows.
+  libcosmic itself does not compile for Windows yet — fails in upstream
+  `accesskit_winit` (E0782, pre-2021 `&Trait` argument syntax) on both the
+  host mingw toolchain and cross's container toolchain — so the GUI remains
+  unbuildable there until that pin is updated.
 - **macOS:** untested — no machine, no SDK for cross-compilation.
