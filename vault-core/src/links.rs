@@ -8,15 +8,29 @@
 //!
 //! ASSUMPTIONS to confirm against real Obsidian in M3 (HANDOFF 4.3):
 //! * block-ID character set and placement rules,
-//! * whether tags inside headings count,
-//! * same-document links (`[[#Heading]]`) are skipped here (they are not
-//!   vault-level backlink edges).
+//! * whether tags immediately after `(` count (we say yes, matching the
+//!   not-mid-word rule; link DESTINATIONS are excluded, which the user
+//!   confirmed matches their vault's tag pane),
+//! * same-document links (`[[#Heading]]`, `(#anchor)`) are skipped (they are
+//!   not vault-level backlink edges).
 
-/// A wikilink or embed target as written (note part only, before `#`/`|`).
+/// How a link was written; decides how it resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    /// `[[Note]]` — resolves by Obsidian's shortest-unique-name rules.
+    Wiki,
+    /// `[text](path)` — resolves relative to the note's folder.
+    Markdown,
+}
+
+/// A wikilink/embed target as written (note part only, before `#`/`|`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawLink {
     pub embed: bool,
-    /// Note target as written; empty for same-document links (`[[#Heading]]`).
+    pub kind: LinkKind,
+    /// Wiki: note target as written; empty for same-document (`[[#Heading]]`).
+    /// Markdown: percent-decoded vault-relative path. External URLs and pure
+    /// `#anchors` are not reported at all.
     pub target: String,
 }
 
@@ -47,6 +61,7 @@ pub fn scan_links(body: &str) -> Vec<RawLink> {
                 if !target.is_empty() {
                     links.push(RawLink {
                         embed,
+                        kind: LinkKind::Wiki,
                         target: target.to_string(),
                     });
                 }
@@ -59,18 +74,144 @@ pub fn scan_links(body: &str) -> Vec<RawLink> {
     links
 }
 
+/// Scan a note body for standard Markdown links and images, skipping code.
+/// Only vault-internal targets are returned: external schemes (`http(s):`,
+/// `mailto:`, `obsidian://`, …) and pure `#anchors` are skipped, and
+/// percent-escapes are decoded so `[x](My%20Note.md)` resolves.
+pub fn scan_md_links(body: &str) -> Vec<RawLink> {
+    let mut links = Vec::new();
+    for line in non_code_lines(body) {
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] != '[' {
+                i += 1;
+                continue;
+            }
+            let embed = i > 0 && chars[i - 1] == '!';
+            // link text: to the matching `]`, counting nested brackets
+            let Some(text_end) = matching_bracket(&chars, i) else {
+                i += 1;
+                continue;
+            };
+            // inline links only: `](` — reference links `[x][y]` have no target here
+            if chars.get(text_end + 1) != Some(&'(') {
+                i = text_end + 1;
+                continue;
+            }
+            let Some(close) = balanced_parens(&chars, text_end + 1) else {
+                i = text_end + 1;
+                continue;
+            };
+            let raw_dest: String = chars[text_end + 2..close].iter().collect();
+            let dest = raw_dest.trim();
+            if !is_external(dest) {
+                links.push(RawLink {
+                    embed,
+                    kind: LinkKind::Markdown,
+                    target: percent_decode(dest),
+                });
+            }
+            i = close + 1;
+        }
+    }
+    links
+}
+
+/// The index of the `]` matching the `[` at `start` (nested brackets allowed).
+fn matching_bracket(chars: &[char], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, &c) in chars.iter().enumerate().skip(start) {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Given the index of `(`, the index of its matching `)` (balanced).
+fn balanced_parens(chars: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, &c) in chars.iter().enumerate().skip(open) {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Schemes that are not vault paths. A leading `#` is a same-document anchor.
+fn is_external(dest: &str) -> bool {
+    let lower = dest.to_ascii_lowercase();
+    lower.starts_with('#')
+        || [
+            "http://",
+            "https://",
+            "mailto:",
+            "obsidian://",
+            "file://",
+            "www.",
+        ]
+        .iter()
+        .any(|s| lower.starts_with(s))
+}
+
+/// Minimal percent-decoding for link destinations (`%20` → space).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 3 <= bytes.len() {
+            if let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Scan a note body for inline `#tags` (frontmatter tags live in
-/// [`crate::FrontmatterMeta`]). Skips fenced code and inline code.
+/// [`crate::FrontmatterMeta`]). Skips fenced code, inline code, and Markdown
+/// link destinations — `[fn](#footnote-3)` is a URL fragment, not a tag
+/// (user-confirmed against the real vault's tag pane).
 ///
 /// Tag rules from Obsidian's docs: letters, digits, `_ - /`, at least one
 /// non-digit; must start at a word boundary; trailing `/` trimmed.
-/// Boundary behavior (`foo#bar`) is ASSUMED (HANDOFF 4.3).
 pub fn scan_tags(body: &str) -> Vec<String> {
     let mut tags = Vec::new();
     for line in non_code_lines(body) {
+        let line = blank_html_attr_values(&blank_md_destinations(&line));
         let chars: Vec<char> = line.chars().collect();
         for (i, &c) in chars.iter().enumerate() {
-            if c != '#' || !tag_boundary(chars.get(i.wrapping_sub(1)).filter(|_| i > 0)) {
+            if c != '#' {
+                continue;
+            }
+            // `\#tag` is an escaped hash, not a tag.
+            if i > 0 && chars[i - 1] == '\\' {
+                continue;
+            }
+            if !tag_boundary(chars.get(i.wrapping_sub(1)).filter(|_| i > 0)) {
                 continue;
             }
             let body: String = chars[i + 1..]
@@ -132,6 +273,68 @@ pub fn scan_block_ids(body: &str) -> Vec<String> {
     out
 }
 
+/// Blank quoted attribute values inside HTML tags (`<a href="#fn1">` →
+/// `<a href="     ">`) so URL fragments in raw HTML are never scanned as
+/// tags. Comments are skipped wholesale.
+fn blank_html_attr_values(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = chars.clone();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '<' {
+            i += 1;
+            continue;
+        }
+        // skip comments
+        if chars[i..].starts_with(&['<', '!', '-', '-']) {
+            match find_seq(&chars, i + 4, &['-', '-', '>']) {
+                Some(end) => {
+                    i = end + 3;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        // an HTML tag: scan to '>', blanking quoted values
+        if chars
+            .get(i + 1)
+            .is_some_and(|c| c.is_ascii_alphabetic() || *c == '/')
+        {
+            let (mut j, mut quote, mut quote_start) = (i + 1, None, 0);
+            while j < chars.len() {
+                let c = chars[j];
+                match quote {
+                    Some(q) => {
+                        if c == q {
+                            for slot in out.iter_mut().take(j).skip(quote_start) {
+                                *slot = ' ';
+                            }
+                            quote = None;
+                        }
+                    }
+                    None => match c {
+                        '>' => break,
+                        '"' | '\'' => {
+                            quote = Some(c);
+                            quote_start = j + 1;
+                        }
+                        _ => {}
+                    },
+                }
+                j += 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out.into_iter().collect()
+}
+
+fn find_seq(chars: &[char], from: usize, seq: &[char]) -> Option<usize> {
+    (from..chars.len().saturating_sub(seq.len() - 1)).find(|&i| chars[i..i + seq.len()] == *seq)
+}
+
 fn is_tag_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | '-' | '/')
 }
@@ -167,6 +370,37 @@ fn non_code_lines(body: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Blank the destinations of inline Markdown links/images (`[text](dest)` →
+/// `[text]      `), preserving character positions. Wikilinks are untouched.
+fn blank_md_destinations(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = chars.clone();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '[' {
+            i += 1;
+            continue;
+        }
+        let Some(text_end) = matching_bracket(&chars, i) else {
+            i += 1;
+            continue;
+        };
+        if chars.get(text_end + 1) != Some(&'(') {
+            i = text_end + 1;
+            continue;
+        }
+        let Some(close) = balanced_parens(&chars, text_end + 1) else {
+            i = text_end + 1;
+            continue;
+        };
+        for slot in out.iter_mut().take(close).skip(text_end + 2) {
+            *slot = ' ';
+        }
+        i = close + 1;
+    }
+    out.into_iter().collect()
 }
 
 /// Whether the line (after <=3 leading spaces... simplified: any leading
@@ -225,24 +459,22 @@ fn blank_inline_code(line: &str) -> String {
 mod tests {
     use super::*;
 
+    fn targets(links: &[RawLink]) -> Vec<(&str, LinkKind, bool)> {
+        links
+            .iter()
+            .map(|l| (l.target.as_str(), l.kind, l.embed))
+            .collect()
+    }
+
     #[test]
     fn links_basic_and_embeds() {
         let links = scan_links("see [[Note]] and [[Other|alias]] and ![[img.png|300]]\n");
         assert_eq!(
-            links,
+            targets(&links),
             [
-                RawLink {
-                    embed: false,
-                    target: "Note".into()
-                },
-                RawLink {
-                    embed: false,
-                    target: "Other".into()
-                },
-                RawLink {
-                    embed: true,
-                    target: "img.png".into()
-                },
+                ("Note", LinkKind::Wiki, false),
+                ("Other", LinkKind::Wiki, false),
+                ("img.png", LinkKind::Wiki, true),
             ]
         );
     }
@@ -259,6 +491,44 @@ mod tests {
         let src = "`[[no]]` and\n```\n[[no]]\n```\nbut [[yes]]";
         let targets: Vec<String> = scan_links(src).into_iter().map(|l| l.target).collect();
         assert_eq!(targets, ["yes"]);
+    }
+
+    #[test]
+    fn markdown_links_internal_only_and_decoded() {
+        let links = scan_md_links(
+            "[text](Note.md) ![img](../media/my%20pic.png)\n[web](https://x.co/a#f) [anchor](#s) [ref][1]",
+        );
+        assert_eq!(
+            targets(&links),
+            [
+                ("Note.md", LinkKind::Markdown, false),
+                ("../media/my pic.png", LinkKind::Markdown, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_link_with_parens_and_nested_brackets() {
+        let links = scan_md_links("[[wiki]] then [deep [x] link](a(b)c.md)\n");
+        assert_eq!(targets(&links), [("a(b)c.md", LinkKind::Markdown, false)]);
+    }
+
+    #[test]
+    fn tags_exclude_link_destinations() {
+        // The real-vault false positive: 114 `](#anchor)` destinations.
+        assert!(scan_tags("[fn](#footnote-3) and [[*]](#fm1)\n").is_empty());
+        // HTML href attributes too (`<a href="#fn1">`)
+        assert!(scan_tags("<a href=\"#fn1\">[*]</a> prose\n").is_empty());
+        // but visible text keeps its tags
+        assert_eq!(scan_tags("[see #tag here](x.md)\n"), ["tag"]);
+        assert_eq!(scan_tags("<a href=\"#x\">[see #tag]</a>\n"), ["tag"]);
+    }
+
+    #[test]
+    fn escaped_hash_is_not_a_tag() {
+        // The real vault: `\#ActuallyAutistic` is escaped prose.
+        assert!(scan_tags("many \\#ActuallyAutistic activists\n").is_empty());
+        assert_eq!(scan_tags("escaped \\#no but real #yes\n"), ["yes"]);
     }
 
     #[test]

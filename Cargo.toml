@@ -6,3 +6,11 @@ members = [
     "vault-md",
     "app",
 ]
+# `app` depends on libcosmic via a path dependency outside this repository
+# (/cella/Git/libcosmic), so the default commands build/test the UI-free
+# layers only. Use `--workspace` explicitly where libcosmic is available.
+default-members = [
+    "vault-glass",
+    "vault-core",
+    "vault-md",
+]

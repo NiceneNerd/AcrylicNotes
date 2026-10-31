@@ -12,8 +12,11 @@ use thiserror::Error;
 use walkdir::WalkDir;
 
 use crate::frontmatter::{parse_frontmatter_meta, split_frontmatter, FrontmatterMeta};
-use crate::links::{scan_block_ids, scan_headings, scan_links, scan_tags};
+use crate::links::{
+    scan_block_ids, scan_headings, scan_links, scan_md_links, scan_tags, LinkKind, RawLink,
+};
 use crate::resolve::VaultIndex;
+use crate::write::{atomic_write, WriteResult};
 
 /// A note file in the vault.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,8 +41,9 @@ pub struct Note {
     pub headings: Vec<Heading>,
     /// Block IDs (`^id` at block end).
     pub block_ids: Vec<String>,
-    /// Outgoing link/embed note targets as written (before `#`/`|`).
-    pub outgoing_links: Vec<String>,
+    /// Outgoing links and embeds (wikilinks and internal Markdown links),
+    /// with the kind that decides how each resolves.
+    pub outgoing_links: Vec<RawLink>,
 }
 
 /// A heading in a note.
@@ -216,10 +220,16 @@ impl Vault {
         self.backlinks.clear();
         let mut edges: Vec<(String, String)> = Vec::new();
         for (path, note) in &self.notes {
-            for target in &note.outgoing_links {
+            for link in &note.outgoing_links {
                 // Backlinks follow RESOLVED targets, not raw link text.
-                if let Some(resolved) = index.resolve(target, path) {
-                    edges.push((resolved.to_string(), path.clone()));
+                // Wikilinks use shortest-unique-name; Markdown links are
+                // always relative to the note's folder.
+                let resolved = match link.kind {
+                    LinkKind::Wiki => index.resolve(&link.target, path),
+                    LinkKind::Markdown => index.resolve_relative(&link.target, path),
+                };
+                if let Some(target) = resolved {
+                    edges.push((target.to_string(), path.clone()));
                 }
             }
         }
@@ -304,6 +314,39 @@ impl Vault {
             .insert(path.to_string());
     }
 
+    /// Save a note through the safe write path and refresh its index entry.
+    ///
+    /// `original` must be the note content as the caller last saw it (external
+    /// changes are refused); `new_body` replaces the body verbatim. The write
+    /// is bracketed with the watcher suppression so our own save does not read
+    /// back as an external change.
+    pub fn save_note(
+        &mut self,
+        path: &str,
+        original: &str,
+        new_body: &str,
+    ) -> Result<WriteResult, VaultError> {
+        // HANDOFF section 2: never write into dot-directories (`.obsidian/`).
+        // This guard comes first: protecting the vault beats path-shape rules.
+        if is_ignored(path) {
+            return Err(VaultError::ProtectedPath(path.to_string()));
+        }
+        if !path.ends_with(".md") {
+            return Err(VaultError::NotANote(path.to_string()));
+        }
+        self.mark_pending_write(path);
+        match atomic_write(&self.root.join(path), original, new_body) {
+            Ok(result) => {
+                self.reload(&[path.to_string()])?;
+                Ok(result)
+            }
+            Err(e) => {
+                self.unmark_pending_write(path);
+                Err(e.into())
+            }
+        }
+    }
+
     /// Unregister a pending write.
     pub fn unmark_pending_write(&self, path: &str) {
         self.pending_writes.write().unwrap().remove(path);
@@ -360,11 +403,8 @@ impl Note {
                 id: None,
             })
             .collect();
-        let outgoing_links = scan_links(&split.body)
-            .into_iter()
-            .map(|l| l.target)
-            .filter(|t| !t.is_empty())
-            .collect();
+        let mut outgoing_links = scan_links(&split.body);
+        outgoing_links.extend(scan_md_links(&split.body));
 
         Ok(Note {
             path: rel.to_string(),
@@ -402,6 +442,12 @@ pub enum VaultError {
     Frontmatter(#[from] crate::frontmatter::FrontmatterError),
     #[error("Path strip prefix error: {0}")]
     StripPrefix(#[from] std::path::StripPrefixError),
+    #[error("write error: {0}")]
+    Write(#[from] crate::write::WriteError),
+    #[error("not a note path: {0}")]
+    NotANote(String),
+    #[error("refusing to write protected path: {0}")]
+    ProtectedPath(String),
 }
 
 #[cfg(test)]
@@ -451,7 +497,21 @@ mod tests {
         // frontmatter + inline tags, deduped, order preserved
         assert_eq!(a.tags, ["fm", "shared", "inline"]);
         assert_eq!(a.block_ids, ["blk1"]);
-        assert_eq!(a.outgoing_links, ["b", "Notes/Glass"]);
+        assert_eq!(
+            a.outgoing_links,
+            [
+                RawLink {
+                    embed: false,
+                    kind: LinkKind::Wiki,
+                    target: "b".into()
+                },
+                RawLink {
+                    embed: false,
+                    kind: LinkKind::Wiki,
+                    target: "Notes/Glass".into()
+                },
+            ]
+        );
         let g = vault.get_note("Notes/Glass.md").unwrap();
         assert_eq!(
             g.headings,
@@ -523,5 +583,45 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+    }
+
+    #[test]
+    fn save_note_updates_content_and_index() {
+        let (tmp, mut vault) = test_vault();
+        let before = fs::read_to_string(tmp.path().join("b.md")).unwrap();
+        // stale original: external-change detection must refuse
+        let err = vault.save_note("b.md", "stale original", "new body");
+        assert!(
+            matches!(
+                err,
+                Err(VaultError::Write(
+                    crate::write::WriteError::ExternallyModified
+                ))
+            ),
+            "{err:?}"
+        );
+
+        let result = vault
+            .save_note("b.md", &before, "now links [[Notes/Glass]]\n")
+            .unwrap();
+        assert_eq!(result.size, "now links [[Notes/Glass]]\n".len() as u64);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("b.md")).unwrap(),
+            "now links [[Notes/Glass]]\n"
+        );
+        assert_eq!(vault.backlinks("Notes/Glass.md"), ["a.md", "b.md"]);
+    }
+
+    #[test]
+    fn save_note_refuses_protected_and_non_note_paths() {
+        let (_tmp, mut vault) = test_vault();
+        assert!(matches!(
+            vault.save_note(".obsidian/app.json", "{}", "{}"),
+            Err(VaultError::ProtectedPath(_))
+        ));
+        assert!(matches!(
+            vault.save_note("assets/cat.png", "", ""),
+            Err(VaultError::NotANote(_))
+        ));
     }
 }

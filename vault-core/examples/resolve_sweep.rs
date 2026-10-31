@@ -16,24 +16,37 @@ fn main() {
     let mut resolved = 0usize;
     let mut unresolved: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for note in vault.all_notes() {
-        for target in &note.outgoing_links {
+        for link in &note.outgoing_links {
             total += 1;
-            if index.resolve(target, &note.path).is_some() {
+            // resolve each link the way its kind demands
+            let hit = match link.kind {
+                vault_core::LinkKind::Wiki => index.resolve(&link.target, &note.path),
+                vault_core::LinkKind::Markdown => index.resolve_relative(&link.target, &note.path),
+            };
+            if let Some(_path) = hit {
                 resolved += 1;
             } else {
                 unresolved
-                    .entry(target.clone())
+                    .entry(link.target.clone())
                     .or_default()
                     .push(note.path.clone());
             }
         }
     }
 
-    println!("{total} outgoing links, {resolved} resolved, {} unresolved", unresolved.len());
+    println!(
+        "{total} outgoing links, {resolved} resolved, {} unresolved",
+        unresolved.len()
+    );
     let mut by_count: Vec<(&String, &Vec<String>)> = unresolved.iter().collect();
     by_count.sort_by_key(|(_, srcs)| std::cmp::Reverse(srcs.len()));
     println!("most-linked unresolved targets:");
     for (target, sources) in by_count.iter().take(15) {
-        println!("  {:?} (from {} notes, e.g. {})", target, sources.len(), sources[0]);
+        println!(
+            "  {:?} (from {} notes, e.g. {})",
+            target,
+            sources.len(),
+            sources[0]
+        );
     }
 }
