@@ -1,0 +1,11 @@
+[package]
+name = "vault-md"
+version = "0.1.0"
+edition = "2021"
+description = "Markdown pipeline: comrak parse + Obsidian extensions -> IR -> HTML/widgets"
+
+[dependencies]
+comrak = { version = "0.59", default-features = true }
+vault-core = { path = "../vault-core" }
+ammonia = "4.2"
+thiserror = "2.0"

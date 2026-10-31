@@ -1,7 +1,11 @@
-use comrak::{nodes::NodeValue, parse_document, Arena, Options};
 use acrylic_notes::inline::{extract, lower_text};
+use comrak::{nodes::NodeValue, parse_document, Arena, Options};
 fn main() {
-    for src in ["[[a *b* c]] and [[Note|*alias*]]", "[[Note]](paren) #tag", "![[img.png|300]](x)"] {
+    for src in [
+        "[[a *b* c]] and [[Note|*alias*]]",
+        "[[Note]](paren) #tag",
+        "![[img.png|300]](x)",
+    ] {
         let e = extract(src);
         let arena = Arena::new();
         let root = parse_document(&arena, &e.text, &Options::default());

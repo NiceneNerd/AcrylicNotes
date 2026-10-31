@@ -16,11 +16,7 @@ impl Backdrop for NativeBackdrop {
     fn probe(&self) -> Capabilities {
         Capabilities {
             preferred: GlassStyle::LiquidGlass,
-            fallbacks: vec![
-                GlassStyle::Vibrancy,
-                GlassStyle::Blur,
-                GlassStyle::Opaque,
-            ],
+            fallbacks: vec![GlassStyle::Vibrancy, GlassStyle::Blur, GlassStyle::Opaque],
         }
     }
 

@@ -222,7 +222,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(applied, GlassStyle::Blur);
-        assert_eq!(tried, [GlassStyle::Mica, GlassStyle::Acrylic, GlassStyle::Blur]);
+        assert_eq!(
+            tried,
+            [GlassStyle::Mica, GlassStyle::Acrylic, GlassStyle::Blur]
+        );
     }
 
     #[test]

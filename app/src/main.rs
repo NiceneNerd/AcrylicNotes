@@ -138,7 +138,10 @@ impl cosmic::Application for App {
         {
             // On Wayland, run_with_handle doesn't complete, so we use a one-shot
             // timer to reflect the compositor blur state if it was already applied.
-            if self.requested == GlassStyle::Blur && self.applied.is_none() && self.capabilities.preferred == GlassStyle::Blur {
+            if self.requested == GlassStyle::Blur
+                && self.applied.is_none()
+                && self.capabilities.preferred == GlassStyle::Blur
+            {
                 return cosmic::iced::time::every(std::time::Duration::from_millis(500))
                     .map(|_| Message::Applied(GlassStyle::Blur));
             }
@@ -226,10 +229,7 @@ impl cosmic::Application for App {
         .height(Length::Fill)
         .style(move |_theme| cosmic::widget::container::Style {
             background: Some(Background::Color(Color::from_rgba(
-                0.08,
-                0.09,
-                0.11,
-                note_alpha,
+                0.08, 0.09, 0.11, note_alpha,
             ))),
             text_color: Some(text_color),
             ..cosmic::widget::container::Style::default()

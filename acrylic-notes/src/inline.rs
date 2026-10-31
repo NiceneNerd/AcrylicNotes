@@ -11,10 +11,16 @@ const OPEN: char = '\u{E000}';
 const CLOSE: char = '\u{E001}';
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Token { Wiki(WikiLink), Embed(Embed) }
+pub enum Token {
+    Wiki(WikiLink),
+    Embed(Embed),
+}
 
 #[derive(Debug)]
-pub struct Extracted { pub text: String, pub tokens: Vec<Token> }
+pub struct Extracted {
+    pub text: String,
+    pub tokens: Vec<Token>,
+}
 
 pub fn extract(src: &str) -> Extracted {
     let chars: Vec<char> = src.chars().filter(|c| *c != OPEN && *c != CLOSE).collect();
@@ -36,27 +42,40 @@ pub fn extract(src: &str) -> Extracted {
             '`' => {
                 let n = run_len(&chars, i, '`');
                 match find_run(&chars, i + n, '`', n) {
-                    Some(j) => { out.extend(&chars[i..j + n]); i = j + n; }
-                    None => { out.extend(&chars[i..i + n]); i += n; }
+                    Some(j) => {
+                        out.extend(&chars[i..j + n]);
+                        i = j + n;
+                    }
+                    None => {
+                        out.extend(&chars[i..i + n]);
+                        i += n;
+                    }
                 }
                 at_line_start = false;
                 continue;
             }
             '%' if starts(&chars, i, "%%") => {
-                if let Some(j) = find_str(&chars, i + 2, "%%") { i = j + 2; continue; }
+                if let Some(j) = find_str(&chars, i + 2, "%%") {
+                    i = j + 2;
+                    continue;
+                }
             }
             '!' if starts(&chars, i, "![[") => {
                 if let Some((inner, end)) = wiki_inner(&chars, i + 3) {
                     tokens.push(Token::Embed(parse_embed(&inner)));
                     out.push_str(&format!("{OPEN}{}{CLOSE}", tokens.len() - 1));
-                    i = end; at_line_start = false; continue;
+                    i = end;
+                    at_line_start = false;
+                    continue;
                 }
             }
             '[' if starts(&chars, i, "[[") => {
                 if let Some((inner, end)) = wiki_inner(&chars, i + 2) {
                     tokens.push(Token::Wiki(parse_wiki(&inner)));
                     out.push_str(&format!("{OPEN}{}{CLOSE}", tokens.len() - 1));
-                    i = end; at_line_start = false; continue;
+                    i = end;
+                    at_line_start = false;
+                    continue;
                 }
             }
             _ => {}
@@ -73,7 +92,9 @@ pub fn lower_text(text: &str, tokens: &[Token]) -> Vec<Inline> {
     let (mut out, mut buf) = (Vec::new(), String::new());
     let mut i = 0;
     let flush = |buf: &mut String, out: &mut Vec<Inline>| {
-        if !buf.is_empty() { out.push(Inline::Text(std::mem::take(buf))); }
+        if !buf.is_empty() {
+            out.push(Inline::Text(std::mem::take(buf)));
+        }
     };
     while i < chars.len() {
         let c = chars[i];
@@ -92,7 +113,10 @@ pub fn lower_text(text: &str, tokens: &[Token]) -> Vec<Inline> {
             }
         }
         if c == '#' && tag_boundary(chars.get(i.wrapping_sub(1)).filter(|_| i > 0)) {
-            let body: String = chars[i + 1..].iter().take_while(|&&x| is_tag_char(x)).collect();
+            let body: String = chars[i + 1..]
+                .iter()
+                .take_while(|&&x| is_tag_char(x))
+                .collect();
             let trimmed = body.trim_end_matches('/');
             if !trimmed.is_empty() && trimmed.chars().any(|x| !x.is_ascii_digit()) {
                 flush(&mut buf, &mut out);
@@ -108,19 +132,34 @@ pub fn lower_text(text: &str, tokens: &[Token]) -> Vec<Inline> {
     out
 }
 
-fn is_tag_char(c: char) -> bool { c.is_alphanumeric() || matches!(c, '_' | '-' | '/') }
+fn is_tag_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '/')
+}
 fn tag_boundary(prev: Option<&char>) -> bool {
-    prev.map_or(true, |p| !(p.is_alphanumeric() || matches!(p, '_' | '-' | '/' | '#')))
+    prev.map_or(true, |p| {
+        !(p.is_alphanumeric() || matches!(p, '_' | '-' | '/' | '#'))
+    })
 }
 
 pub fn parse_target(s: &str) -> WikiTarget {
     match s.split_once('#') {
-        None => WikiTarget { note: s.trim().into(), ..Default::default() },
+        None => WikiTarget {
+            note: s.trim().into(),
+            ..Default::default()
+        },
         Some((note, rest)) => {
             let note = note.trim().to_string();
             match rest.strip_prefix('^') {
-                Some(b) => WikiTarget { note, block: Some(b.into()), heading: None },
-                None => WikiTarget { note, heading: Some(rest.into()), block: None },
+                Some(b) => WikiTarget {
+                    note,
+                    block: Some(b.into()),
+                    heading: None,
+                },
+                None => WikiTarget {
+                    note,
+                    heading: Some(rest.into()),
+                    block: None,
+                },
             }
         }
     }
@@ -141,61 +180,100 @@ fn split_alias(inner: &str) -> (String, Option<String>) {
 
 pub fn parse_wiki(inner: &str) -> WikiLink {
     let (t, alias) = split_alias(inner);
-    WikiLink { target: parse_target(&t), alias }
+    WikiLink {
+        target: parse_target(&t),
+        alias,
+    }
 }
 
 pub fn parse_embed(inner: &str) -> Embed {
     let (t, alias) = split_alias(inner);
     let size = alias.as_deref().and_then(parse_size);
     let alias = if size.is_some() { None } else { alias };
-    Embed { target: parse_target(&t), size, alias }
+    Embed {
+        target: parse_target(&t),
+        size,
+        alias,
+    }
 }
 
 fn parse_size(s: &str) -> Option<(u32, Option<u32>)> {
-    let (w, h) = match s.split_once('x') { Some((w, h)) => (w, Some(h)), None => (s, None) };
+    let (w, h) = match s.split_once('x') {
+        Some((w, h)) => (w, Some(h)),
+        None => (s, None),
+    };
     let w = w.parse().ok()?;
-    let h = match h { Some(h) => Some(h.parse().ok()?), None => None };
+    let h = match h {
+        Some(h) => Some(h.parse().ok()?),
+        None => None,
+    };
     Some((w, h))
 }
 
 // ---- tiny scanners over Vec<char> ----
 fn starts(c: &[char], i: usize, p: &str) -> bool {
-    p.chars().enumerate().all(|(k, pc)| c.get(i + k) == Some(&pc))
+    p.chars()
+        .enumerate()
+        .all(|(k, pc)| c.get(i + k) == Some(&pc))
 }
 fn find_str(c: &[char], from: usize, p: &str) -> Option<usize> {
     (from..c.len()).find(|&i| starts(c, i, p))
 }
-fn run_len(c: &[char], i: usize, ch: char) -> usize { c[i..].iter().take_while(|&&x| x == ch).count() }
+fn run_len(c: &[char], i: usize, ch: char) -> usize {
+    c[i..].iter().take_while(|&&x| x == ch).count()
+}
 fn find_run(c: &[char], mut i: usize, ch: char, n: usize) -> Option<usize> {
     while i < c.len() {
-        if c[i] == ch { let r = run_len(c, i, ch); if r == n { return Some(i); } i += r; } else { i += 1; }
+        if c[i] == ch {
+            let r = run_len(c, i, ch);
+            if r == n {
+                return Some(i);
+            }
+            i += r;
+        } else {
+            i += 1;
+        }
     }
     None
 }
 fn wiki_inner(c: &[char], from: usize) -> Option<(String, usize)> {
     let end = find_str(c, from, "]]")?;
     let inner: String = c[from..end].iter().collect();
-    if inner.is_empty() || inner.contains('\n') || inner.contains("[[") { return None; }
+    if inner.is_empty() || inner.contains('\n') || inner.contains("[[") {
+        return None;
+    }
     Some((inner, end + 2))
 }
 fn fence_at(c: &[char], i: usize) -> Option<(char, usize)> {
     let mut k = i;
-    while k < c.len() && k - i < 3 && c[k] == ' ' { k += 1; }
+    while k < c.len() && k - i < 3 && c[k] == ' ' {
+        k += 1;
+    }
     let ch = *c.get(k)?;
-    if ch != '`' && ch != '~' { return None; }
+    if ch != '`' && ch != '~' {
+        return None;
+    }
     let n = run_len(c, k, ch);
     (n >= 3).then_some((ch, n))
 }
 fn fence_end(c: &[char], start: usize, fc: char, flen: usize) -> usize {
     let mut i = start;
-    while i < c.len() && c[i] != '\n' { i += 1; } // skip opening line
+    while i < c.len() && c[i] != '\n' {
+        i += 1;
+    } // skip opening line
     while i < c.len() {
         i += 1; // line start
-        if let Some((ch, n)) = fence_at(c, i) { if ch == fc && n >= flen {
-            while i < c.len() && c[i] != '\n' { i += 1; }
-            return i;
-        } }
-        while i < c.len() && c[i] != '\n' { i += 1; }
+        if let Some((ch, n)) = fence_at(c, i) {
+            if ch == fc && n >= flen {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+                return i;
+            }
+        }
+        while i < c.len() && c[i] != '\n' {
+            i += 1;
+        }
     }
     c.len()
 }
@@ -203,9 +281,20 @@ fn fence_end(c: &[char], start: usize, fc: char, flen: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn lower(s: &str) -> Vec<Inline> { let e = extract(s); lower_text(&e.text, &e.tokens) }
+    fn lower(s: &str) -> Vec<Inline> {
+        let e = extract(s);
+        lower_text(&e.text, &e.tokens)
+    }
     fn tags(v: &[Inline]) -> Vec<&str> {
-        v.iter().filter_map(|i| if let Inline::Tag(t) = i { Some(t.as_str()) } else { None }).collect()
+        v.iter()
+            .filter_map(|i| {
+                if let Inline::Tag(t) = i {
+                    Some(t.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -232,7 +321,7 @@ mod tests {
     #[test]
     fn emphasis_inside_wikilink_cannot_split_it() {
         let e = extract("see [[a *b* c]] and [[Note|*alias*]]");
-        assert!(!e.text.contains("[["));          // both hidden from comrak
+        assert!(!e.text.contains("[[")); // both hidden from comrak
         assert_eq!(e.tokens.len(), 2);
         let out = lower_text(&e.text, &e.tokens);
         assert!(matches!(out[1], Inline::WikiLink(_)));
@@ -256,10 +345,13 @@ mod tests {
 
     #[test]
     fn tag_rules() {
-        assert_eq!(tags(&lower("a #tag and #nested/tag, #y1984.")), ["tag", "nested/tag", "y1984"]);
-        assert!(tags(&lower("year #1984 here")).is_empty());   // all-numeric
-        assert!(tags(&lower("foo#bar")).is_empty());           // no boundary
-        assert!(tags(&lower("# heading-ish")).is_empty());     // '#' + space
+        assert_eq!(
+            tags(&lower("a #tag and #nested/tag, #y1984.")),
+            ["tag", "nested/tag", "y1984"]
+        );
+        assert!(tags(&lower("year #1984 here")).is_empty()); // all-numeric
+        assert!(tags(&lower("foo#bar")).is_empty()); // no boundary
+        assert!(tags(&lower("# heading-ish")).is_empty()); // '#' + space
         assert_eq!(tags(&lower("#a-b_c")), ["a-b_c"]);
         assert_eq!(tags(&lower("#tag/")), ["tag"]);
     }

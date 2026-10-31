@@ -8,6 +8,8 @@ fn main() {
     let src = "See [[Note|alias]] and ![[img.png|300]] and #tag, ==hi== %%c%%.";
     let root = parse_document(&arena, src, &o);
     for n in root.descendants() {
-        if let NodeValue::Text(t) = &n.data.borrow().value { println!("Text node: {:?}", t); }
+        if let NodeValue::Text(t) = &n.data.borrow().value {
+            println!("Text node: {:?}", t);
+        }
     }
 }

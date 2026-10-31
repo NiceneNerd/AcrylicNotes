@@ -1,3 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["acrylic-notes", "vault-glass", "app"]
+members = [
+    "acrylic-notes",
+    "vault-glass",
+    "vault-core",
+    "vault-md",
+    "app",
+]

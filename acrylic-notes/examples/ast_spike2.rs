@@ -28,5 +28,7 @@ fn main() {
         "tag #a_b_c and #x*y*",
         "![[img.png]](x)",
         "[[a]] [text](u) [[b]]",
-    ] { show(s); }
+    ] {
+        show(s);
+    }
 }

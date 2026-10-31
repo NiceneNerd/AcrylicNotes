@@ -11,18 +11,42 @@ pub struct Doc {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
-    Heading { level: u8, content: Vec<Inline> },
-    Paragraph { content: Vec<Inline>, block_id: Option<String> },
-    List { ordered: bool, start: Option<u64>, items: Vec<ListItem> },
+    Heading {
+        level: u8,
+        content: Vec<Inline>,
+    },
+    Paragraph {
+        content: Vec<Inline>,
+        block_id: Option<String>,
+    },
+    List {
+        ordered: bool,
+        start: Option<u64>,
+        items: Vec<ListItem>,
+    },
     Quote(Vec<Block>),
-    Callout { kind: String, fold: Fold, title: Vec<Inline>, body: Vec<Block> },
-    Code { lang: Option<String>, text: String },
+    Callout {
+        kind: String,
+        fold: Fold,
+        title: Vec<Inline>,
+        body: Vec<Block>,
+    },
+    Code {
+        lang: Option<String>,
+        text: String,
+    },
     Math(String),
-    Table { header: Vec<Vec<Inline>>, rows: Vec<Vec<Vec<Inline>>> },
+    Table {
+        header: Vec<Vec<Inline>>,
+        rows: Vec<Vec<Vec<Inline>>>,
+    },
     Rule,
     /// `![[Note]]` alone on its line: transclude a note/section/block.
     EmbedBlock(Embed),
-    FootnoteDef { label: String, body: Vec<Block> },
+    FootnoteDef {
+        label: String,
+        body: Vec<Block>,
+    },
     Html(String),
 }
 
@@ -33,7 +57,11 @@ pub struct ListItem {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Fold { None, Open, Closed } // `[!tip]`, `[!tip]+`, `[!tip]-`
+pub enum Fold {
+    None,
+    Open,
+    Closed,
+} // `[!tip]`, `[!tip]+`, `[!tip]-`
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inline {
@@ -44,8 +72,15 @@ pub enum Inline {
     Highlight(Vec<Inline>),
     Code(String),
     Math(String),
-    Link { url: String, title: Option<String>, content: Vec<Inline> },
-    Image { url: String, alt: String },
+    Link {
+        url: String,
+        title: Option<String>,
+        content: Vec<Inline>,
+    },
+    Image {
+        url: String,
+        alt: String,
+    },
     WikiLink(WikiLink),
     Embed(Embed),
     Tag(String), // without the leading '#'

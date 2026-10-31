@@ -1,0 +1,19 @@
+[package]
+name = "vault-core"
+version = "0.1.0"
+edition = "2021"
+description = "UI-free vault: scan, index, resolve, frontmatter, atomic writes"
+
+[dependencies]
+notify = { version = "8.2", default-features = true }
+notify-debouncer-full = "0.7"
+walkdir = "2.5"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_norway = "0.9"
+unicode-normalization = "0.1"
+hashbrown = "0.14"
+parking_lot = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
+tempfile = "3.27"
+sha2 = "0.10"
