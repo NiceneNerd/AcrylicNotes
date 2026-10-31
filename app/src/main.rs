@@ -29,26 +29,64 @@ struct App {
     core: Core,
     capabilities: Capabilities,
     requested: GlassStyle,
-    applied: Option<GlassStyle>,
+    state: Option<BackdropState>,
     error: Option<String>,
+}
+
+/// A local platform call reported what it applied.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BackdropState {
+    /// `vault-glass` applied the effect through a platform API.
+    Applied(GlassStyle),
+    /// The request was delegated (Wayland: the compositor blurs through
+    /// `ext-background-effect-v1`); nothing local exists to confirm it with.
+    Delegated(GlassStyle),
 }
 
 #[derive(Clone, Debug)]
 enum Message {
     Request(GlassStyle),
     Applied(GlassStyle),
+    Delegated(GlassStyle),
     Failed(String),
 }
 
 impl App {
     /// Ask the platform for a backdrop and report back what it managed.
-    fn request_backdrop(style: GlassStyle) -> cosmic::app::Task<Message> {
-        // On Wayland, libcosmic uses its native backend which doesn't implement
-        // `run_with_handle`. The compositor blur is applied automatically when
-        // the window is transparent and the compositor supports the protocol.
-        // We'll just report success for Blur style if the compositor reports
-        // support, otherwise we'd need the winit backend.
-        cosmic::iced::window::run_with_handle(cosmic::iced::window::Id::RESERVED, move |handle| {
+    fn request_backdrop(&self, style: GlassStyle) -> cosmic::app::Task<Message> {
+        let id = cosmic::iced::window::Id::RESERVED;
+
+        #[cfg(target_os = "linux")]
+        {
+            // Wayland: the blur is compositor-managed. libcosmic's toolkit
+            // request is the whole story and no per-window native call exists,
+            // so reporting "applied" would claim a confirmation we do not
+            // have. We report the request as delegated instead.
+            if style != GlassStyle::Opaque && self.capabilities.preferred == GlassStyle::Blur {
+                let blur = cosmic::iced::window::enable_blur::<cosmic::Action<Message>>(id);
+                let note = cosmic::iced::Task::perform(std::future::ready(()), move |()| {
+                    cosmic::Action::App(Message::Delegated(style))
+                });
+                return cosmic::app::Task::batch([blur, note]);
+            }
+            if style == GlassStyle::Opaque {
+                let unblur = cosmic::iced::window::disable_blur::<cosmic::Action<Message>>(id);
+                let note = cosmic::iced::Task::perform(std::future::ready(()), move |()| {
+                    cosmic::Action::App(Message::Applied(GlassStyle::Opaque))
+                });
+                return cosmic::app::Task::batch([unblur, note]);
+            }
+            // No compositor blur and no local API: say so instead of pretending.
+            return cosmic::iced::Task::perform(std::future::ready(()), move |()| {
+                cosmic::Action::App(Message::Failed(
+                    "no compositor blur and no local backdrop API on this platform".into(),
+                ))
+            })
+            .into();
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        cosmic::iced::window::run_with_handle(id, move |handle| {
             let backdrop = vault_glass::platform::native();
             match Backdrop::apply(&*backdrop, &handle, style) {
                 Ok(applied) => Message::Applied(applied),
@@ -75,7 +113,8 @@ impl App {
 
     /// Whether the window should currently show a blurred backdrop.
     fn is_glassy(&self) -> bool {
-        self.requested != GlassStyle::Opaque && self.applied != Some(GlassStyle::Opaque)
+        let state_glassy = !matches!(self.state, Some(BackdropState::Applied(GlassStyle::Opaque)));
+        self.requested != GlassStyle::Opaque && state_glassy
     }
 }
 
@@ -100,12 +139,12 @@ impl cosmic::Application for App {
             core,
             capabilities: capabilities.clone(),
             requested: capabilities.preferred,
-            applied: None,
+            state: None,
             error: None,
         };
         app.core.set_header_title("Acrylic Notes".to_string());
 
-        let task = Self::request_backdrop(app.requested);
+        let task = app.request_backdrop(app.requested);
 
         (app, task)
     }
@@ -115,38 +154,22 @@ impl cosmic::Application for App {
             Message::Request(style) => {
                 self.requested = style;
                 self.error = None;
-                Self::request_backdrop(style)
+                self.state = None;
+                self.request_backdrop(style)
             }
             Message::Applied(style) => {
-                self.applied = Some(style);
-                let id = cosmic::iced::window::Id::RESERVED;
-                if style == GlassStyle::Blur {
-                    cosmic::iced::window::enable_blur(id)
-                } else {
-                    cosmic::iced::window::disable_blur(id)
-                }
+                self.state = Some(BackdropState::Applied(style));
+                cosmic::app::Task::none()
+            }
+            Message::Delegated(style) => {
+                self.state = Some(BackdropState::Delegated(style));
+                cosmic::app::Task::none()
             }
             Message::Failed(error) => {
                 self.error = Some(error);
                 cosmic::app::Task::none()
             }
         }
-    }
-
-    fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
-        #[cfg(target_os = "linux")]
-        {
-            // On Wayland, run_with_handle doesn't complete, so we use a one-shot
-            // timer to reflect the compositor blur state if it was already applied.
-            if self.requested == GlassStyle::Blur
-                && self.applied.is_none()
-                && self.capabilities.preferred == GlassStyle::Blur
-            {
-                return cosmic::iced::time::every(std::time::Duration::from_millis(500))
-                    .map(|_| Message::Applied(GlassStyle::Blur));
-            }
-        }
-        cosmic::iced::Subscription::none()
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
@@ -194,15 +217,22 @@ impl cosmic::Application for App {
             buttons = buttons.push(button.on_press(Message::Request(style)));
         }
 
-        let status = match (&self.applied, &self.error) {
-            (Some(applied), None) => format!(
+        let status = match (&self.state, &self.error) {
+            (Some(BackdropState::Delegated(style)), None) => format!(
+                "requested: {} — delegated to compositor (ext-background-effect-v1): not confirmed locally",
+                style.name(),
+            ),
+            (Some(BackdropState::Applied(applied)), None) => format!(
                 "requested: {} — applied: {} — platform prefers: {}",
                 self.requested.name(),
                 applied.name(),
                 self.capabilities.preferred.name(),
             ),
-            (Some(applied), Some(error)) => {
+            (Some(BackdropState::Applied(applied)), Some(error)) => {
                 format!("applied: {applied} — error: {error}")
+            }
+            (Some(BackdropState::Delegated(applied)), Some(error)) => {
+                format!("delegated: {applied} — error: {error}")
             }
             (None, Some(error)) => format!("error: {error}"),
             (None, None) => "no backdrop applied yet".to_string(),

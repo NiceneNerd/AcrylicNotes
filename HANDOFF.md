@@ -117,6 +117,11 @@ re-run everything (see M2).
 - libcosmic features `wayland` and `winit` conflict; libcosmic recently began
   bundling icons for macOS as well as Windows, but it is COSMIC-first, so
   expect rough edges off Linux. https://pop-os.github.io/libcosmic/cosmic/
+  CORRECTED 2026-10-31 by reading the Cargo.toml at the pinned commit: the
+  `wayland` feature IMPLIES `winit` (plus `a11y` and `multi-window`), so the
+  two never conflict. Per-target feature tables still work, but on Linux they
+  are effectively cosmetic — everything the `wayland` feature needs comes in
+  through the implied `winit` anyway.
 - `window-vibrancy` (Tauri team) takes any raw-window-handle: Windows
   `apply_mica` (Win11 only), `apply_acrylic` (documented perf problems when
   resizing/dragging on some builds), `apply_blur`; macOS `apply_vibrancy`

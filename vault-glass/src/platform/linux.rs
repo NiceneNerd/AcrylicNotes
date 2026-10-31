@@ -31,12 +31,18 @@ impl Backdrop for CompositorBackdrop {
         _window: &dyn HasWindowHandle,
         requested: GlassStyle,
     ) -> Result<GlassStyle, GlassError> {
-        // Nothing to call: the GUI toolkit asks the compositor for the blur.
-        Ok(match requested {
-            GlassStyle::Opaque => GlassStyle::Opaque,
-            _ if supports_compositor_blur() => GlassStyle::Blur,
-            _ => GlassStyle::Opaque,
-        })
+        match requested {
+            // Nothing to call for opaque; the caller just paints its surface.
+            GlassStyle::Opaque => Ok(GlassStyle::Opaque),
+            // There is no per-window native blur call on Wayland: the toolkit
+            // asks the compositor via `ext-background-effect-v1`. Reporting
+            // Ok(Blur) here would claim a confirmation that does not exist —
+            // the caller delegates through the toolkit instead.
+            _ => Err(GlassError::NotApplicable(
+                "wayland blur is compositor-managed; delegate via the toolkit \
+                 (iced::window::enable_blur) instead of a local API",
+            )),
+        }
     }
 }
 

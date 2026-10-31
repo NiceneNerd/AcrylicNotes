@@ -1,0 +1,8 @@
+# Cross-compilation settings. xargo/cargo-xargo is gone (removed from
+# crates.io; the archived japaric/xargo no longer compiles on Rust 1.95), and
+# rustup's precompiled std has taken over its job: `rustup target add
+# x86_64-pc-windows-gnu` + this linker config is the modern equivalent.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+# Run the Windows test binaries under Wine on a Linux host.
+runner = "wine"

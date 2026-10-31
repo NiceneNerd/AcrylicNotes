@@ -27,9 +27,13 @@ impl Backdrop for NativeBackdrop {
             .map_err(|error| GlassError::Handle(error.to_string()))?;
 
         negotiate(requested, &self.probe(), |style| match style {
-            GlassStyle::Mica => window_vibrancy::apply_mica(window, None),
-            GlassStyle::Acrylic => window_vibrancy::apply_acrylic(window, None),
-            GlassStyle::Blur => window_vibrancy::apply_blur(window, Some((18, 18, 18, 125))),
+            GlassStyle::Mica => window_vibrancy::apply_mica(window, None).map_err(windows_error),
+            GlassStyle::Acrylic => {
+                window_vibrancy::apply_acrylic(window, None).map_err(windows_error)
+            }
+            GlassStyle::Blur => {
+                window_vibrancy::apply_blur(window, Some((18, 18, 18, 125))).map_err(windows_error)
+            }
             GlassStyle::Vibrancy | GlassStyle::LiquidGlass => {
                 Err(GlassError::Platform("macOS-only effect".into()))
             }
@@ -37,4 +41,9 @@ impl Backdrop for NativeBackdrop {
         })
         .map_err(|error| GlassError::Platform(error.to_string()))
     }
+}
+
+/// Map a `window-vibrancy` error onto `GlassError::Platform`.
+fn windows_error(error: window_vibrancy::Error) -> GlassError {
+    GlassError::Platform(error.to_string())
 }

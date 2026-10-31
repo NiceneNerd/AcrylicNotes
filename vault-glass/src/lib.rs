@@ -79,6 +79,9 @@ pub enum GlassError {
     Handle(String),
     /// The platform refused an effect for a reason other than "not this OS".
     Platform(String),
+    /// This platform has no local API for the requested effect at all — the
+    /// effect is managed elsewhere (e.g. Wayland compositors own the blur).
+    NotApplicable(&'static str),
 }
 
 impl fmt::Display for GlassError {
@@ -86,6 +89,9 @@ impl fmt::Display for GlassError {
         match self {
             GlassError::Handle(msg) => write!(f, "window handle error: {msg}"),
             GlassError::Platform(msg) => write!(f, "platform refused backdrop: {msg}"),
+            GlassError::NotApplicable(msg) => {
+                write!(f, "no local backdrop API on this platform: {msg}")
+            }
         }
     }
 }
