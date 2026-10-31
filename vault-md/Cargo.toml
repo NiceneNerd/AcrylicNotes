@@ -5,9 +5,9 @@ edition = "2021"
 description = "Markdown pipeline: comrak parse + Obsidian extensions -> IR -> HTML/widgets"
 
 [dependencies]
-# comrak 0.59: extension gates (tables, footnotes, math, ofm_*) are compile-time
-# OFF by default and selected per-parse via Options; the cargo features only
-# cover the CLI/syntect extras, which we do not want.
-comrak = { version = "0.59", default-features = false }
+# comrak 0.59: extension gates are selected per-parse via Options; the cargo
+# features only cover extras. `attributes` enables `{#id}` heading attributes.
+comrak = { version = "0.59", default-features = false, features = ["attributes"] }
 vault-core = { path = "../vault-core" }
+ammonia = "4.2"
 thiserror = "2.0"

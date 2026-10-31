@@ -9,6 +9,7 @@
 pub mod frontmatter;
 pub mod links;
 pub mod resolve;
+pub mod source;
 pub mod vault;
 pub mod write;
 
@@ -17,5 +18,6 @@ pub use frontmatter::{
 };
 pub use links::{LinkKind, RawLink};
 pub use resolve::VaultIndex;
+pub use source::{NoteSource, ObsidianSettings};
 pub use vault::{Heading, Note, Vault};
 pub use write::{atomic_write, atomic_write_raw, WriteError, WriteResult};

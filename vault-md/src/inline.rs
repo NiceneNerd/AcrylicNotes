@@ -20,6 +20,9 @@ const CLOSE: char = '\u{E001}';
 pub enum Token {
     Wiki(WikiLink),
     Embed(Embed),
+    /// Characters that must survive as literal text: an escaped `\#` is not
+    /// a tag, and comrak would consume the backslash before `lower_text` ran.
+    Literal(String),
 }
 
 #[derive(Debug)]
@@ -89,11 +92,19 @@ pub fn extract(src: &str) -> Extracted {
                 at_line_start = false;
                 continue;
             }
-            '%' if starts(&chars, i, "%%") => {
-                if let Some(j) = find_str(&chars, i + 2, "%%") {
-                    i = j + 2;
-                    continue;
-                }
+            '\\' if starts(&chars, i, "\\#") => {
+                tokens.push(Token::Literal("#".into()));
+                out.push_str(&format!("{OPEN}l{}{CLOSE}", tokens.len() - 1));
+                i += 2;
+                at_line_start = false;
+                continue;
+            }
+            '%' => {
+                // `%%comments%%` are comrak's job (ofm_comments → CommentInline
+                // nodes, dropped at lowering). The pre-pass must NOT delete
+                // them: deleting text can collapse block structure, and a
+                // comment node keeps the literal verbatim so wikilinks inside
+                // comments are never interpreted.
             }
             '!' if starts(&chars, i, "![[") => {
                 if let Some((inner, end)) = wiki_inner(&chars, i + 3) {
@@ -136,18 +147,28 @@ pub fn lower_text(text: &str, tokens: &[Token]) -> Vec<Inline> {
         if c == OPEN {
             if let Some(rel) = chars[i..].iter().position(|&x| x == CLOSE) {
                 let idx: String = chars[i + 1..i + rel].iter().collect();
-                if let Some(t) = idx.parse::<usize>().ok().and_then(|n| tokens.get(n)) {
+                // `l<idx>` marks a literal token (escaped characters).
+                let token = if let Some(num) = idx.strip_prefix('l') {
+                    num.parse::<usize>().ok().and_then(|n| tokens.get(n))
+                } else {
+                    idx.parse::<usize>().ok().and_then(|n| tokens.get(n))
+                };
+                if let Some(t) = token {
                     flush(&mut buf, &mut out);
                     out.push(match t {
                         Token::Wiki(w) => Inline::WikiLink(w.clone()),
                         Token::Embed(e) => Inline::Embed(e.clone()),
+                        Token::Literal(s) => Inline::Text(s.clone()),
                     });
                     i += rel + 1;
                     continue;
                 }
             }
         }
-        if c == '#' && tag_boundary(chars.get(i.wrapping_sub(1)).filter(|_| i > 0)) {
+        if c == '#'
+            && chars.get(i.wrapping_sub(1)) != Some(&'\\')
+            && tag_boundary(chars.get(i.wrapping_sub(1)).filter(|_| i > 0))
+        {
             let body: String = chars[i + 1..]
                 .iter()
                 .take_while(|&&x| is_tag_char(x))
@@ -417,8 +438,12 @@ mod tests {
     }
 
     #[test]
-    fn comments_dropped_unterminated_kept() {
-        assert_eq!(extract("a %%hidden [[x]]%% b").tokens.len(), 0);
+    fn comments_pass_through_to_comrak() {
+        // Comments are comrak's job now (ofm_comments); the pre-pass leaves
+        // them in place so block structure survives, and lowering drops the
+        // comment nodes (see lower tests). An unterminated `%%` is literal.
+        let e = extract("a %%hidden [[x]]%% b");
+        assert_eq!(e.text, "a %%hidden \u{e000}0\u{e001}%% b"); // wikilink sentinelized, comment kept
         assert_eq!(extract("a %%hidden b").text, "a %%hidden b");
     }
 

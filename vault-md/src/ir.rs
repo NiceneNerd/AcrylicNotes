@@ -9,11 +9,22 @@ pub struct Doc {
     pub blocks: Vec<Block>,
 }
 
+/// Table column alignment, from `|:-:|` delimiter rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alignment {
+    None,
+    Left,
+    Center,
+    Right,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     Heading {
         level: u8,
         content: Vec<Inline>,
+        /// Explicit id from a `{#custom-id}` attribute (comrak `header_attributes`).
+        id: Option<String>,
     },
     Paragraph {
         content: Vec<Inline>,
@@ -22,12 +33,16 @@ pub enum Block {
     List {
         ordered: bool,
         start: Option<u64>,
+        /// GFM tightness: tight lists render items without paragraph wrappers.
+        tight: bool,
         items: Vec<ListItem>,
     },
     Quote(Vec<Block>),
     Callout {
         kind: String,
         fold: Fold,
+        /// Callout metadata after `|` in the header (`[!note|meta]`).
+        metadata: Option<String>,
         title: Vec<Inline>,
         body: Vec<Block>,
     },
@@ -37,6 +52,7 @@ pub enum Block {
     },
     Math(String),
     Table {
+        alignments: Vec<Alignment>,
         header: Vec<Vec<Inline>>,
         rows: Vec<Vec<Vec<Inline>>>,
     },
@@ -47,12 +63,15 @@ pub enum Block {
         label: String,
         body: Vec<Block>,
     },
+    /// Raw HTML block (sanitized at render time).
     Html(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListItem {
     pub task: Option<bool>, // Some(done) for `- [ ]` / `- [x]`
+    /// `^block-id` at the end of the item.
+    pub block_id: Option<String>,
     pub body: Vec<Block>,
 }
 
@@ -86,6 +105,8 @@ pub enum Inline {
     Tag(String), // without the leading '#'
     FootnoteRef(String),
     InlineFootnote(Vec<Inline>),
+    /// Raw inline HTML (e.g. `<abbr title="…">`); sanitized at render time.
+    Html(String),
     SoftBreak,
     HardBreak,
 }

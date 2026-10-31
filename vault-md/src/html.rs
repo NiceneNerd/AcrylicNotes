@@ -1,0 +1,707 @@
+//! IR → HTML.
+//!
+//! The reading-view renderer: resolves links through a [`VaultIndex`],
+//! transcludes embeds with cycle detection and a depth limit, and sanitizes
+//! raw HTML fragments with ammonia. Obsidian-compatible class names are used
+//! (`internal-link`, `callout`, `tag`, …) so vault CSS keeps working.
+//!
+//! Sanitization applies to RAW HTML FRAGMENTS ONLY — never to the whole
+//! document, which would strip this renderer's own classes and ids.
+
+use std::cell::RefCell;
+use std::fmt::Write as _;
+
+use vault_core::{LinkKind, VaultIndex};
+
+use crate::ir::{Alignment, Block, Doc, Fold, Inline};
+
+/// Read-only inputs the renderer needs beyond the IR.
+pub struct RenderContext<'a> {
+    /// Resolution index over notes AND attachments.
+    pub index: &'a VaultIndex,
+    /// Vault-relative path of the note being rendered (`[[#Heading]]` needs it).
+    pub from_note: &'a str,
+    /// Raw text of other notes, for transclusion.
+    pub notes: &'a dyn vault_core::NoteSource,
+    pub options: RenderOptions,
+    /// Paths currently being transcluded (cycle detection).
+    chain: RefCell<Vec<String>>,
+    /// Footnote label -> display number, in document definition order.
+    footnote_defs: RefCell<std::collections::HashMap<String, usize>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RenderOptions {
+    /// Obsidian `strictLineBreaks`: soft breaks stay soft (newline) instead
+    /// of becoming `<br>`.
+    pub strict_line_breaks: bool,
+    /// Transclusion depth limit (Obsidian has a similar guard).
+    pub max_embed_depth: usize,
+    /// Sanitize raw HTML fragments with ammonia.
+    pub sanitize_html: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            strict_line_breaks: false,
+            max_embed_depth: 3,
+            sanitize_html: true,
+        }
+    }
+}
+
+impl<'a> RenderContext<'a> {
+    pub fn new(
+        index: &'a VaultIndex,
+        from_note: &'a str,
+        notes: &'a dyn vault_core::NoteSource,
+        options: RenderOptions,
+    ) -> Self {
+        Self {
+            index,
+            from_note,
+            notes,
+            options,
+            chain: RefCell::new(vec![from_note.to_string()]),
+            footnote_defs: RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// The display number for a footnote label (definition order; unknown
+    /// labels get numbers after the definitions).
+    fn footnote_number(&self, label: &str) -> usize {
+        let mut defs = self.footnote_defs.borrow_mut();
+        let next = defs.len() + 1;
+        *defs.entry(label.to_string()).or_insert(next)
+    }
+
+    fn entering(&self, path: &str) -> bool {
+        let mut chain = self.chain.borrow_mut();
+        if chain.len() > self.options.max_embed_depth || chain.iter().any(|p| p == path) {
+            return false;
+        }
+        chain.push(path.to_string());
+        true
+    }
+
+    fn leaving(&self) {
+        self.chain.borrow_mut().pop();
+    }
+}
+
+/// Render a whole note to HTML.
+pub fn render_html(doc: &Doc, ctx: &RenderContext) -> String {
+    // Footnote definitions get numbers in document order; references then
+    // display numbers like Obsidian does, not internal labels.
+    for block in &doc.blocks {
+        collect_footnote_defs(block, ctx);
+    }
+    let mut out = String::new();
+    for block in &doc.blocks {
+        render_block(block, ctx, &mut out);
+    }
+    out
+}
+
+fn collect_footnote_defs(block: &Block, ctx: &RenderContext) {
+    match block {
+        Block::FootnoteDef { label, body } => {
+            let mut defs = ctx.footnote_defs.borrow_mut();
+            let next = defs.len() + 1;
+            defs.entry(label.clone()).or_insert(next);
+            drop(defs);
+            for b in body {
+                collect_footnote_defs(b, ctx);
+            }
+        }
+        Block::List { items, .. } => {
+            for item in items {
+                for b in &item.body {
+                    collect_footnote_defs(b, ctx);
+                }
+            }
+        }
+        Block::Quote(body) | Block::Callout { body, .. } => {
+            for b in body {
+                collect_footnote_defs(b, ctx);
+            }
+        }
+        Block::EmbedBlock(_) => {}
+        _ => {}
+    }
+}
+
+fn render_block(block: &Block, ctx: &RenderContext, out: &mut String) {
+    match block {
+        Block::Paragraph { content, .. } => {
+            if content.is_empty() {
+                return;
+            }
+            out.push_str("<p>");
+            render_inlines(content, ctx, out);
+            out.push_str("</p>\n");
+        }
+        Block::Heading { level, content, id } => {
+            let _ = write!(out, "<h{level}");
+            if let Some(id) = id {
+                let _ = write!(out, " id=\"{}\"", escape_attr(id));
+            }
+            out.push('>');
+            render_inlines(content, ctx, out);
+            let _ = writeln!(out, "</h{level}>");
+        }
+        Block::List {
+            ordered,
+            start,
+            tight,
+            items,
+        } => {
+            let tag = if *ordered { "ol" } else { "ul" };
+            match start {
+                Some(n) if *ordered => {
+                    let _ = writeln!(out, "<{tag} start=\"{n}\">");
+                }
+                _ => out.push_str(&format!("<{tag}>\n")),
+            }
+            for item in items {
+                out.push_str("<li");
+                if let Some(done) = item.task {
+                    let _ = write!(
+                        out,
+                        " class=\"task-list-item{}\"",
+                        if done { " is-checked" } else { "" }
+                    );
+                }
+                out.push('>');
+                if let Some(done) = item.task {
+                    let _ = write!(
+                        out,
+                        "<input type=\"checkbox\" disabled{}> ",
+                        if done { " checked" } else { "" }
+                    );
+                }
+                if *tight {
+                    // Tight list: item content renders without <p> wrappers.
+                    for block in &item.body {
+                        match block {
+                            Block::Paragraph { content, .. } => render_inlines(content, ctx, out),
+                            other => render_block(other, ctx, out),
+                        }
+                    }
+                } else {
+                    for block in &item.body {
+                        render_block(block, ctx, out);
+                    }
+                }
+                out.push_str("</li>\n");
+            }
+            let _ = writeln!(out, "</{tag}>");
+        }
+        Block::Quote(body) => {
+            out.push_str("<blockquote>\n");
+            for block in body {
+                render_block(block, ctx, out);
+            }
+            out.push_str("</blockquote>\n");
+        }
+        Block::Callout {
+            kind,
+            fold,
+            metadata,
+            title,
+            body,
+        } => {
+            out.push_str("<div");
+            if let Some(meta) = metadata {
+                let _ = write!(out, " data-callout-metadata=\"{}\"", escape_attr(meta));
+            }
+            let _ = write!(
+                out,
+                " class=\"callout\" data-callout=\"{}\"",
+                escape_attr(kind)
+            );
+            match fold {
+                Fold::Open => out.push_str(" data-callout-foldable data-callout-open"),
+                Fold::Closed => out.push_str(" data-callout-foldable"),
+                Fold::None => {}
+            }
+            out.push_str(">\n<div class=\"callout-title\"><div class=\"callout-title-inner\">");
+            render_inlines(title, ctx, out);
+            out.push_str("</div></div>\n");
+            // Obsidian renders folded content lazily; we always render it and
+            // let the `data-callout-foldable` attributes drive the CSS/JS.
+            out.push_str("<div class=\"callout-content\">\n");
+            for block in body {
+                render_block(block, ctx, out);
+            }
+            out.push_str("</div>\n</div>\n");
+        }
+        Block::Code { lang, text } => {
+            out.push_str("<pre><code");
+            if let Some(lang) = lang {
+                let _ = write!(out, " class=\"language-{}\"", escape_attr(lang));
+            }
+            out.push('>');
+            out.push_str(&escape(text));
+            out.push_str("</code></pre>\n");
+        }
+        Block::Math(text) => {
+            let _ = writeln!(
+                out,
+                "<span class=\"math math-display\">$$ {} $$</span>",
+                escape(text)
+            );
+        }
+        Block::Table {
+            alignments,
+            header,
+            rows,
+        } => {
+            out.push_str("<table>\n");
+            if !header.is_empty() {
+                out.push_str("<thead>\n<tr>\n");
+                for (i, cell) in header.iter().enumerate() {
+                    let _ = write!(out, "<th{}>", align_attr(alignments.get(i)));
+                    render_inlines(cell, ctx, out);
+                    out.push_str("</th>\n");
+                }
+                out.push_str("</tr>\n</thead>\n");
+            }
+            if !rows.is_empty() {
+                out.push_str("<tbody>\n");
+                for row in rows {
+                    out.push_str("<tr>\n");
+                    for (i, cell) in row.iter().enumerate() {
+                        let _ = write!(out, "<td{}>", align_attr(alignments.get(i)));
+                        render_inlines(cell, ctx, out);
+                        out.push_str("</td>\n");
+                    }
+                    out.push_str("</tr>\n");
+                }
+                out.push_str("</tbody>\n");
+            }
+            out.push_str("</table>\n");
+        }
+        Block::Rule => out.push_str("<hr>\n"),
+        Block::EmbedBlock(embed) => render_embed_block(embed, ctx, out),
+        Block::FootnoteDef { label, body } => {
+            let _ = writeln!(
+                out,
+                "<div class=\"footnote-def\" id=\"fn-{}\">",
+                escape_attr(label)
+            );
+            for block in body {
+                render_block(block, ctx, out);
+            }
+            out.push_str("</div>\n");
+        }
+        Block::Html(html) => out.push_str(&sanitize(html, ctx)),
+    }
+}
+
+fn render_embed_block(embed: &crate::ir::Embed, ctx: &RenderContext, out: &mut String) {
+    let target = &embed.target;
+    if is_media(&target.note) {
+        out.push_str("<p>");
+        render_embed_media(embed, ctx, out);
+        out.push_str("</p>\n");
+        return;
+    }
+    render_embed_note(target, ctx, out);
+}
+
+/// Media embeds (`![[img.png|300]]`) render as <img>/<video> elements.
+fn render_embed_media(embed: &crate::ir::Embed, ctx: &RenderContext, out: &mut String) {
+    let target = &embed.target;
+    let resolved = ctx.index.resolve(&target.note, ctx.from_note);
+    let _ = write!(
+        out,
+        "<img class=\"internal-embed\" src=\"{}\" alt=\"{}\"",
+        resolved.map(href_encode).as_deref().unwrap_or(""),
+        escape_attr(&target.note)
+    );
+    if let Some((w, h)) = embed.size {
+        let _ = write!(out, " width=\"{w}\"");
+        if let Some(h) = h {
+            let _ = write!(out, " height=\"{h}\"");
+        }
+    }
+    if resolved.is_none() {
+        out.push_str(" data-unresolved");
+    }
+    out.push('>');
+}
+
+/// Note/section/block transclusion (`![[Note]]`, `![[Note#Heading]]`).
+fn render_embed_note(target: &crate::ir::WikiTarget, ctx: &RenderContext, out: &mut String) {
+    let Some(path) = ctx
+        .index
+        .resolve(&target.note, ctx.from_note)
+        .map(str::to_string)
+    else {
+        let _ = writeln!(
+            out,
+            "<div class=\"internal-embed is-unresolved\" data-target=\"{}\">{}</div>",
+            escape_attr(&target.note),
+            escape(&target.note)
+        );
+        return;
+    };
+
+    let Some(source) = ctx.notes.note_source(&path) else {
+        let _ = writeln!(
+            out,
+            "<div class=\"internal-embed is-unresolved\" data-target=\"{}\"></div>",
+            escape_attr(&path)
+        );
+        return;
+    };
+    if !ctx.entering(&path) {
+        // Depth limit or cycle: say so instead of recursing forever.
+        let _ = writeln!(
+            out,
+            "<div class=\"internal-embed is-unresolved\" data-target=\"{}\">[embed depth limit]</div>",
+            escape_attr(&path)
+        );
+        return;
+    }
+    let doc = crate::lower::parse_note(&source);
+    let mut rendered = String::new();
+    let blocks: &[Block] = match (&target.heading, &target.block) {
+        (Some(heading), _) => section(&doc.blocks, heading),
+        (None, Some(block_id)) => slice_block(&doc.blocks, block_id),
+        _ => &doc.blocks,
+    };
+    for block in blocks {
+        render_block(block, ctx, &mut rendered);
+    }
+    ctx.leaving();
+    if rendered.is_empty() {
+        let _ = writeln!(
+            out,
+            "<div class=\"internal-embed is-unresolved\" data-target=\"{}\"></div>",
+            escape_attr(&path)
+        );
+    } else {
+        let _ = write!(
+            out,
+            "<div class=\"internal-embed\" data-target=\"{}\">\n{}</div>\n",
+            escape_attr(&path),
+            rendered
+        );
+    }
+}
+
+/// The blocks of `#Heading` up to the next heading of the same or higher level.
+fn section<'a>(blocks: &'a [Block], heading: &str) -> &'a [Block] {
+    let wanted = heading.trim().to_lowercase();
+    let mut started_at: Option<(usize, u8)> = None;
+    let mut end = blocks.len();
+    for (i, block) in blocks.iter().enumerate() {
+        if let Block::Heading { level, content, .. } = block {
+            let text = plain(content).to_lowercase();
+            match started_at {
+                None => {
+                    if text == wanted {
+                        started_at = Some((i, *level));
+                    }
+                }
+                Some((_, open_level)) => {
+                    if *level <= open_level {
+                        end = i;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    match started_at {
+        Some((s, _)) => &blocks[s..end],
+        None => &[],
+    }
+}
+
+/// The block carrying `#^block-id` (paragraph or list item).
+fn slice_block<'a>(blocks: &'a [Block], block_id: &str) -> &'a [Block] {
+    for (i, block) in blocks.iter().enumerate() {
+        let found = match block {
+            Block::Paragraph { block_id: id, .. } => id.as_deref() == Some(block_id),
+            Block::List { items, .. } => items
+                .iter()
+                .any(|it| it.block_id.as_deref() == Some(block_id)),
+            _ => false,
+        };
+        if found {
+            return &blocks[i..i + 1];
+        }
+    }
+    &[]
+}
+
+fn render_inlines(inlines: &[Inline], ctx: &RenderContext, out: &mut String) {
+    // Runs of adjacent raw-HTML and text inlines are buffered and sanitized
+    // TOGETHER, so paired tags like <abbr>…</abbr> are cleaned as one
+    // fragment instead of being closed prematurely.
+    let mut raw_run = String::new();
+    for inline in inlines {
+        match inline {
+            Inline::Html(html) => raw_run.push_str(html),
+            Inline::Text(text) if !raw_run.is_empty() => {
+                raw_run.push_str(&escape(text));
+            }
+            _ => {
+                flush_raw_run(&mut raw_run, ctx, out);
+                render_inline(inline, ctx, out);
+            }
+        }
+    }
+    flush_raw_run(&mut raw_run, ctx, out);
+}
+
+fn flush_raw_run(raw_run: &mut String, ctx: &RenderContext, out: &mut String) {
+    if raw_run.is_empty() {
+        return;
+    }
+    out.push_str(&sanitize(raw_run, ctx));
+    raw_run.clear();
+}
+
+fn render_inline(inline: &Inline, ctx: &RenderContext, out: &mut String) {
+    match inline {
+        Inline::Text(text) => out.push_str(&escape(text)),
+        Inline::Emph(children) => wrap_inline("em", children, ctx, out),
+        Inline::Strong(children) => wrap_inline("strong", children, ctx, out),
+        Inline::Strike(children) => wrap_inline("del", children, ctx, out),
+        Inline::Highlight(children) => wrap_inline("mark", children, ctx, out),
+        Inline::Code(code) => {
+            let _ = write!(out, "<code>{}</code>", escape(code));
+        }
+        Inline::Math(text) => {
+            let _ = write!(
+                out,
+                "<span class=\"math math-inline\">$ {} $</span>",
+                escape(text)
+            );
+        }
+        Inline::Link {
+            url,
+            title,
+            content,
+        } => {
+            let _ = write!(
+                out,
+                "<a href=\"{}\"{}>",
+                escape_attr(url),
+                title
+                    .as_ref()
+                    .map(|t| format!(" title=\"{}\"", escape_attr(t)))
+                    .unwrap_or_default()
+            );
+            render_inlines(content, ctx, out);
+            out.push_str("</a>");
+        }
+        Inline::Image { url, alt } => {
+            let _ = write!(
+                out,
+                "<img src=\"{}\" alt=\"{}\">",
+                escape_attr(url),
+                escape_attr(alt)
+            );
+        }
+        Inline::WikiLink(link) => render_wikilink(link, ctx, out),
+        Inline::Embed(embed) => render_embed_media(embed, ctx, out),
+        Inline::Tag(name) => {
+            let _ = write!(
+                out,
+                "<a class=\"tag\" href=\"#{}\">#{}</a>",
+                escape_attr(name),
+                escape(name)
+            );
+        }
+        Inline::FootnoteRef(label) => {
+            let number = ctx.footnote_number(label);
+            let _ = write!(
+                out,
+                "<sup class=\"footnote-ref\"><a href=\"#fn-{}\">{}</a></sup>",
+                escape_attr(label),
+                number
+            );
+        }
+        Inline::InlineFootnote(children) => {
+            // comrak normalizes inline footnotes to refs + defs; kept for
+            // IR completeness.
+            wrap_inline("span", children, ctx, out);
+        }
+        Inline::Html(html) => out.push_str(&sanitize(html, ctx)),
+        Inline::SoftBreak => {
+            if ctx.options.strict_line_breaks {
+                out.push('\n');
+            } else {
+                out.push_str("<br>\n");
+            }
+        }
+        Inline::HardBreak => out.push_str("<br>\n"),
+    }
+}
+
+/// Wikilinks resolve through the index; unresolved ones get `is-unresolved`
+/// and keep their target in `data-target`. `[[Note#Heading]]` displays as
+/// "Note > Heading" unless an alias is given.
+fn render_wikilink(link: &crate::ir::WikiLink, ctx: &RenderContext, out: &mut String) {
+    let target = &link.target;
+    let label = match &link.alias {
+        Some(alias) => alias.clone(),
+        None => {
+            let note_display = if target.note.is_empty() {
+                String::new()
+            } else {
+                target.note.clone()
+            };
+            match (&target.heading, &target.block) {
+                (Some(h), _) if !note_display.is_empty() => format!("{note_display} > {h}"),
+                (Some(h), _) => h.clone(),
+                (None, Some(b)) => format!("{note_display} > ^{b}"),
+                (None, None) => note_display,
+            }
+        }
+    };
+
+    // Same-document links ([[#Heading]]): anchor only.
+    if target.note.is_empty() {
+        let anchor = match (&target.heading, &target.block) {
+            (Some(h), _) => format!("#{}", escape_attr(h)),
+            (None, Some(b)) => format!("#^{}", escape_attr(b)),
+            _ => String::new(),
+        };
+        let _ = write!(
+            out,
+            "<a class=\"internal-link\" href=\"{anchor}\">{}</a>",
+            escape(&label)
+        );
+        return;
+    }
+
+    let resolved = ctx
+        .index
+        .resolve(&target.note, ctx.from_note)
+        .map(str::to_string);
+    let fragment = match (&target.heading, &target.block) {
+        (Some(h), _) => format!("#{}", escape_attr(h)),
+        (None, Some(b)) => format!("#^{}", escape_attr(b)),
+        (None, None) => String::new(),
+    };
+    match resolved {
+        Some(path) => {
+            let _ = write!(
+                out,
+                "<a class=\"internal-link\" href=\"{}{fragment}\" data-href=\"{}\">{}</a>",
+                href_encode(&path),
+                escape_attr(&path),
+                escape(&label)
+            );
+        }
+        None => {
+            let _ = write!(
+                out,
+                "<a class=\"internal-link is-unresolved\" data-href=\"{}\">{}</a>",
+                escape_attr(&target.note),
+                escape(&label)
+            );
+        }
+    }
+    let _ = LinkKind::Wiki; // resolution semantics live in VaultIndex
+}
+
+fn wrap_inline(tag: &str, children: &[Inline], ctx: &RenderContext, out: &mut String) {
+    let _ = write!(out, "<{tag}>");
+    render_inlines(children, ctx, out);
+    let _ = write!(out, "</{tag}>");
+}
+
+fn align_attr(alignment: Option<&Alignment>) -> String {
+    match alignment {
+        Some(Alignment::Left) => " style=\"text-align: left;\"".into(),
+        Some(Alignment::Center) => " style=\"text-align: center;\"".into(),
+        Some(Alignment::Right) => " style=\"text-align: right;\"".into(),
+        _ => String::new(),
+    }
+}
+
+fn is_media(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    [
+        "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "avif", "mp4", "webm", "mov",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+}
+
+/// Sanitize a raw HTML fragment. `class`/`id`/`title` survive so vault CSS
+/// keeps working; relative URLs pass through (they are vault paths); scripts
+/// and event handlers never do. Applied to RAW FRAGMENTS ONLY — never to the
+/// whole document, which would strip this renderer's own classes and ids.
+fn sanitize(fragment: &str, ctx: &RenderContext) -> String {
+    if !ctx.options.sanitize_html {
+        return fragment.to_string();
+    }
+    let mut builder = ammonia::Builder::default();
+    let mut generic: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    generic.insert("class");
+    generic.insert("id");
+    generic.insert("title");
+    builder.generic_attributes(generic);
+    builder.url_relative(ammonia::UrlRelative::PassThrough);
+    builder.clean(fragment).to_string()
+}
+
+fn plain(inlines: &[Inline]) -> String {
+    let mut text = String::new();
+    for inline in inlines {
+        match inline {
+            Inline::Text(t) => text.push_str(t),
+            Inline::Code(c) => text.push_str(c),
+            Inline::Emph(inner)
+            | Inline::Strong(inner)
+            | Inline::Strike(inner)
+            | Inline::Highlight(inner)
+            | Inline::InlineFootnote(inner) => text.push_str(&plain(inner)),
+            Inline::Link { content, .. } => text.push_str(&plain(content)),
+            _ => {}
+        }
+    }
+    text
+}
+
+fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\u{26}' => out.push_str("\u{26}amp;"),
+            '<' => out.push_str("\u{26}lt;"),
+            '>' => out.push_str("\u{26}gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn escape_attr(text: &str) -> String {
+    escape(text).replace('"', "\u{26}quot;")
+}
+
+/// Percent-encode a vault-relative path for use in an href/src.
+fn href_encode(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
