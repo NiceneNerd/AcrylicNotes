@@ -1,0 +1,32 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+description = "Vault Notes — GUI frontend (M0 glass spike)"
+
+[dependencies]
+vault-glass = { path = "../vault-glass" }
+
+# libcosmic is used from a local checkout so the build does not depend on the
+# network. Pinned commit: 95236a944bfd51c63a2fc65fe50a592c47168d40 (2026-10-27).
+# Replace `path` with
+#   git = "https://github.com/pop-os/libcosmic.git"
+#   rev = "95236a944bfd51c63a2fc65fe50a592c47168d40"
+# to build without the checkout.
+[dependencies.libcosmic]
+path = "/cella/Git/libcosmic"
+default-features = false
+features = ["wgpu", "tokio", "a11y"]
+
+# Per-target feature selection (see HANDOFF.md 4.1): Wayland on Linux,
+# winit everywhere else. `cargo tree --target <triple> -e features` shows the
+# result.
+[target.'cfg(target_os = "linux")'.dependencies.libcosmic]
+path = "/cella/Git/libcosmic"
+default-features = false
+features = ["wayland", "dbus-config"]
+
+[target.'cfg(not(target_os = "linux"))'.dependencies.libcosmic]
+path = "/cella/Git/libcosmic"
+default-features = false
+features = ["winit"]

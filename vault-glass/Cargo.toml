@@ -1,0 +1,9 @@
+[package]
+name = "vault-glass"
+version = "0.1.0"
+edition = "2021"
+description = "One trait for putting a real backdrop (frosted glass, Mica, Acrylic, vibrancy) behind a window"
+
+[dependencies]
+raw-window-handle = "0.6"
+window-vibrancy = "0.8"
