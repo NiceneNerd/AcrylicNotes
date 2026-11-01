@@ -134,13 +134,21 @@ re-run everything (see M2).
 
 ### 4.3 Known gaps in the current code (confirmed by `examples/gaps.rs`)
 
-`extract()` currently turns a wikilink into a token in each of these cases:
+RESOLVED in M2/M3 — the list below is kept for reference; every item was
+closed and is now covered by a test. `cargo run -p vault-md --example gaps`
+prints the five cases and asserts that none of them extracts a token.
+
+`extract()` used to turn a wikilink into a token in each of these cases:
 
 - Indented (4-space) code blocks. Definitely wrong; must skip.
+  → FIXED (`indented_code_mask`).
 - Frontmatter. Definitely wrong: split frontmatter FIRST and run `extract`
   on the body only. (Obsidian properties often hold quoted `"[[Note]]"`.)
+  → FIXED (`extract_document`; the split is lossless).
 - Escaped `\[[x]]`, inline math `$a[[b]]c$`, raw HTML blocks. Check what
   real Obsidian does for each, then match it.
+  → CHECKED against real Obsidian (2026-10-31): none of the three is a
+  link. All three now extract zero tokens.
 
 Other open items: `parse_target` stores nested `#H1#H2` raw in `heading`;
 tag rules were taken from Obsidian's docs (letters, digits, `_ - /`, at
@@ -150,6 +158,15 @@ assumed NOT to resolve links (autocomplete only); macOS filename Unicode
 normalization (NFD/NFC) and Windows case-insensitivity are not handled yet;
 non-`.md` link targets (pdf, canvas, images with spaces) are only lightly
 covered.
+
+→ RESOLVED/STATUS: the tie-break is CONFIRMED (nearest, then shallowest) and
+implemented — the corpus caught that an "exact path" bonus wrongly let a
+root file beat the nearest duplicate. Aliases CONFIRMED not to resolve
+links. Tag boundaries: `(#tag)` confirmed NOT a tag, `foo#bar` assumed.
+Nested `#H1#H2` headings and macOS NFD storage remain open (NFD matching
+itself is implemented and unit-tested; only real-macOS storage is
+untested). Non-`.md` targets are now covered by the corpus (attachments
+with spaces, wiki and percent-encoded Markdown links).
 
 ## 5. Milestones (do in order)
 
