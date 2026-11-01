@@ -89,12 +89,13 @@ impl VaultIndex {
 
         let from_dir = from.rsplit_once('/').map_or("", |(d, _)| d);
         let mut hits: Vec<&str> = hit_idx.iter().map(|&i| self.files[i].as_str()).collect();
+        // Confirmed against real Obsidian (M3): among candidates, the NEAREST
+        // folder wins, then the shallowest path. There is no "exact path"
+        // bonus: from Notes/, `[[Glass]]` opens Notes/Glass.md even when a
+        // root Glass.md matches the query exactly.
         hits.sort_by_key(|f| {
-            let exact = key(f) != t;
-            let shared = common_dirs(f, from_dir);
             (
-                exact,
-                Reverse(shared),
+                Reverse(common_dirs(f, from_dir)),
                 f.matches('/').count(),
                 f.to_string(),
             )
@@ -226,6 +227,19 @@ mod tests {
         );
         assert_eq!(i.resolve("Glass", "Notes/Rust.md"), Some("Notes/Glass.md"));
         assert_eq!(i.candidates("Glass", "Journal/x.md").len(), 3);
+    }
+
+    /// Confirmed against real Obsidian (M3): a root file matching the bare
+    /// name exactly does NOT beat the nearest duplicate.
+    #[test]
+    fn root_file_does_not_beat_the_nearest_duplicate() {
+        let i = VaultIndex::new(["Glass.md", "Notes/Glass.md", "Notes/Source.md"]);
+        assert_eq!(
+            i.resolve("Glass", "Notes/Source.md"),
+            Some("Notes/Glass.md")
+        );
+        assert_eq!(i.resolve("Glass", "root.md"), Some("Glass.md"));
+        assert_eq!(i.candidates("Glass", "root.md").len(), 2);
     }
 
     #[test]

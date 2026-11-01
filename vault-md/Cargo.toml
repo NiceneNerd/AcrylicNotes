@@ -11,3 +11,6 @@ comrak = { version = "0.59", default-features = false, features = ["attributes"]
 vault-core = { path = "../vault-core" }
 ammonia = "4.2"
 thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.22"

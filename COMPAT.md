@@ -124,5 +124,9 @@ Previously confirmed (M2):
   libcosmic itself does not compile for Windows yet — fails in upstream
   `accesskit_winit` (E0782, pre-2021 `&Trait` argument syntax) on both the
   host mingw toolchain and cross's container toolchain — so the GUI remains
-  unbuildable there until that pin is updated.
+  unbuildable there until that pin is updated. Also note: **Wine rejects
+  filenames containing combining characters** (ERROR_INVALID_NAME) — real
+  NTFS accepts them, but we cannot verify that without real Windows, so the
+  corpus's NFD-named fixture is exercised on Unix only (its test is
+  `#[cfg_attr(windows, ignore)]`).
 - **macOS:** untested — no machine, no SDK for cross-compilation.
