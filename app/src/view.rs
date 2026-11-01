@@ -76,8 +76,16 @@ fn main_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
     let mut col = column::Column::new()
         .width(Length::Fill)
         .height(Length::Fill);
-    if let Some(paths) = &app.banner {
-        col = col.push(banner(paths, palette));
+    if let Some(banner) = &app.banner {
+        col = col.push(banner_view(banner, palette));
+    }
+    if let Some(error) = &app.error {
+        col = col.push(
+            row::Row::new()
+                .spacing(8)
+                .push(text(error).class(palette.danger))
+                .push(button::text("×").on_press(Message::ErrorDismiss)),
+        );
     }
     let sidebar = container(scrollable::scrollable(tree_view(app, palette)).width(Length::Fill))
         .width(Length::Fixed(250.0))
@@ -89,28 +97,62 @@ fn main_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
     col.into()
 }
 
-/// Non-blocking banner for files that changed on disk while dirty (M4
-/// decision 7): reload discards local edits, keep dismisses.
-fn banner<'a>(paths: &'a [String], palette: Palette) -> Element<'a, Message> {
-    let names = paths
+/// Non-blocking external-change banner (M4 decision 7). Two sections:
+/// reloaded tabs are informational; conflicting tabs (unsaved edits vs.
+/// disk) offer reload-discard, keep-local, or a deliberate overwrite.
+fn banner_view<'a>(banner: &crate::app::Banner, palette: Palette) -> Element<'a, Message> {
+    let mut col = column::Column::new().spacing(4).width(Length::Fill);
+    if !banner.conflicts.is_empty() {
+        col = col.push(
+            row::Row::new()
+                .spacing(8)
+                .push(
+                    text(format!(
+                        "Changed on disk while you edited: {}",
+                        titles(&banner.conflicts)
+                    ))
+                    .class(palette.text),
+                )
+                .push(button::text("Reload from disk").on_press(Message::BannerReload))
+                .push(button::text("Keep mine").on_press(Message::BannerDismiss))
+                .push(button::suggested("Save mine anyway").on_press(Message::BannerOverwrite)),
+        );
+    }
+    if !banner.reloaded.is_empty() {
+        col = col.push(
+            row::Row::new()
+                .spacing(8)
+                .push(
+                    text(format!(
+                        "Reloaded from disk (changed externally): {}",
+                        titles(&banner.reloaded)
+                    ))
+                    .class(palette.muted),
+                )
+                .push(button::text("Dismiss").on_press(Message::BannerDismiss)),
+        );
+    }
+    let background = if banner.conflicts.is_empty() {
+        with_alpha(palette.muted, 0.15)
+    } else {
+        with_alpha(palette.warning, 0.18)
+    };
+    container(col)
+        .padding(6)
+        .width(Length::Fill)
+        .style(move |_| cosmic::widget::container::Style {
+            background: Some(Background::Color(background)),
+            ..Default::default()
+        })
+        .into()
+}
+
+fn titles(paths: &[String]) -> String {
+    paths
         .iter()
         .map(|path| crate::app::title_of(path))
         .collect::<Vec<_>>()
-        .join(", ");
-    container(
-        row::Row::new()
-            .spacing(8)
-            .push(text(format!("Changed on disk while you edited: {names}")).class(palette.text))
-            .push(button::text("Reload from disk").on_press(Message::BannerReload))
-            .push(button::text("Keep mine").on_press(Message::BannerDismiss)),
-    )
-    .padding(6)
-    .width(Length::Fill)
-    .style(move |_| cosmic::widget::container::Style {
-        background: Some(Background::Color(with_alpha(palette.warning, 0.18))),
-        ..Default::default()
-    })
-    .into()
+        .join(", ")
 }
 
 // --- sidebar ---------------------------------------------------------------

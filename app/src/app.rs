@@ -142,7 +142,11 @@ pub enum Message {
     /// Periodic watcher poll.
     WatchTick,
     BannerReload,
+    /// Conflict resolution: deliberately overwrite the external changes
+    /// with the local buffer.
+    BannerOverwrite,
     BannerDismiss,
+    ErrorDismiss,
     TabOpen(String),
     TabClose(usize),
     TabSelect(usize),
@@ -169,7 +173,7 @@ pub struct VaultNotes {
     pub active: Option<usize>,
     pub pane: PaneMode,
     /// Paths of open tabs that changed on disk while dirty.
-    pub banner: Option<Vec<String>>,
+    pub banner: Option<Banner>,
     pub error: Option<String>,
     pub vault_input: String,
     pub strict_breaks: bool,
@@ -285,24 +289,23 @@ impl VaultNotes {
             return Task::none();
         };
         let tab = &mut self.tabs[idx];
-        let text = tab.content.text();
-        let disk = vault.note_source(&tab.path).unwrap_or_default();
-        let result = match save_plan(&text, &disk) {
-            SavePlan::Body(body) => vault.save_note(&tab.path, &disk, &body),
-            SavePlan::Full(full) => vault.save_note_full(&tab.path, &disk, &full),
-        };
-        match result {
+        // The sentinel is the base text our edits were made against: an
+        // external change since then refuses the save instead of clobbering.
+        let base = tab.base_text.clone();
+        match write_tab(vault, tab, &base) {
             Ok(_) => {
-                tab.base_text = text;
+                tab.base_text = tab.content.text();
                 tab.refresh_doc();
+                self.error = None;
                 self.rebuild_index();
             }
             Err(VaultError::Write(vault_core::WriteError::ExternallyModified)) => {
-                // The file changed under us: surface the banner path.
-                if let Some(tab) = self.tabs.get(idx) {
-                    self.banner = Some(vec![tab.path.clone()]);
-                }
-                self.error = Some("file changed on disk while editing".to_string());
+                // The file changed under us: offer resolution in the banner.
+                let path = tab.path.clone();
+                self.banner = Some(Banner {
+                    reloaded: Vec::new(),
+                    conflicts: vec![path],
+                });
             }
             Err(error) => {
                 self.error = Some(format!("save failed: {error}"));
@@ -327,24 +330,29 @@ impl VaultNotes {
         };
         self.rebuild_index();
 
-        let mut manual: Vec<String> = Vec::new();
+        let mut banner = Banner::default();
         if let Some(vault) = self.vault.as_ref() {
             for tab in &mut self.tabs {
                 if !dirty.iter().any(|path| path == &tab.path) {
                     continue;
                 }
-                if tab.is_dirty() {
-                    manual.push(tab.path.clone());
-                } else {
-                    let source = vault.note_source(&tab.path).unwrap_or_default();
-                    tab.content = Content::with_text(&source);
-                    tab.base_text = source;
-                    tab.refresh_doc();
+                let disk = vault.note_source(&tab.path).unwrap_or_default();
+                match external_action(&disk, &tab.base_text, tab.is_dirty()) {
+                    ExternalAction::None => {}
+                    ExternalAction::Reloaded => {
+                        tab.content = Content::with_text(&disk);
+                        tab.base_text = disk;
+                        tab.refresh_doc();
+                        banner.reloaded.push(tab.path.clone());
+                    }
+                    ExternalAction::Conflict => {
+                        banner.conflicts.push(tab.path.clone());
+                    }
                 }
             }
         }
-        if !manual.is_empty() {
-            self.banner = Some(manual);
+        if !banner.is_empty() {
+            self.banner = Some(banner);
         }
         Task::none()
     }
@@ -407,11 +415,15 @@ impl cosmic::Application for VaultNotes {
             Message::VaultOpen(path) => self.open_vault(path),
             Message::WatchTick => self.poll_watcher(),
             Message::BannerReload => {
-                // Discard local edits in the banner's tabs and reload.
-                let paths = self.banner.take().unwrap_or_default();
+                // Discard local edits in the conflicting tabs; reload disk.
+                let conflicts = self
+                    .banner
+                    .take()
+                    .map(|banner| banner.conflicts)
+                    .unwrap_or_default();
                 if let Some(vault) = self.vault.as_ref() {
                     for tab in &mut self.tabs {
-                        if !paths.iter().any(|p| p == &tab.path) {
+                        if !conflicts.iter().any(|p| p == &tab.path) {
                             continue;
                         }
                         let source = vault.note_source(&tab.path).unwrap_or_default();
@@ -423,8 +435,37 @@ impl cosmic::Application for VaultNotes {
                 self.error = None;
                 Task::none()
             }
+            Message::BannerOverwrite => {
+                // Deliberate resolution: write the local buffer over the
+                // external change (fresh disk text as the sentinel).
+                let conflicts = self
+                    .banner
+                    .take()
+                    .map(|banner| banner.conflicts)
+                    .unwrap_or_default();
+                if let Some(vault) = self.vault.as_mut() {
+                    for tab in &mut self.tabs {
+                        if !conflicts.iter().any(|p| p == &tab.path) {
+                            continue;
+                        }
+                        let disk = vault.note_source(&tab.path).unwrap_or_default();
+                        match write_tab(vault, tab, &disk) {
+                            Ok(_) => tab.base_text = tab.content.text(),
+                            Err(error) => {
+                                self.error = Some(format!("overwrite failed: {error}"));
+                            }
+                        }
+                    }
+                }
+                self.rebuild_index();
+                Task::none()
+            }
             Message::BannerDismiss => {
                 self.banner = None;
+                Task::none()
+            }
+            Message::ErrorDismiss => {
+                self.error = None;
                 Task::none()
             }
             Message::TabOpen(path) => self.open_tab(path),
@@ -542,11 +583,68 @@ impl cosmic::Application for VaultNotes {
     }
 }
 
+/// What the watcher poll decides to do about one externally changed tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExternalAction {
+    /// Content-identical change (e.g. an mtime-only `touch`): nothing to do.
+    None,
+    /// Real content change with no local edits: auto-reload + info banner.
+    Reloaded,
+    /// Real content change with unsaved edits: conflict banner.
+    Conflict,
+}
+
+/// Classify an external change against the tab's base text (M4 decision 7):
+/// identical content is silent; otherwise dirty tabs conflict and clean
+/// tabs reload.
+pub(crate) fn external_action(disk: &str, base: &str, tab_dirty: bool) -> ExternalAction {
+    if disk == base {
+        ExternalAction::None
+    } else if tab_dirty {
+        ExternalAction::Conflict
+    } else {
+        ExternalAction::Reloaded
+    }
+}
+
+/// The non-blocking external-change banner: what was reloaded under us, and
+/// which tabs have unsaved edits conflicting with disk.
+#[derive(Debug, Default)]
+pub struct Banner {
+    pub reloaded: Vec<String>,
+    pub conflicts: Vec<String>,
+}
+
+impl Banner {
+    fn is_empty(&self) -> bool {
+        self.reloaded.is_empty() && self.conflicts.is_empty()
+    }
+}
+
 /// How the editor buffer should be written: body-only (frontmatter bytes are
 /// provably untouched) or full text (the user edited the frontmatter).
 pub(crate) enum SavePlan {
     Body(String),
     Full(String),
+}
+
+/// Write a tab's buffer through the safe save path.
+///
+/// `original` is the on-disk text this write is based on. Saves normally
+/// pass the tab's `base_text`, so an external change since load is REFUSED
+/// (`ExternallyModified`) instead of silently clobbered; the conflict
+/// banner's "save mine anyway" passes the fresh disk text to overwrite
+/// deliberately.
+pub(crate) fn write_tab(
+    vault: &mut Vault,
+    tab: &mut Tab,
+    original: &str,
+) -> Result<vault_core::WriteResult, VaultError> {
+    let text = tab.content.text();
+    match save_plan(&text, original) {
+        SavePlan::Body(body) => vault.save_note(&tab.path, original, &body),
+        SavePlan::Full(full) => vault.save_note_full(&tab.path, original, &full),
+    }
 }
 
 pub(crate) fn save_plan(editor: &str, disk: &str) -> SavePlan {
@@ -648,5 +746,55 @@ mod tests {
     fn tab_titles_are_file_stems() {
         assert_eq!(title_of("Journal/2026/04/14.md"), "14");
         assert_eq!(title_of("Glass.md"), "Glass");
+    }
+
+    #[test]
+    fn external_changes_classify_by_content_then_dirtiness() {
+        use ExternalAction::*;
+        // Content-identical (an mtime-only `touch`): silent either way.
+        assert_eq!(external_action("same", "same", false), None);
+        assert_eq!(external_action("same", "same", true), None);
+        // Real change: clean tabs reload, dirty tabs conflict.
+        assert_eq!(external_action("new", "old", false), Reloaded);
+        assert_eq!(external_action("new", "old", true), Conflict);
+    }
+
+    #[test]
+    fn tab_save_refuses_to_clobber_external_changes() {
+        use cosmic::iced::widget::text_editor::{Action, Edit};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("n.md"), "hello\n").unwrap();
+        let mut vault = Vault::open(tmp.path()).unwrap();
+        let mut tab = Tab::open("n.md".to_string(), "hello\n");
+
+        // Local edit + save against our base: goes through the safe path.
+        tab.content.perform(Action::Edit(Edit::Insert('X')));
+        let base = tab.base_text.clone();
+        write_tab(&mut vault, &mut tab, &base).unwrap();
+        assert_eq!(
+            vault.note_source("n.md").as_deref(),
+            Some(tab.content.text().as_str())
+        );
+
+        // External change after our base: refused, disk keeps its content.
+        std::fs::write(tmp.path().join("n.md"), "external\n").unwrap();
+        let base = tab.base_text.clone();
+        let err = write_tab(&mut vault, &mut tab, &base);
+        assert!(matches!(
+            err,
+            Err(VaultError::Write(
+                vault_core::WriteError::ExternallyModified
+            ))
+        ));
+        assert_eq!(vault.note_source("n.md").as_deref(), Some("external\n"));
+
+        // The banner's "save mine anyway": fresh disk text as the sentinel.
+        let fresh = vault.note_source("n.md").unwrap();
+        write_tab(&mut vault, &mut tab, &fresh).unwrap();
+        assert_eq!(
+            vault.note_source("n.md").as_deref(),
+            Some(tab.content.text().as_str())
+        );
     }
 }

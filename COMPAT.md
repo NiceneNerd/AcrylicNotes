@@ -158,3 +158,11 @@ express what HTML does — all honest approximations, revisitable later:
 - New-note creation and frontmatter edits save through the same guarded
   path: `Vault::save_note` (body-only, frontmatter bytes provably reused)
   or `Vault::save_note_full` (full text, added in M4a).
+- **External changes and saves conflict-check**: a save's sentinel is the
+  tab's base text (what the edits were based on), so a save after an
+  external change is REFUSED rather than silently clobbering. The watcher
+  poll classifies changes by content: an mtime-only `touch` is silent;
+  a real change auto-reloads clean tabs (informational banner) and raises
+  a conflict banner for dirty tabs — Reload from disk / Keep mine / Save
+  mine anyway (the deliberate overwrite passes the fresh disk text as the
+  sentinel).
