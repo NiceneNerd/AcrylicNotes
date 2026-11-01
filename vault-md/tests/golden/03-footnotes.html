@@ -1,7 +1,15 @@
 <p>Text with a footnote<sup class="footnote-ref"><a href="#fn-1">1</a></sup> and an inline one<sup class="footnote-ref"><a href="#fn-__inline_1">2</a></sup> here.</p>
-<div class="footnote-def" id="fn-1">
+<p>Numbers follow REFERENCE order, not definition order: beta<sup class="footnote-ref"><a href="#fn-b">3</a></sup> comes first,<br>
+then alpha<sup class="footnote-ref"><a href="#fn-a">4</a></sup>.</p>
+<div class="footnote-def" id="fn-1" data-footnote-number="1">
 <p>The definition.</p>
 </div>
-<div class="footnote-def" id="fn-__inline_1">
+<div class="footnote-def" id="fn-__inline_1" data-footnote-number="2">
 <p>inline body</p>
+</div>
+<div class="footnote-def" id="fn-b" data-footnote-number="3">
+<p>beta definition</p>
+</div>
+<div class="footnote-def" id="fn-a" data-footnote-number="4">
+<p>alpha definition</p>
 </div>

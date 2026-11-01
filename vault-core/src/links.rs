@@ -340,7 +340,7 @@ fn is_tag_char(c: char) -> bool {
 }
 
 fn tag_boundary(prev: Option<&char>) -> bool {
-    prev.is_none_or(|p| !(p.is_alphanumeric() || matches!(p, '_' | '-' | '/' | '#')))
+    prev.is_none_or(|p| !(p.is_alphanumeric() || matches!(p, '_' | '-' | '/' | '#' | '(' | ')')))
 }
 
 /// Lines that are not inside a fenced code block, with inline code spans
@@ -522,6 +522,17 @@ mod tests {
         // but visible text keeps its tags
         assert_eq!(scan_tags("[see #tag here](x.md)\n"), ["tag"]);
         assert_eq!(scan_tags("<a href=\"#x\">[see #tag]</a>\n"), ["tag"]);
+    }
+
+    /// Confirmed against real Obsidian (M3, 2026-10-31): a `#` directly
+    /// after an open or close paren does NOT register as a tag.
+    #[test]
+    fn tags_after_parens_are_not_tags() {
+        assert!(scan_tags("(#tag) text\n").is_empty());
+        assert!(scan_tags("word)#tag\n").is_empty());
+        // whitespace and ordinary punctuation still start a tag
+        assert_eq!(scan_tags("word #tag\n"), ["tag"]);
+        assert_eq!(scan_tags("word, #tag\n"), ["tag"]);
     }
 
     #[test]

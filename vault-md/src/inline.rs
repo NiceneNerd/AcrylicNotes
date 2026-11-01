@@ -65,6 +65,38 @@ pub fn extract(src: &str) -> Extracted {
             i += 1;
             continue;
         }
+        // Confirmed against Obsidian (M3): wikilinks inside raw HTML blocks
+        // are literal. A line starting with '<' + letter, '/', '!' or '?'
+        // opens a CommonMark HTML block; copy lines until a blank line.
+        if at_line_start && chars[i] == '<' {
+            let opens_html = chars
+                .get(i + 1)
+                .is_some_and(|&n| n.is_ascii_alphabetic() || matches!(n, '/' | '!' | '?'));
+            if opens_html {
+                let mut j = i;
+                while j < chars.len() {
+                    let line_end = chars[j..]
+                        .iter()
+                        .position(|&x| x == '\n')
+                        .map_or(chars.len(), |p| j + p);
+                    let blank = chars[j..line_end]
+                        .iter()
+                        .all(|&x| matches!(x, ' ' | '\t' | '\r'));
+                    if blank {
+                        break;
+                    }
+                    j = if line_end < chars.len() {
+                        line_end + 1
+                    } else {
+                        line_end
+                    };
+                }
+                out.extend(&chars[i..j]);
+                i = j;
+                at_line_start = true;
+                continue;
+            }
+        }
         // fenced code block: copy verbatim through the closing fence
         if at_line_start {
             if let Some((fc, flen)) = fence_at(&chars, i) {
@@ -96,6 +128,65 @@ pub fn extract(src: &str) -> Extracted {
                 tokens.push(Token::Literal("#".into()));
                 out.push_str(&format!("{OPEN}l{}{CLOSE}", tokens.len() - 1));
                 i += 2;
+                at_line_start = false;
+                continue;
+            }
+            // Confirmed against Obsidian (M3): \\[[x]] does NOT render as a
+            // link — pass the escape through verbatim so comrak unescapes it.
+            '\\' => {
+                out.push(c);
+                if let Some(&next) = chars.get(i + 1) {
+                    out.push(next);
+                }
+                i += 2;
+                at_line_start = false;
+                continue;
+            }
+            // Confirmed against Obsidian (M3): wikilinks inside $math$ and
+            // $$display$$ are NOT links — copy math spans verbatim (comrak
+            // still parses them as math).
+            '$' if starts(&chars, i, "$$") => {
+                match find_str(&chars, i + 2, "$$") {
+                    Some(end) => {
+                        out.extend(&chars[i..end + 2]);
+                        i = end + 2;
+                    }
+                    // Unterminated `$$`: literal dollars.
+                    None => {
+                        out.push('$');
+                        i += 1;
+                    }
+                }
+                at_line_start = false;
+                continue;
+            }
+            '$' => {
+                // The closing `$` must not follow whitespace, which keeps
+                // "$5 and $10" literal (currency) and mirrors comrak's
+                // math_dollars rules.
+                let mut j = i + 1;
+                let mut closer = None;
+                while j < chars.len() {
+                    if chars[j] == '$' && j > i + 1 && !matches!(chars[j - 1], ' ' | '\t' | '\n') {
+                        closer = Some(j);
+                        break;
+                    }
+                    // A blank line ends the hunt: unterminated math.
+                    if chars[j] == '\n' && matches!(chars.get(j + 1), Some('\n') | Some('\r')) {
+                        break;
+                    }
+                    j += 1;
+                }
+                match closer {
+                    Some(end) => {
+                        out.extend(&chars[i..=end]);
+                        i = end + 1;
+                    }
+                    None => {
+                        out.push('$');
+                        i += 1;
+                    }
+                }
                 at_line_start = false;
                 continue;
             }
@@ -192,7 +283,7 @@ fn is_tag_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | '-' | '/')
 }
 fn tag_boundary(prev: Option<&char>) -> bool {
-    prev.is_none_or(|p| !(p.is_alphanumeric() || matches!(p, '_' | '-' | '/' | '#')))
+    prev.is_none_or(|p| !(p.is_alphanumeric() || matches!(p, '_' | '-' | '/' | '#' | '(' | ')')))
 }
 
 pub fn parse_target(s: &str) -> WikiTarget {
@@ -435,6 +526,55 @@ mod tests {
         assert!(e.text.contains("`[[no]]`") && e.text.contains("%%no%%"));
         let tilde = extract("~~~\n[[no]]\n~~~\n[[yes]]");
         assert_eq!(tilde.tokens.len(), 1);
+    }
+
+    /// Confirmed against real Obsidian (M3, 2026-10-31): an escaped
+    /// wikilink is NOT a link — it renders as literal text.
+    #[test]
+    fn escaped_wikilink_is_not_a_link() {
+        let e = extract("literal \\[[not a link]] here");
+        assert_eq!(e.tokens.len(), 0, "escaped link must not become a token");
+        assert!(e.text.contains("\\[[not a link]]"));
+    }
+
+    /// Confirmed against real Obsidian (M3): no links inside math.
+    #[test]
+    fn no_links_inside_math() {
+        let e = extract("inline $a[[b]]c$ math");
+        assert_eq!(e.tokens.len(), 0);
+        assert!(e.text.contains("$a[[b]]c$"));
+        let d = extract("$$\na[[b]]c\n$$");
+        assert_eq!(d.tokens.len(), 0);
+        assert!(d.text.contains("a[[b]]c"));
+    }
+
+    /// Currency stays text: the closing `$` follows whitespace.
+    #[test]
+    fn currency_dollars_are_literal() {
+        let e = extract("Costs $5 and $10 each.");
+        assert_eq!(e.tokens.len(), 0);
+        assert_eq!(e.text, "Costs $5 and $10 each.");
+    }
+
+    /// Confirmed against real Obsidian (M3): raw HTML blocks are literal.
+    #[test]
+    fn html_blocks_are_literal() {
+        let e = extract("<div>[[x]]</div>\n\nbut [[yes]]");
+        assert_eq!(e.tokens.len(), 1, "only the wikilink outside the block");
+        assert!(e.text.contains("<div>[[x]]</div>"));
+    }
+
+    /// Confirmed against real Obsidian (M3): a `#` directly after an open
+    /// or close paren does NOT start a tag.
+    #[test]
+    fn tag_after_paren_is_not_a_tag() {
+        assert!(tags(&lower("(#tag) text")).is_empty());
+        assert!(tags(&lower("word)#tag")).is_empty());
+        // a tag after whitespace or other punctuation is still a tag
+        assert_eq!(tags(&lower("word #tag")), ["tag"]);
+        assert_eq!(tags(&lower("word, #tag")), ["tag"]);
+        // a hyphen IS a tag character, so a hash after it is mid-word
+        assert!(tags(&lower("word-#tag")).is_empty());
     }
 
     #[test]

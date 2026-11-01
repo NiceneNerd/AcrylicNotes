@@ -94,8 +94,16 @@ impl<'a> RenderContext<'a> {
 pub fn render_html(doc: &Doc, ctx: &RenderContext) -> String {
     // Footnote definitions get numbers in document order; references then
     // display numbers like Obsidian does, not internal labels.
+    //
+    // Numbering follows REFERENCE order (confirmed against real Obsidian in
+    // M3): the first reference to a label is 1, the next new label 2, and so
+    // on. Definitions that are never referenced take the numbers after the
+    // referenced ones, in definition order.
     for block in &doc.blocks {
-        collect_footnote_defs(block, ctx);
+        collect_footnote_refs(block, ctx);
+    }
+    for block in &doc.blocks {
+        assign_unused_def_numbers(block, ctx);
     }
     let mut out = String::new();
     for block in &doc.blocks {
@@ -104,27 +112,84 @@ pub fn render_html(doc: &Doc, ctx: &RenderContext) -> String {
     out
 }
 
-fn collect_footnote_defs(block: &Block, ctx: &RenderContext) {
+/// Walk the document in reading order and number every footnote label the
+/// first time it is REFERENCED.
+fn collect_footnote_refs(block: &Block, ctx: &RenderContext) {
     match block {
-        Block::FootnoteDef { label, body } => {
-            let mut defs = ctx.footnote_defs.borrow_mut();
-            let next = defs.len() + 1;
-            defs.entry(label.clone()).or_insert(next);
-            drop(defs);
+        Block::Paragraph { content, .. } | Block::Heading { content, .. } => {
+            collect_inline_refs(content, ctx);
+        }
+        Block::Callout { title, body, .. } => {
+            collect_inline_refs(title, ctx);
             for b in body {
-                collect_footnote_defs(b, ctx);
+                collect_footnote_refs(b, ctx);
             }
         }
         Block::List { items, .. } => {
             for item in items {
                 for b in &item.body {
-                    collect_footnote_defs(b, ctx);
+                    collect_footnote_refs(b, ctx);
+                }
+            }
+        }
+        Block::Quote(body) | Block::FootnoteDef { body, .. } => {
+            for b in body {
+                collect_footnote_refs(b, ctx);
+            }
+        }
+        Block::Table { header, rows, .. } => {
+            for cell in header {
+                collect_inline_refs(cell, ctx);
+            }
+            for row in rows {
+                for cell in row {
+                    collect_inline_refs(cell, ctx);
+                }
+            }
+        }
+        Block::Code { .. } | Block::Math(_) | Block::Rule | Block::Html(_) => {}
+        Block::EmbedBlock(_) => {}
+    }
+}
+
+/// Number the inlines' footnote references (including nested containers).
+fn collect_inline_refs(inlines: &[Inline], ctx: &RenderContext) {
+    for inline in inlines {
+        match inline {
+            Inline::FootnoteRef(label) => {
+                ctx.footnote_number(label);
+            }
+            Inline::Emph(children)
+            | Inline::Strong(children)
+            | Inline::Strike(children)
+            | Inline::Highlight(children)
+            | Inline::InlineFootnote(children) => collect_inline_refs(children, ctx),
+            Inline::Link { content, .. } => collect_inline_refs(content, ctx),
+            _ => {}
+        }
+    }
+}
+
+/// Give every definition that was never referenced the next free number, in
+/// definition order.
+fn assign_unused_def_numbers(block: &Block, ctx: &RenderContext) {
+    match block {
+        Block::FootnoteDef { label, body } => {
+            ctx.footnote_number(label);
+            for b in body {
+                assign_unused_def_numbers(b, ctx);
+            }
+        }
+        Block::List { items, .. } => {
+            for item in items {
+                for b in &item.body {
+                    assign_unused_def_numbers(b, ctx);
                 }
             }
         }
         Block::Quote(body) | Block::Callout { body, .. } => {
             for b in body {
-                collect_footnote_defs(b, ctx);
+                assign_unused_def_numbers(b, ctx);
             }
         }
         Block::EmbedBlock(_) => {}
@@ -286,9 +351,12 @@ fn render_block(block: &Block, ctx: &RenderContext, out: &mut String) {
         Block::Rule => out.push_str("<hr>\n"),
         Block::EmbedBlock(embed) => render_embed_block(embed, ctx, out),
         Block::FootnoteDef { label, body } => {
+            // The number is the reference-order number, so the definition
+            // shows the same number the reference used.
+            let number = ctx.footnote_number(label);
             let _ = writeln!(
                 out,
-                "<div class=\"footnote-def\" id=\"fn-{}\">",
+                "<div class=\"footnote-def\" id=\"fn-{}\" data-footnote-number=\"{number}\">",
                 escape_attr(label)
             );
             for block in body {
@@ -559,9 +627,15 @@ fn render_wikilink(link: &crate::ir::WikiLink, ctx: &RenderContext, out: &mut St
                 target.note.clone()
             };
             match (&target.heading, &target.block) {
+                // `[[Note#Heading]]` reads "Note > Heading" (confirmed, M3).
                 (Some(h), _) if !note_display.is_empty() => format!("{note_display} > {h}"),
                 (Some(h), _) => h.clone(),
-                (None, Some(b)) => format!("{note_display} > ^{b}"),
+                // A block reference shows only the note name (confirmed, M3:
+                // Obsidian's autocomplete inserts the bare note name).
+                (None, Some(b)) if !note_display.is_empty() => note_display,
+                // Same-document block reference: no note name to show, so the
+                // block id itself is the label (ASSUMPTION, see COMPAT.md).
+                (None, Some(b)) => format!("^{b}"),
                 (None, None) => note_display,
             }
         }
@@ -704,4 +778,62 @@ fn href_encode(path: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lower::parse_note;
+
+    struct NoNotes;
+
+    impl vault_core::NoteSource for NoNotes {
+        fn note_source(&self, _path: &str) -> Option<String> {
+            None
+        }
+    }
+
+    fn render(src: &str) -> String {
+        let doc = parse_note(src);
+        let index = VaultIndex::new(["Note.md"]);
+        let notes = NoNotes;
+        let ctx = RenderContext::new(&index, "fixture.md", &notes, RenderOptions::default());
+        render_html(&doc, &ctx)
+    }
+
+    /// Confirmed against real Obsidian (M3): footnote numbers follow
+    /// REFERENCE order, not definition order.
+    #[test]
+    fn footnote_numbers_follow_reference_order() {
+        let html = render("beta[^b] then alpha[^a].\n\n[^a]: alpha\n\n[^b]: beta\n");
+        // The first reference is 1 even though its definition comes second.
+        assert!(html.contains("href=\"#fn-b\">1</a>"), "{html}");
+        assert!(html.contains("href=\"#fn-a\">2</a>"), "{html}");
+        // The definitions carry the same numbers.
+        assert!(
+            html.contains("id=\"fn-b\" data-footnote-number=\"1\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("id=\"fn-a\" data-footnote-number=\"2\""),
+            "{html}"
+        );
+    }
+
+    /// Confirmed against real Obsidian (M3): a block reference shows only
+    /// the note name.
+    #[test]
+    fn block_reference_label_is_the_note_name() {
+        let html = render("see [[Note#^bid]] here\n");
+        assert!(html.contains(">Note</a>"), "{html}");
+        assert!(!html.contains("^bid</a>"), "{html}");
+    }
+
+    /// Confirmed against real Obsidian (M3): `[[Note#Heading]]` reads
+    /// "Note > Heading".
+    #[test]
+    fn heading_link_label_is_note_and_heading() {
+        let html = render("see [[Note#Heading]] here\n");
+        assert!(html.contains("Note &gt; Heading</a>"), "{html}");
+    }
 }

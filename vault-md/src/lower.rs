@@ -9,7 +9,8 @@
 //! Deliberate behaviors:
 //! * empty paragraphs are dropped (a comment-only paragraph leaves nothing),
 //! * a trailing `^block-id` on a paragraph or list item becomes that block's
-//!   id (a lone `^id` paragraph stays literal text — assumption, see COMPAT),
+//!   id, and a paragraph that is ONLY `^id` is invisible: it attaches to the
+//!   previous block (confirmed against real Obsidian in M3),
 //! * display math alone in a paragraph becomes `Block::Math`.
 
 use comrak::nodes::{AstNode, ListType, NodeValue};
@@ -43,6 +44,7 @@ fn lower_comrak(extracted: &Extracted) -> Vec<Block> {
     for child in root.children() {
         lower_block(child, &extracted.tokens, &mut blocks);
     }
+    attach_lone_block_ids(&mut blocks);
     blocks
 }
 
@@ -285,6 +287,85 @@ fn take_trailing_block_id(inlines: &mut [Inline]) -> Option<String> {
     Some(id.to_string())
 }
 
+/// Confirmed against real Obsidian (M3, 2026-10-31): a paragraph that holds
+/// nothing but a `^block-id` is INVISIBLE in reading view — it renders no
+/// text and attaches its id to the preceding block.
+///
+/// ```text
+/// para text
+/// ^abc          <- invisible; `para text` becomes the block `^abc`
+/// ```
+///
+/// The id goes to the previous paragraph or, after a list, to the list's last
+/// item. A block that already carries an id keeps it (first id wins).
+fn attach_lone_block_ids(blocks: &mut Vec<Block>) {
+    let mut i = 0;
+    while i < blocks.len() {
+        if let Some(id) = lone_block_id(&blocks[i]) {
+            blocks.remove(i);
+            if i > 0 {
+                attach_block_id(&mut blocks[i - 1], &id);
+            }
+            // The block that shifted into place is not re-examined as a lone
+            // id (a second `^id` line simply has nowhere to attach).
+            continue;
+        }
+        match &mut blocks[i] {
+            Block::List { items, .. } => {
+                for item in items {
+                    attach_lone_block_ids(&mut item.body);
+                }
+            }
+            Block::Quote(body) => attach_lone_block_ids(body),
+            Block::Callout { body, .. } => attach_lone_block_ids(body),
+            Block::FootnoteDef { body, .. } => attach_lone_block_ids(body),
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// The id of a paragraph whose entire content is one `^id` token.
+fn lone_block_id(block: &Block) -> Option<String> {
+    let Block::Paragraph { content, .. } = block else {
+        return None;
+    };
+    let [Inline::Text(text)] = content.as_slice() else {
+        return None;
+    };
+    let trimmed = text.trim();
+    let id = trimmed.strip_prefix('^')?;
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+/// Attach `id` to a block that can carry one.
+fn attach_block_id(block: &mut Block, id: &str) {
+    match block {
+        Block::Paragraph { block_id, .. } => {
+            if block_id.is_none() {
+                *block_id = Some(id.to_string());
+            }
+        }
+        Block::List { items, .. } => {
+            if let Some(item) = items.last_mut() {
+                if item.block_id.is_none() {
+                    item.block_id = Some(id.to_string());
+                }
+            }
+        }
+        // Headings, tables and rules have no block-id slot in our IR; the
+        // id stays invisible (ASSUMPTION, see COMPAT.md).
+        _ => {}
+    }
+}
+
 fn is_empty_inlines(inlines: &[Inline]) -> bool {
     inlines.iter().all(|inline| match inline {
         Inline::Text(text) => text.trim().is_empty(),
@@ -455,14 +536,42 @@ mod tests {
         }
     }
 
+    /// Confirmed against real Obsidian (M3): a lone `^id` line is invisible
+    /// and attaches to the previous block.
     #[test]
-    fn lone_block_id_stays_literal() {
-        // Assumption: Obsidian shows a lone ^id as text.
+    fn lone_block_id_attaches_to_previous_paragraph() {
+        let doc = parsed("para text\n\n^just-an-id\n");
+        assert_eq!(doc.blocks.len(), 1, "the lone id paragraph disappears");
+        match &doc.blocks[0] {
+            Block::Paragraph { content, block_id } => {
+                assert_eq!(block_id.as_deref(), Some("just-an-id"));
+                assert!(content
+                    .iter()
+                    .any(|i| matches!(i, Inline::Text(t) if t == "para text")));
+            }
+            other => panic!("expected paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lone_block_id_after_list_attaches_to_last_item() {
+        let doc = parsed("- item one\n- item two\n\n^list-id\n");
+        match &doc.blocks[0] {
+            Block::List { items, .. } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[1].block_id.as_deref(), Some("list-id"));
+            }
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lone_block_id_without_previous_block_is_invisible() {
         let doc = parsed("^just-an-id\n");
-        assert!(doc
-            .blocks
-            .iter()
-            .any(|b| paragraph_text(b).contains("^just-an-id")));
+        assert!(
+            doc.blocks.is_empty(),
+            "a leading id has nothing to attach to"
+        );
     }
 
     #[test]
