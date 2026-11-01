@@ -130,3 +130,31 @@ Previously confirmed (M2):
   corpus's NFD-named fixture is exercised on Unix only (its test is
   `#[cfg_attr(windows, ignore)]`).
 - **macOS:** untested — no machine, no SDK for cross-compilation.
+
+## GUI reading view (M4a)
+
+The libcosmic reading view renders `vault-md`'s IR directly into widgets
+(iced `rich_text` spans), not HTML. Choices where a widget tree cannot
+express what HTML does — all honest approximations, revisitable later:
+
+- **Raw HTML** blocks/spans render as plain monospace text (the sanitized
+  HTML path is the web renderer's job).
+- **Remote images** (`http(s)`) are text placeholders — no network fetch in
+  v1; local images render from disk with a per-path `Handle` cache.
+- **Same-document `[[#Heading]]` / `[[#^block]]` links** emit a `scroll:`
+  URI and are inert until M4b wires scroll-to-anchor.
+- **Tag clicks** (`tag:`) and footnote-reference clicks (`fnref:`) are
+  inert until M4b's tag panel / footnote scrolling.
+- **Task checkboxes** in lists are display-only; toggling from reading view
+  is deferred (it rewrites the source line).
+- **Callout fold state** is per-tab and keyed by traversal order, so it
+  resets when the note is edited (ids are positional).
+- Link routing uses URI schemes over span links (`note:`, `wiki:`,
+  `create:`, `open:`); `create:<name>|<from>` creates the note in the vault
+  root (Obsidian's default new-note location), refusing traversal/dotfiles.
+- Source-editor highlighting is syntect's Markdown grammar (libcosmic
+  `highlighter` feature, `token: "md"`) — theme follows system light/dark.
+  A hand-rolled Markdown token set is a possible later upgrade.
+- New-note creation and frontmatter edits save through the same guarded
+  path: `Vault::save_note` (body-only, frontmatter bytes provably reused)
+  or `Vault::save_note_full` (full text, added in M4a).

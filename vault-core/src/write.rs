@@ -53,6 +53,22 @@ pub fn atomic_write(
     Ok(stat_written(path, &new_content))
 }
 
+/// Write full file content atomically — frontmatter included, verbatim.
+///
+/// Unlike [`atomic_write`], the caller supplies the *complete* new text
+/// (BOM, frontmatter, and body). Use this when the frontmatter itself was
+/// edited; an unedited frontmatter block should go through [`atomic_write`]
+/// so the original bytes are provably reused. External-change detection and
+/// durability are identical.
+pub fn atomic_write_full(
+    path: &Path,
+    original: &str,
+    content: &str,
+) -> Result<WriteResult, WriteError> {
+    write_durable(path, original, content.as_bytes())?;
+    Ok(stat_written(path, content))
+}
+
 /// Write arbitrary bytes atomically (attachments, etc.).
 pub fn atomic_write_raw(
     path: &Path,

@@ -16,7 +16,7 @@ use crate::links::{
     scan_block_ids, scan_headings, scan_links, scan_md_links, scan_tags, LinkKind, RawLink,
 };
 use crate::resolve::VaultIndex;
-use crate::write::{atomic_write, WriteResult};
+use crate::write::{atomic_write, atomic_write_full, WriteResult};
 
 /// A note file in the vault.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +352,38 @@ impl Vault {
         self.pending_writes.write().unwrap().remove(path);
     }
 
+    /// Save a note whose *full text* — frontmatter included — the user edited.
+    ///
+    /// `new_content` replaces the entire file verbatim. All the guards of
+    /// [`Vault::save_note`] apply: protected paths are refused, the write is
+    /// bracketed with the watcher suppression, and the file is re-indexed.
+    /// For body-only edits prefer [`Vault::save_note`], which provably reuses
+    /// the original frontmatter bytes.
+    pub fn save_note_full(
+        &mut self,
+        path: &str,
+        original: &str,
+        new_content: &str,
+    ) -> Result<WriteResult, VaultError> {
+        if is_ignored(path) {
+            return Err(VaultError::ProtectedPath(path.to_string()));
+        }
+        if !path.ends_with(".md") {
+            return Err(VaultError::NotANote(path.to_string()));
+        }
+        self.mark_pending_write(path);
+        match atomic_write_full(&self.root.join(path), original, new_content) {
+            Ok(result) => {
+                self.reload(&[path.to_string()])?;
+                Ok(result)
+            }
+            Err(e) => {
+                self.unmark_pending_write(path);
+                Err(e.into())
+            }
+        }
+    }
+
     /// The vault root.
     pub fn root(&self) -> &Path {
         &self.root
@@ -623,5 +655,48 @@ mod tests {
             vault.save_note("assets/cat.png", "", ""),
             Err(VaultError::NotANote(_))
         ));
+    }
+
+    #[test]
+    fn save_note_full_writes_frontmatter_edits_verbatim() {
+        let (tmp, mut vault) = test_vault();
+        let before = fs::read_to_string(tmp.path().join("b.md")).unwrap();
+        assert!(!before.starts_with("---"), "fixture has no frontmatter");
+
+        // The user added frontmatter in the source editor: full-text save.
+        let edited = "---\ntags: [new]\n---\n\nnew full text [[a]]\n";
+        vault.save_note_full("b.md", &before, edited).unwrap();
+        assert_eq!(fs::read_to_string(tmp.path().join("b.md")).unwrap(), edited);
+        // Re-indexed: the new tag is visible.
+        assert!(vault.all_tags().iter().any(|t| t == "new"));
+        // A second full-text save keeps bytes byte-identical (no re-serialization).
+        let after = fs::read_to_string(tmp.path().join("b.md")).unwrap();
+        vault.save_note_full("b.md", &after, &after).unwrap();
+        assert_eq!(fs::read_to_string(tmp.path().join("b.md")).unwrap(), after);
+    }
+
+    #[test]
+    fn save_note_full_refuses_stale_original_and_bad_paths() {
+        let (tmp, mut vault) = test_vault();
+        let err = vault.save_note_full("b.md", "stale original", "---\n---\n\nx");
+        assert!(matches!(
+            err,
+            Err(VaultError::Write(
+                crate::write::WriteError::ExternallyModified
+            ))
+        ));
+        assert!(matches!(
+            vault.save_note_full(".obsidian/app.json", "{}", "{}"),
+            Err(VaultError::ProtectedPath(_))
+        ));
+        assert!(matches!(
+            vault.save_note_full("assets/cat.png", "", ""),
+            Err(VaultError::NotANote(_))
+        ));
+        // Nothing was written by any of the refused calls.
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("b.md")).unwrap(),
+            fs::read_to_string(tmp.path().join("b.md")).unwrap()
+        );
     }
 }

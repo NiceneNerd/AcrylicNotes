@@ -2,10 +2,29 @@
 name = "app"
 version = "0.1.0"
 edition = "2021"
-description = "Vault Notes — GUI frontend (M0 glass spike)"
+description = "Vault Notes — libcosmic GUI (M4)"
 
 [dependencies]
+vault-core = { path = "../vault-core" }
+vault-md = { path = "../vault-md" }
+# Used from M4c on (glass backdrop); kept listed so the dependency stays honest.
 vault-glass = { path = "../vault-glass" }
+dirs = "6.0"
+# Same version cosmic-theme uses (0.7.7 in the lock) — for Srgba conversions.
+palette = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# iced is vendored inside the libcosmic checkout. Depending on it directly
+# (same path -> same crate instance as libcosmic's dependency) unlocks:
+# - the raw `text_editor` with `.highlight_with::<H>()` (libcosmic's own
+#   wrapper hardcodes the PlainText highlighter), and
+# - image codecs for attachment embeds ("image" enables the `image` crate's
+#   default decoders; libcosmic alone only asks for image-without-codecs).
+[dependencies.iced]
+path = "/cella/Git/libcosmic/iced"
+default-features = false
+features = ["highlighter", "image"]
 
 # libcosmic is used from a local checkout so the build does not depend on the
 # network. Pinned commit: 95236a944bfd51c63a2fc65fe50a592c47168d40 (2026-10-27).
@@ -30,3 +49,6 @@ features = ["wayland", "dbus-config"]
 path = "/cella/Git/libcosmic"
 default-features = false
 features = ["winit"]
+
+[dev-dependencies]
+tempfile = "3.22"
