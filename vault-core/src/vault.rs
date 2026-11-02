@@ -168,9 +168,13 @@ impl Vault {
                             // or transiently unreadable; leave the old entry.
                             Err(_) => continue,
                         }
-                    } else {
+                    } else if full.is_file() {
                         self.notes.remove(rel);
                         self.attachments.insert(rel.clone());
+                    } else {
+                        // A directory: neither note nor attachment.
+                        self.notes.remove(rel);
+                        self.attachments.remove(rel);
                     }
                 }
                 Err(_) => {
@@ -460,6 +464,160 @@ impl Vault {
             }
         }
     }
+
+    /// All folders under the vault root, excluding dot-directories,
+    /// sorted, vault-relative with '/' separators. Includes empty folders,
+    /// so the sidebar can offer them for new notes.
+    pub fn folders(&self) -> Vec<String> {
+        let mut folders = Vec::new();
+        for entry in WalkDir::new(&self.root).min_depth(1) {
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            let Ok(rel) = entry.path().strip_prefix(&self.root) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if is_ignored(&rel) {
+                continue;
+            }
+            folders.push(rel);
+        }
+        folders.sort();
+        folders
+    }
+
+    /// Create a folder (and any missing parents). Folders do not enter the
+    /// note index; they show up via [`Vault::folders`].
+    pub fn create_folder(&mut self, rel: &str) -> Result<(), VaultError> {
+        if is_ignored(rel) {
+            return Err(VaultError::ProtectedPath(rel.to_string()));
+        }
+        if rel.is_empty() || rel.ends_with('/') {
+            return Err(VaultError::NotANote(rel.to_string()));
+        }
+        fs::create_dir_all(self.root.join(rel))?;
+        // Suppress the folder-create watcher event so it is not misread.
+        self.mark_pending_write(rel);
+        Ok(())
+    }
+
+    /// Rename (move) a note. The target must not exist. Links in other notes
+    /// are NOT rewritten (M4c scope); their text keeps pointing at the old
+    /// name and shows as unresolved until updated.
+    pub fn rename_note(&mut self, old: &str, new: &str) -> Result<(), VaultError> {
+        for path in [old, new] {
+            if is_ignored(path) {
+                return Err(VaultError::ProtectedPath(path.to_string()));
+            }
+            if !path.ends_with(".md") {
+                return Err(VaultError::NotANote(path.to_string()));
+            }
+        }
+        if old == new {
+            return Ok(());
+        }
+        let target = self.root.join(new);
+        if target.exists() {
+            return Err(VaultError::TargetExists(new.to_string()));
+        }
+        if let Some(parent) = Path::new(new).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(self.root.join(parent))?;
+            }
+        }
+        self.mark_pending_write(old);
+        self.mark_pending_write(new);
+        fs::rename(self.root.join(old), target)?;
+        // `reload` drops the vanished old path and indexes the new one.
+        self.reload(&[old.to_string(), new.to_string()])?;
+        Ok(())
+    }
+
+    /// Move a note into the vault's `.trash/` folder (Obsidian-compatible:
+    /// recoverable, and dot-ignored so it vanishes from the app). Returns
+    /// the path it was moved to, inside `.trash/`.
+    pub fn delete_note(&mut self, path: &str) -> Result<String, VaultError> {
+        if is_ignored(path) {
+            return Err(VaultError::ProtectedPath(path.to_string()));
+        }
+        if !path.ends_with(".md") {
+            return Err(VaultError::NotANote(path.to_string()));
+        }
+        let target = self.trash_target(path);
+        self.mark_pending_write(path);
+        fs::create_dir_all(self.root.join(".trash"))?;
+        fs::rename(self.root.join(path), self.root.join(&target))?;
+        self.reload(&[path.to_string()])?;
+        Ok(target)
+    }
+
+    /// Move a whole folder into `.trash/`. A full rescan follows, since
+    /// every note below it may have moved.
+    pub fn delete_folder(&mut self, rel: &str) -> Result<String, VaultError> {
+        if is_ignored(rel) {
+            return Err(VaultError::ProtectedPath(rel.to_string()));
+        }
+        let dir = self.root.join(rel);
+        if !dir.is_dir() {
+            return Err(VaultError::NotANote(rel.to_string()));
+        }
+        let target = self.trash_target(rel);
+        fs::create_dir_all(self.root.join(".trash"))?;
+        fs::rename(dir, self.root.join(&target))?;
+        self.scan()?;
+        Ok(target)
+    }
+
+    /// Rename (move) a whole folder; the target must not exist. A full
+    /// rescan follows, since every note below it changed paths.
+    pub fn rename_folder(&mut self, old: &str, new: &str) -> Result<(), VaultError> {
+        for path in [old, new] {
+            if is_ignored(path) {
+                return Err(VaultError::ProtectedPath(path.to_string()));
+            }
+            if path.is_empty() || path.ends_with('/') {
+                return Err(VaultError::NotANote(path.to_string()));
+            }
+        }
+        if old == new {
+            return Ok(());
+        }
+        let target = self.root.join(new);
+        if target.exists() {
+            return Err(VaultError::TargetExists(new.to_string()));
+        }
+        if let Some(parent) = Path::new(new).parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(self.root.join(parent))?;
+            }
+        }
+        fs::rename(self.root.join(old), target)?;
+        self.scan()?;
+        Ok(())
+    }
+
+    /// A unique `.trash/`-relative target for `rel`: `name.md` when free,
+    /// otherwise `name (2).md`, `name (3).md`, …
+    fn trash_target(&self, rel: &str) -> String {
+        let name = Path::new(rel)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "deleted".to_string());
+        let mut candidate = format!(".trash/{name}");
+        let mut n = 2;
+        let stem = name
+            .strip_suffix(".md")
+            .map(|s| s.to_string())
+            .unwrap_or(name.clone());
+        let ext = name.strip_suffix(".md").map(|_| ".md").unwrap_or("");
+        while self.root.join(&candidate).exists() {
+            candidate = format!(".trash/{stem} ({n}){ext}");
+            n += 1;
+        }
+        candidate
+    }
 }
 
 /// Dot-directories (`.obsidian`, `.git`, `.trash`, …) are ignored everywhere.
@@ -552,6 +710,8 @@ pub enum VaultError {
     NotANote(String),
     #[error("refusing to write protected path: {0}")]
     ProtectedPath(String),
+    #[error("target already exists: {0}")]
+    TargetExists(String),
 }
 
 #[cfg(test)]
@@ -838,5 +998,100 @@ mod tests {
         ));
         // Nothing was written.
         assert!(!tmp.path().join(".obsidian/2026-11-02.md").exists());
+    }
+
+    #[test]
+    fn folders_list_directories_including_empty_ones() {
+        let (tmp, vault) = test_vault();
+        fs::create_dir_all(tmp.path().join("Notes/Empty")).unwrap();
+        assert_eq!(vault.folders(), ["Notes", "Notes/Empty", "assets"]);
+    }
+
+    #[test]
+    fn create_folder_makes_parents_and_refuses_protected() {
+        let (tmp, mut vault) = test_vault();
+        vault.create_folder("a/b/c").unwrap();
+        assert!(tmp.path().join("a/b/c").is_dir());
+        assert!(matches!(
+            vault.create_folder(".obsidian/x"),
+            Err(VaultError::ProtectedPath(_))
+        ));
+        assert!(matches!(
+            vault.create_folder(""),
+            Err(VaultError::NotANote(_))
+        ));
+    }
+
+    #[test]
+    fn rename_note_moves_file_and_updates_index() {
+        let (tmp, mut vault) = test_vault();
+        vault.rename_note("b.md", "Notes/renamed.md").unwrap();
+        assert!(!tmp.path().join("b.md").exists());
+        assert!(tmp.path().join("Notes/renamed.md").exists());
+        assert!(vault.get_note("b.md").is_none());
+        assert!(vault.get_note("Notes/renamed.md").is_some());
+        // Backlinks rebuilt: a.md's [[b]] link now resolves to nothing.
+        assert!(vault.backlinks("Notes/renamed.md").is_empty());
+
+        // Refusals: existing target, protected paths, non-notes.
+        assert!(matches!(
+            vault.rename_note("a.md", "Notes/renamed.md"),
+            Err(VaultError::TargetExists(_))
+        ));
+        assert!(matches!(
+            vault.rename_note("a.md", ".obsidian/x.md"),
+            Err(VaultError::ProtectedPath(_))
+        ));
+        assert!(matches!(
+            vault.rename_note("a.md", "assets/cat.png"),
+            Err(VaultError::NotANote(_))
+        ));
+    }
+
+    #[test]
+    fn delete_note_moves_into_trash_and_drops_from_index() {
+        let (tmp, mut vault) = test_vault();
+        let target = vault.delete_note("b.md").unwrap();
+        assert_eq!(target, ".trash/b.md");
+        assert!(!tmp.path().join("b.md").exists());
+        assert!(tmp.path().join(".trash/b.md").exists());
+        assert!(vault.get_note("b.md").is_none());
+        // .trash stays invisible to the index (dot-directory).
+        assert!(vault.folders().iter().all(|f| !f.starts_with(".trash")));
+
+        // Trash names never collide.
+        fs::write(tmp.path().join("b.md"), "back again\n").unwrap();
+        vault.reload(&["b.md".to_string()]).unwrap();
+        let second = vault.delete_note("b.md").unwrap();
+        assert_eq!(second, ".trash/b (2).md");
+
+        // Refusals.
+        assert!(matches!(
+            vault.delete_note(".obsidian/config"),
+            Err(VaultError::ProtectedPath(_))
+        ));
+        assert!(matches!(
+            vault.delete_note("assets/cat.png"),
+            Err(VaultError::NotANote(_))
+        ));
+    }
+
+    #[test]
+    fn folder_rename_and_delete_move_their_notes() {
+        let (tmp, mut vault) = test_vault();
+        vault.rename_folder("Notes", "Docs").unwrap();
+        assert!(!tmp.path().join("Notes").exists());
+        assert!(vault.get_note("Docs/Glass.md").is_some());
+        assert!(matches!(
+            vault.rename_folder("Docs", "assets"),
+            Err(VaultError::TargetExists(_))
+        ));
+
+        vault.delete_folder("Docs").unwrap();
+        assert!(!tmp.path().join("Docs").exists());
+        assert!(vault.get_note("Docs/Glass.md").is_none());
+        assert!(tmp.path().join(".trash/Docs").is_dir());
+        // A full rescan happened: only the root-level notes remain.
+        assert_eq!(vault.notes.len(), 2);
     }
 }

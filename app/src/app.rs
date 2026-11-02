@@ -205,6 +205,16 @@ pub enum Message {
     DailyNote,
     /// Switch between dark and light themes (persisted).
     ToggleTheme,
+    /// A context menu opened (records the node it belongs to) or closed.
+    TreeMenuTarget(Option<String>),
+    /// A tree context-menu command for the last `TreeMenuTarget(Some(..))`.
+    TreeMenu(TreeMenuAction),
+    /// Keystrokes for the inline tree-edit input.
+    TreeEditInput(String),
+    TreeEditSubmit,
+    TreeEditCancel,
+    /// Wayland surface actions for context-menu popups (routed to libcosmic).
+    Surface(cosmic::surface::Action<Message>),
     TabClose(usize),
     TabSelect(usize),
     EditorAction(cosmic::iced::widget::text_editor::Action),
@@ -266,15 +276,47 @@ pub struct VaultNotes {
     pub glass_style: vault_glass::GlassStyle,
     /// The theme choice the user made (persisted; `System` follows desktop).
     pub theme: settings::ThemeChoice,
+    /// Pending inline tree edit (new note / new folder / rename), if any.
+    pub tree_edit: Option<tree::TreeEdit>,
+    /// The node path the open context menu belongs to (`None` when closed).
+    pub tree_menu_target: Option<String>,
 }
 
 /// Save the active note ~2 s after its last edit (M4 decision, user-tuned).
 const AUTOSAVE_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Id of the inline tree-edit text input (focused when the edit starts).
+pub const TREE_EDIT_INPUT: &str = "tree-edit-input";
+
+/// Commands of the sidebar tree's right-click menu. `Copy` because cosmic's
+/// `menu::Action` requires it; the target node rides separately via
+/// `Message::TreeMenuTarget`, recorded when the menu opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeMenuAction {
+    NewNote,
+    NewFolder,
+    Rename,
+    Delete,
+}
+
+impl cosmic::widget::menu::Action for TreeMenuAction {
+    type Message = Message;
+
+    fn message(&self) -> Self::Message {
+        Message::TreeMenu(*self)
+    }
+}
+
 /// Pure autosave decision: an idle period measured since the last edit is
 /// due for a save. Unit-testable without an `Instant`.
 fn autosave_due(idle_since_last_edit: Option<std::time::Duration>) -> bool {
     idle_since_last_edit.is_some_and(|d| d >= AUTOSAVE_IDLE)
+}
+
+/// Mirrors vault-core's dot-directory rule: reject names that would sneak a
+/// write into `.obsidian/` or friends.
+fn contains_hidden_component(name: &str) -> bool {
+    name.split('/').any(|c| c.starts_with('.') && c != ".")
 }
 
 /// The libcosmic task that applies a stored theme choice (M4c).
@@ -326,6 +368,32 @@ impl VaultNotes {
         self.active.and_then(|idx| self.tabs.get(idx))
     }
 
+    /// The path being renamed inline in the sidebar tree, if any.
+    pub fn tree_rename_target(&self) -> Option<&str> {
+        match &self.tree_edit {
+            Some(tree::TreeEdit {
+                kind: tree::TreeEditKind::Rename { old },
+                ..
+            }) => Some(old),
+            _ => None,
+        }
+    }
+
+    /// The folder receiving an inline new-note/new-folder input, if any.
+    pub fn tree_folder_edit_target(&self) -> Option<&str> {
+        match &self.tree_edit {
+            Some(tree::TreeEdit {
+                kind: tree::TreeEditKind::NewNote { folder },
+                ..
+            }) => Some(folder),
+            Some(tree::TreeEdit {
+                kind: tree::TreeEditKind::NewFolder { folder },
+                ..
+            }) => Some(folder),
+            _ => None,
+        }
+    }
+
     /// Path of the tab currently shown, if any.
     pub fn active_tab_path(&self) -> Option<&str> {
         self.active
@@ -351,7 +419,10 @@ impl VaultNotes {
             .map(|note| note.path.clone())
             .collect();
         let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-        self.tree = tree::build(&refs);
+        // Empty folders materialize too, so they can receive new notes.
+        let folders: Vec<String> = vault.folders();
+        let folder_refs: Vec<&str> = folders.iter().map(String::as_str).collect();
+        self.tree = tree::build_with_folders(&refs, &folder_refs);
     }
 
     fn open_tab(&mut self, path: String) -> Task<Message> {
@@ -518,6 +589,242 @@ impl VaultNotes {
         Task::none()
     }
 
+    /// A tree context-menu command, applied to the node the menu was opened
+    /// on (`Message::TreeMenuTarget` recorded it when the menu opened).
+    fn tree_menu_command(&mut self, action: TreeMenuAction) -> Task<Message> {
+        let Some(target) = self.tree_menu_target.take() else {
+            return Task::none();
+        };
+        match action {
+            TreeMenuAction::NewNote | TreeMenuAction::NewFolder => {
+                // New entries land beside the target: inside a folder, or
+                // in a note's parent folder.
+                let folder = if target.ends_with(".md") {
+                    target
+                        .rsplit_once('/')
+                        .map(|(parent, _)| parent.to_string())
+                        .unwrap_or_default()
+                } else {
+                    target
+                };
+                let kind = if action == TreeMenuAction::NewNote {
+                    tree::TreeEditKind::NewNote {
+                        folder: folder.clone(),
+                    }
+                } else {
+                    tree::TreeEditKind::NewFolder {
+                        folder: folder.clone(),
+                    }
+                };
+                // Reveal the folder so the inline input is visible.
+                self.collapsed.remove(&folder);
+                self.tree_edit = Some(tree::TreeEdit {
+                    kind,
+                    value: String::new(),
+                });
+                cosmic::widget::text_input::focus::<Message>(Id::new(TREE_EDIT_INPUT))
+                    .map(cosmic::Action::App)
+            }
+            TreeMenuAction::Rename => {
+                let value = target.rsplit('/').next().unwrap_or(&target).to_string();
+                self.tree_edit = Some(tree::TreeEdit {
+                    kind: tree::TreeEditKind::Rename { old: target },
+                    value,
+                });
+                cosmic::widget::text_input::focus::<Message>(Id::new(TREE_EDIT_INPUT))
+                    .map(cosmic::Action::App)
+            }
+            TreeMenuAction::Delete => self.delete_tree_path(target),
+        }
+    }
+
+    /// Apply the pending inline tree edit. All writes go through vault-core's
+    /// guarded paths; failures surface in the error line.
+    fn submit_tree_edit(&mut self) -> Task<Message> {
+        let Some(edit) = self.tree_edit.take() else {
+            return Task::none();
+        };
+        let name = edit.value.trim().trim_matches('/').to_string();
+        if name.is_empty() || contains_hidden_component(&name) {
+            self.error = Some(format!("invalid name: {:?}", edit.value));
+            return Task::none();
+        }
+        // Computed before the match: the match moves out of `edit`.
+        let new = edit.target_path();
+        match edit.kind {
+            tree::TreeEditKind::NewNote { folder } => self.create_tree_note(&folder, &name),
+            tree::TreeEditKind::NewFolder { folder } => {
+                let path = if folder.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{folder}/{name}")
+                };
+                let outcome = self.vault.as_mut().map(|vault| vault.create_folder(&path));
+                match outcome {
+                    Some(Ok(())) => self.rebuild_index(),
+                    Some(Err(error)) => {
+                        self.error = Some(format!("cannot create folder {path}: {error}"))
+                    }
+                    None => {}
+                }
+                Task::none()
+            }
+            tree::TreeEditKind::Rename { old } => {
+                if old.ends_with(".md") {
+                    let new = if new.ends_with(".md") {
+                        new
+                    } else {
+                        format!("{new}.md")
+                    };
+                    self.rename_tree_note(old, new)
+                } else {
+                    self.rename_tree_folder(old, new)
+                }
+            }
+        }
+    }
+
+    fn create_tree_note(&mut self, folder: &str, name: &str) -> Task<Message> {
+        let path = if folder.is_empty() {
+            format!("{name}.md")
+        } else {
+            format!("{folder}/{name}.md")
+        };
+        // A name that already resolves: open it instead of duplicating.
+        if self
+            .vault
+            .as_ref()
+            .is_some_and(|vault| vault.note_source(&path).is_some())
+        {
+            return self.open_tab(path);
+        }
+        // A name may itself contain folders ("a/b") — create them first.
+        if let Some((parent, _)) = path.rsplit_once('/') {
+            if parent != folder {
+                let outcome = self.vault.as_mut().map(|vault| vault.create_folder(parent));
+                if let Some(Err(error)) = outcome {
+                    self.error = Some(format!("cannot create folder {parent}: {error}"));
+                    return Task::none();
+                }
+            }
+        }
+        let outcome = self
+            .vault
+            .as_mut()
+            .map(|vault| vault.save_note(&path, "", ""));
+        match outcome {
+            Some(Ok(_)) => {
+                self.rebuild_index();
+                self.open_tab(path)
+            }
+            Some(Err(error)) => {
+                self.error = Some(format!("cannot create {path}: {error}"));
+                Task::none()
+            }
+            None => Task::none(),
+        }
+    }
+
+    fn rename_tree_note(&mut self, old: String, new: String) -> Task<Message> {
+        let outcome = self
+            .vault
+            .as_mut()
+            .map(|vault| vault.rename_note(&old, &new));
+        match outcome {
+            Some(Ok(())) => {
+                for tab in &mut self.tabs {
+                    if tab.path == old {
+                        tab.path = new.clone();
+                    }
+                }
+                self.rebuild_index();
+            }
+            Some(Err(error)) => self.error = Some(format!("cannot rename {old}: {error}")),
+            None => {}
+        }
+        Task::none()
+    }
+
+    fn rename_tree_folder(&mut self, old: String, new: String) -> Task<Message> {
+        let outcome = self
+            .vault
+            .as_mut()
+            .map(|vault| vault.rename_folder(&old, &new));
+        match outcome {
+            Some(Ok(())) => {
+                let prefix = format!("{old}/");
+                for tab in &mut self.tabs {
+                    if let Some(rest) = tab.path.strip_prefix(&prefix) {
+                        tab.path = format!("{new}/{rest}");
+                    }
+                }
+                self.collapsed = self
+                    .collapsed
+                    .iter()
+                    .map(|p| match p.strip_prefix(&prefix) {
+                        Some(rest) => format!("{new}/{rest}"),
+                        None => p.clone(),
+                    })
+                    .collect();
+                self.rebuild_index();
+            }
+            Some(Err(error)) => self.error = Some(format!("cannot rename {old}: {error}")),
+            None => {}
+        }
+        Task::none()
+    }
+
+    /// Delete a note or folder from the tree: files move into the vault's
+    /// `.trash/` (recoverable, dot-ignored). Unsaved edits are saved first
+    /// so nothing is silently lost; a refused save aborts the deletion.
+    fn delete_tree_path(&mut self, path: String) -> Task<Message> {
+        let is_note = path.ends_with(".md");
+        let affected =
+            |p: &str| (is_note && p == path) || (!is_note && p.starts_with(&format!("{path}/")));
+        let dirty: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| affected(&tab.path) && tab.is_dirty())
+            .map(|(idx, _)| idx)
+            .collect();
+        for idx in dirty {
+            if !self.save_tab(idx) {
+                // Conflict banner raised; the tab (and file) stay untouched.
+                return Task::none();
+            }
+        }
+        let outcome = {
+            let Some(vault) = self.vault.as_mut() else {
+                return Task::none();
+            };
+            if is_note {
+                vault.delete_note(&path).map(|_| ())
+            } else {
+                vault.delete_folder(&path).map(|_| ())
+            }
+        };
+        match outcome {
+            Ok(()) => {
+                let active_path = self
+                    .active
+                    .and_then(|idx| self.tabs.get(idx))
+                    .map(|tab| tab.path.clone());
+                self.tabs.retain(|tab| !affected(&tab.path));
+                self.active = active_path
+                    .and_then(|ap| self.tabs.iter().position(|tab| tab.path == ap))
+                    .or(if self.tabs.is_empty() {
+                        None
+                    } else {
+                        Some(self.tabs.len() - 1)
+                    });
+                self.rebuild_index();
+            }
+            Err(error) => self.error = Some(format!("cannot delete {path}: {error}")),
+        }
+        Task::none()
+    }
+
     /// Poll the watcher: re-index externally changed paths, auto-refresh
     /// clean tabs, and flag dirty ones in the banner (M4 decision 7).
     /// Save the active tab if it was edited and has been idle for
@@ -613,6 +920,8 @@ impl cosmic::Application for VaultNotes {
             last_edit: None,
             glass_style: vault_glass::GlassStyle::Opaque,
             theme: settings::ThemeChoice::default(),
+            tree_edit: None,
+            tree_menu_target: None,
         };
         app.core.set_header_title("Vault Notes".to_string());
 
@@ -730,6 +1039,23 @@ impl cosmic::Application for VaultNotes {
                 theme_task(next)
             }
             Message::TabClose(idx) => self.close_tab(idx),
+            Message::TreeMenuTarget(target) => {
+                self.tree_menu_target = target;
+                Task::none()
+            }
+            Message::TreeMenu(action) => self.tree_menu_command(action),
+            Message::TreeEditInput(value) => {
+                if let Some(edit) = &mut self.tree_edit {
+                    edit.value = value;
+                }
+                Task::none()
+            }
+            Message::TreeEditCancel => {
+                self.tree_edit = None;
+                Task::none()
+            }
+            Message::TreeEditSubmit => self.submit_tree_edit(),
+            Message::Surface(action) => cosmic::task::message(cosmic::Action::Surface(action)),
             Message::TabSelect(idx) => {
                 if idx < self.tabs.len() {
                     self.active = Some(idx);
@@ -939,6 +1265,11 @@ impl cosmic::Application for VaultNotes {
                             self.switcher.open = false;
                             Task::none()
                         }
+                        _ => Task::none(),
+                    }
+                } else if self.tree_edit.is_some() {
+                    match key {
+                        Key::Named(Named::Escape) => self.update(Message::TreeEditCancel),
                         _ => Task::none(),
                     }
                 } else if modifiers.control() {

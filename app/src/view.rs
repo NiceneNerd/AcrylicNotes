@@ -7,10 +7,15 @@
 use cosmic::iced::core::widget::Id;
 use cosmic::iced::widget::{opaque, stack, text_editor};
 use cosmic::iced::{alignment, border, Background, Length, Padding};
-use cosmic::widget::{button, column, container, flex_row, row, scrollable, text, text_input};
+use cosmic::widget::{
+    button, column, container, context_menu, flex_row, menu, row, scrollable, text, text_input,
+};
 use cosmic::Element;
 
-use crate::app::{title_of, Message, Palette, PaneMode, SidePanel, VaultNotes, SWITCHER_INPUT};
+use crate::app::{
+    title_of, Message, Palette, PaneMode, SidePanel, TreeMenuAction, VaultNotes, SWITCHER_INPUT,
+    TREE_EDIT_INPUT,
+};
 use crate::reading;
 use crate::scroll::READING_SCROLL;
 use crate::tree::TreeNode;
@@ -213,12 +218,69 @@ fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
 }
 
 fn tree_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
-    if app.tree.is_empty() {
+    if app.tree.is_empty() && app.tree_folder_edit_target().is_none() {
         return container(text("No notes.").class(palette.muted))
             .padding(12)
             .into();
     }
-    nodes_view(&app.tree, 0, app)
+    let mut col = column::Column::new().spacing(0).width(Length::Fill);
+    // A root-level new-note/new-folder input renders above the tree.
+    if app.tree_folder_edit_target() == Some("") {
+        col = col.push(tree_edit_row(app, 4.0));
+    }
+    col = col.push(nodes_view(&app.tree, 0, app));
+    col.into()
+}
+
+/// The shared right-click menu for a tree row: new note/folder beside the
+/// target, then rename and delete (delete moves files to `.trash/`).
+fn node_menu() -> Vec<menu::Tree<Message>> {
+    menu::items(
+        &std::collections::HashMap::new(),
+        vec![
+            menu::Item::Button("New note", None, TreeMenuAction::NewNote),
+            menu::Item::Button("New folder", None, TreeMenuAction::NewFolder),
+            menu::Item::Divider,
+            menu::Item::Button("Rename", None, TreeMenuAction::Rename),
+            menu::Item::Button("Delete", None, TreeMenuAction::Delete),
+        ],
+    )
+}
+
+/// Wrap a tree row in the right-click menu; the opened menu records its
+/// target so a later `TreeMenu` command knows what to act on.
+fn menu_row<'a>(
+    row: impl Into<cosmic::Element<'a, Message>>,
+    path: &str,
+) -> cosmic::Element<'a, Message> {
+    context_menu(row, Some(node_menu()))
+        .on_open(Message::TreeMenuTarget(Some(path.to_string())))
+        .on_close(Message::TreeMenuTarget(None))
+        .on_surface_action(Message::Surface)
+        .into()
+}
+
+/// The inline name input for new-note / new-folder / rename edits.
+fn tree_edit_row<'a>(app: &'a VaultNotes, indent: f32) -> cosmic::Element<'a, Message> {
+    let value = app
+        .tree_edit
+        .as_ref()
+        .map(|edit| edit.value.as_str())
+        .unwrap_or("");
+    container(
+        text_input("Name", value)
+            .id(Id::new(TREE_EDIT_INPUT))
+            .on_input(Message::TreeEditInput)
+            .on_submit(|_| Message::TreeEditSubmit)
+            .width(Length::Fill),
+    )
+    .padding(Padding {
+        left: indent + 10.0,
+        right: 8.0,
+        ..Padding::ZERO
+    })
+    .width(Length::Fill)
+    .into()
 }
 
 fn nodes_view<'a>(
@@ -240,42 +302,54 @@ fn nodes_view<'a>(
                 } else {
                     "▾"
                 };
+                let row = if app.tree_rename_target() == Some(path.as_str()) {
+                    tree_edit_row(app, indent)
+                } else {
+                    button::text(format!("{icon} {name}"))
+                        .on_press(Message::ToggleFolder(path.clone()))
+                        .height(Length::Shrink)
+                        .width(Length::Fill)
+                        .into()
+                };
                 col = col.push(
-                    container(
-                        button::text(format!("{icon} {name}"))
-                            .on_press(Message::ToggleFolder(path.clone()))
-                            .height(Length::Shrink)
-                            .width(Length::Fill),
-                    )
-                    .padding(Padding {
-                        left: indent,
-                        ..Padding::ZERO
-                    })
-                    .width(Length::Fill),
+                    container(menu_row(row, path))
+                        .padding(Padding {
+                            left: indent,
+                            ..Padding::ZERO
+                        })
+                        .width(Length::Fill),
                 );
                 if !app.collapsed.contains(path) {
+                    // New-note/new-folder inputs render as the folder's first row.
+                    if app.tree_folder_edit_target() == Some(path.as_str()) {
+                        col = col.push(tree_edit_row(app, indent + 14.0));
+                    }
                     col = col.push(nodes_view(children, depth + 1, app));
                 }
             }
             TreeNode::Note { name, path } => {
-                let mut label = name.clone();
-                if app.active_tab_path() == Some(path.as_str()) {
-                    label = format!("● {label}");
-                } else if app.is_tab_dirty(path) {
-                    label = format!("• {label}");
-                }
+                let row = if app.tree_rename_target() == Some(path.as_str()) {
+                    tree_edit_row(app, indent + 10.0)
+                } else {
+                    let mut label = name.clone();
+                    if app.active_tab_path() == Some(path.as_str()) {
+                        label = format!("● {label}");
+                    } else if app.is_tab_dirty(path) {
+                        label = format!("• {label}");
+                    }
+                    button::text(label)
+                        .on_press(Message::TabOpen(path.clone()))
+                        .height(Length::Shrink)
+                        .width(Length::Fill)
+                        .into()
+                };
                 col = col.push(
-                    container(
-                        button::text(label)
-                            .on_press(Message::TabOpen(path.clone()))
-                            .height(Length::Shrink)
-                            .width(Length::Fill),
-                    )
-                    .padding(Padding {
-                        left: indent + 10.0,
-                        ..Padding::ZERO
-                    })
-                    .width(Length::Fill),
+                    container(menu_row(row, path))
+                        .padding(Padding {
+                            left: indent + 10.0,
+                            ..Padding::ZERO
+                        })
+                        .width(Length::Fill),
                 );
             }
         }
