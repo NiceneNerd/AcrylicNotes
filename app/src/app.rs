@@ -257,6 +257,18 @@ pub struct VaultNotes {
     pub search_hits: Vec<crate::search::SearchHit>,
     pub selected_tag: Option<String>,
     pub switcher: Switcher,
+    // --- M4c ---
+    /// When the editor last saw an edit action; drives autosave-on-idle.
+    pub last_edit: Option<std::time::Instant>,
+}
+
+/// Save the active note ~2 s after its last edit (M4 decision, user-tuned).
+const AUTOSAVE_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Pure autosave decision: an idle period measured since the last edit is
+/// due for a save. Unit-testable without an `Instant`.
+fn autosave_due(idle_since_last_edit: Option<std::time::Duration>) -> bool {
+    idle_since_last_edit.is_some_and(|d| d >= AUTOSAVE_IDLE)
 }
 
 impl VaultNotes {
@@ -454,6 +466,18 @@ impl VaultNotes {
 
     /// Poll the watcher: re-index externally changed paths, auto-refresh
     /// clean tabs, and flag dirty ones in the banner (M4 decision 7).
+    /// Save the active tab if it was edited and has been idle for
+    /// `AUTOSAVE_IDLE`. Goes through the guarded save path, so an external
+    /// change refuses the write and raises the conflict banner instead of
+    /// silently clobbering.
+    fn autosave_tick(&mut self) -> Task<Message> {
+        let idle = self.last_edit.map(|t| t.elapsed());
+        if autosave_due(idle) && self.active.is_some_and(|idx| self.tabs[idx].is_dirty()) {
+            return self.save_active();
+        }
+        Task::none()
+    }
+
     fn poll_watcher(&mut self) -> Task<Message> {
         let dirty = {
             let Some(vault) = self.vault.as_mut() else {
@@ -532,6 +556,7 @@ impl cosmic::Application for VaultNotes {
             search_hits: Vec::new(),
             selected_tag: None,
             switcher: Switcher::default(),
+            last_edit: None,
         };
         app.core.set_header_title("Vault Notes".to_string());
 
@@ -556,7 +581,11 @@ impl cosmic::Application for VaultNotes {
                 self.update(Message::VaultOpen(path))
             }
             Message::VaultOpen(path) => self.open_vault(path),
-            Message::WatchTick => self.poll_watcher(),
+            Message::WatchTick => {
+                let autosave = self.autosave_tick();
+                let poll = self.poll_watcher();
+                Task::batch([autosave, poll])
+            }
             Message::BannerReload => {
                 // Discard local edits in the conflicting tabs; reload disk.
                 let conflicts = self
@@ -643,6 +672,9 @@ impl cosmic::Application for VaultNotes {
                     if is_edit {
                         tab.refresh_doc();
                     }
+                    // Any editor activity (edits and cursor moves alike)
+                    // resets the idle timer: the user is still working here.
+                    self.last_edit = Some(std::time::Instant::now());
                 }
                 Task::none()
             }
@@ -1108,5 +1140,17 @@ mod tests {
             vault.note_source("n.md").as_deref(),
             Some(tab.content.text().as_str())
         );
+    }
+
+    #[test]
+    fn autosave_fires_only_after_the_idle_window() {
+        use std::time::Duration;
+        // No edit recorded: never save.
+        assert!(!autosave_due(None));
+        // Recent edit: not yet.
+        assert!(!autosave_due(Some(Duration::from_millis(500))));
+        // Idle past the window: save.
+        assert!(autosave_due(Some(Duration::from_secs(2))));
+        assert!(autosave_due(Some(Duration::from_secs(10))));
     }
 }
