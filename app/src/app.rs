@@ -435,8 +435,18 @@ impl VaultNotes {
     /// reuse the original frontmatter bytes verbatim; frontmatter edits go
     /// through `save_note_full` with the full text.
     fn save_active(&mut self) -> Task<Message> {
-        let (Some(idx), Some(vault)) = (self.active, self.vault.as_mut()) else {
-            return Task::none();
+        if let Some(idx) = self.active {
+            self.save_tab(idx);
+        }
+        Task::none()
+    }
+
+    /// Save tab `idx` through the guarded write path. Returns whether the
+    /// tab is now clean; on refusal (external change) the conflict banner is
+    /// raised and the tab stays dirty.
+    fn save_tab(&mut self, idx: usize) -> bool {
+        let Some(vault) = self.vault.as_mut() else {
+            return false;
         };
         let tab = &mut self.tabs[idx];
         // The sentinel is the base text our edits were made against: an
@@ -448,6 +458,7 @@ impl VaultNotes {
                 tab.refresh_doc();
                 self.error = None;
                 self.rebuild_index();
+                true
             }
             Err(VaultError::Write(vault_core::WriteError::ExternallyModified)) => {
                 // The file changed under us: offer resolution in the banner.
@@ -456,11 +467,35 @@ impl VaultNotes {
                     reloaded: Vec::new(),
                     conflicts: vec![path],
                 });
+                false
             }
             Err(error) => {
                 self.error = Some(format!("save failed: {error}"));
+                false
             }
         }
+    }
+
+    /// Close a tab, saving unsaved edits first. A refused save (external
+    /// change) keeps the tab open so no edits are lost.
+    fn close_tab(&mut self, idx: usize) -> Task<Message> {
+        if idx >= self.tabs.len() {
+            return Task::none();
+        }
+        if self.tabs[idx].is_dirty() && !self.save_tab(idx) {
+            return Task::none();
+        }
+        self.tabs.remove(idx);
+        self.active = match self.active {
+            Some(active) if active >= self.tabs.len() => {
+                if self.tabs.is_empty() {
+                    None
+                } else {
+                    Some(self.tabs.len() - 1)
+                }
+            }
+            other => other,
+        };
         Task::none()
     }
 
@@ -642,22 +677,7 @@ impl cosmic::Application for VaultNotes {
             }
             Message::TabOpen(path) => self.open_tab(path),
             Message::DailyNote => self.open_daily_note(),
-            Message::TabClose(idx) => {
-                if idx < self.tabs.len() {
-                    self.tabs.remove(idx);
-                    self.active = match self.active {
-                        Some(active) if active >= self.tabs.len() => {
-                            if self.tabs.is_empty() {
-                                None
-                            } else {
-                                Some(self.tabs.len() - 1)
-                            }
-                        }
-                        other => other,
-                    };
-                }
-                Task::none()
-            }
+            Message::TabClose(idx) => self.close_tab(idx),
             Message::TabSelect(idx) => {
                 if idx < self.tabs.len() {
                     self.active = Some(idx);
@@ -874,6 +894,15 @@ impl cosmic::Application for VaultNotes {
                         Key::Character(c) if c == "p" => self.update(Message::SwitcherToggle),
                         Key::Character(c) if c == "s" => self.save_active(),
                         Key::Character(c) if c == "d" => self.update(Message::DailyNote),
+                        // Shift+F arrives as either case depending on the
+                        // platform's key mapping.
+                        Key::Character(c) if c == "f" || c == "F" => {
+                            self.update(Message::SidePanel(SidePanel::Search))
+                        }
+                        Key::Character(c) if c == "w" => match self.active {
+                            Some(idx) => self.update(Message::TabClose(idx)),
+                            None => Task::none(),
+                        },
                         _ => Task::none(),
                     }
                 } else {
