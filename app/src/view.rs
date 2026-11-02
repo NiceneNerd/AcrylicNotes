@@ -573,7 +573,30 @@ fn editor_pane<'a>(tab: &'a crate::app::Tab, palette: Palette) -> Element<'a, Me
                     token: "md".to_string(),
                 },
                 |highlight, _theme| highlight.to_format(),
-            ),
+            )
+            .style(|theme: &cosmic::Theme, status: text_editor::Status| {
+                // Cosmic's default text_editor style paints an opaque
+                // bg_color, which hides the pane's translucent overlay (and
+                // any compositor frosted-window blur behind it). Keep only
+                // the border and text colors; the pane container's dark
+                // overlay is the visible editor surface.
+                let cosmic = theme.cosmic();
+                let border_color = match status {
+                    text_editor::Status::Focused { .. } => cosmic.accent.base,
+                    _ => cosmic.bg_divider(),
+                };
+                text_editor::Style {
+                    background: Background::Color(cosmic::iced::Color::TRANSPARENT),
+                    border: border::Border {
+                        radius: cosmic.corner_radii.radius_0.into(),
+                        width: f32::from(cosmic.space_xxxs()),
+                        color: border_color.into(),
+                    },
+                    placeholder: with_alpha(cosmic.palette.neutral_9.into(), 0.7),
+                    value: cosmic.palette.neutral_9.into(),
+                    selection: cosmic.accent.base.into(),
+                }
+            }),
     )
     .padding(8)
     .width(Length::Fill)
