@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use cosmic::iced::core::text::Span;
+use cosmic::iced::core::widget::Id;
 use cosmic::iced::widget::{self, image::Handle as ImageHandle, rich_text, text};
 use cosmic::iced::{border, font, Background, Color, Font, Length, Padding};
 use cosmic::widget::{button, column, container, row, scrollable, Space};
@@ -43,6 +44,102 @@ pub struct Ctx<'a> {
     pub images: &'a RefCell<HashMap<String, ImageHandle>>,
 }
 
+/// One heading for the outline panel (M4b): its top-level block index, the
+/// heading level and its plain text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlineEntry {
+    pub block: usize,
+    pub level: u8,
+    pub text: String,
+}
+
+/// Top-level headings of a document, in document order.
+pub fn outline(doc: &Doc) -> Vec<OutlineEntry> {
+    doc.blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, block)| match block {
+            Block::Heading { level, content, .. } => Some(OutlineEntry {
+                block: i,
+                level: *level,
+                text: plain_inlines(content),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The plain text of a block, descending into nested structures (lists,
+/// quotes, callouts, footnote definitions, tables). Embeds do not descend —
+/// they pull other notes in at render time; their target name still counts
+/// as text so `![[Note]]` is searchable in a coarse way.
+pub fn block_text(block: &Block) -> String {
+    match block {
+        Block::Heading { content, .. } | Block::Paragraph { content, .. } => plain_inlines(content),
+        Block::List { items, .. } => items
+            .iter()
+            .map(|item| {
+                item.body
+                    .iter()
+                    .map(block_text)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        Block::Quote(body) | Block::FootnoteDef { body, .. } => {
+            body.iter().map(block_text).collect::<Vec<_>>().join(" ")
+        }
+        Block::Callout { title, body, .. } => {
+            let mut parts = vec![plain_inlines(title)];
+            parts.extend(body.iter().map(block_text));
+            parts.join(" ")
+        }
+        Block::Code { text, .. } | Block::Math(text) | Block::Html(text) => text.clone(),
+        Block::Table { header, rows, .. } => header
+            .iter()
+            .chain(rows.iter().flatten())
+            .map(|cell| cell.iter().map(inline_text).collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+            .join(" "),
+        Block::Rule => String::new(),
+        Block::EmbedBlock(embed) => embed.target.note.clone(),
+    }
+}
+
+fn inline_text(inline: &Inline) -> String {
+    match inline {
+        Inline::Text(s) | Inline::Code(s) | Inline::Math(s) | Inline::Html(s) => s.clone(),
+        Inline::Emph(inner)
+        | Inline::Strong(inner)
+        | Inline::Strike(inner)
+        | Inline::Highlight(inner)
+        | Inline::InlineFootnote(inner) => inner.iter().map(inline_text).collect(),
+        Inline::Link { content, .. } => content.iter().map(inline_text).collect(),
+        Inline::WikiLink(link) => link
+            .alias
+            .clone()
+            .unwrap_or_else(|| link.target.note.clone()),
+        Inline::Image { alt, .. } => alt.clone(),
+        Inline::Embed(embed) => embed.target.note.clone(),
+        Inline::Tag(t) => format!("#{t}"),
+        Inline::FootnoteRef(l) => format!("[{l}]"),
+        Inline::SoftBreak | Inline::HardBreak => " ".to_string(),
+    }
+}
+
+/// First top-level block whose text contains `query` (case-insensitive) —
+/// used to scroll a search hit's reading view to the match.
+pub fn find_block_with_text(doc: &Doc, query: &str) -> Option<usize> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return None;
+    }
+    doc.blocks
+        .iter()
+        .position(|block| block_text(block).to_lowercase().contains(&query))
+}
+
 /// Render a whole document (frontmatter preview + blocks).
 pub fn render_doc<'a>(doc: &Doc, ctx: &Ctx<'a>) -> Element<'a, Message> {
     let palette = ctx.palette;
@@ -65,8 +162,11 @@ pub fn render_doc<'a>(doc: &Doc, ctx: &Ctx<'a>) -> Element<'a, Message> {
     // embeds) keeps them globally unique per tab.
     let mut fold_id = 0u64;
     let stack = vec![ctx.from.clone()];
-    for block in &doc.blocks {
-        col = col.push(render_block(block, ctx, 0, &stack, &mut fold_id));
+    for (i, block) in doc.blocks.iter().enumerate() {
+        let element = render_block(block, ctx, 0, &stack, &mut fold_id);
+        // Anchor every top-level block so outline/search jumps can measure
+        // and scroll to it (see scroll.rs). The container is pass-through.
+        col = col.push(container(element).id(Id::from(format!("block-{i}"))));
     }
     col.into()
 }
@@ -920,6 +1020,30 @@ mod tests {
         let (label, uri, _) = wikilink_span(&anchor, &ctx);
         assert_eq!(label, "Intro");
         assert_eq!(uri, "scroll:Intro");
+    }
+
+    #[test]
+    fn outline_lists_top_level_headings_with_block_indices() {
+        let doc = parse_note("# One\n\ntext\n\n## Two\n\n- a list\n- items\n\n# Three\n");
+        let entries = outline(&doc);
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        assert_eq!(entries[0].block, 0);
+        assert_eq!(entries[0].level, 1);
+        assert_eq!(entries[0].text, "One");
+        assert_eq!(entries[1].block, 2);
+        assert_eq!(entries[1].level, 2);
+        assert_eq!(entries[2].text, "Three");
+    }
+
+    #[test]
+    fn find_block_with_text_descends_into_nested_structures() {
+        let doc = parse_note("# Top\n\ntarget is here\n\n> [!note] Callout\n> the needle inside\n");
+        // Plain paragraph.
+        assert_eq!(find_block_with_text(&doc, "target is"), Some(1));
+        // Inside the callout body.
+        assert_eq!(find_block_with_text(&doc, "needle inside"), Some(2));
+        assert_eq!(find_block_with_text(&doc, "absent"), None);
+        assert_eq!(find_block_with_text(&doc, "  "), None);
     }
 
     #[test]

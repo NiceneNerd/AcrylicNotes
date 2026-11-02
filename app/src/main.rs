@@ -6,7 +6,10 @@
 //! in M4c through `vault-glass`.
 
 mod app;
+mod fuzzy;
 mod reading;
+mod scroll;
+mod search;
 mod settings;
 mod tree;
 mod view;

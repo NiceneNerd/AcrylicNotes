@@ -141,10 +141,14 @@ express what HTML does — all honest approximations, revisitable later:
   HTML path is the web renderer's job).
 - **Remote images** (`http(s)`) are text placeholders — no network fetch in
   v1; local images render from disk with a per-path `Handle` cache.
-- **Same-document `[[#Heading]]` / `[[#^block]]` links** emit a `scroll:`
-  URI and are inert until M4b wires scroll-to-anchor.
-- **Tag clicks** (`tag:`) and footnote-reference clicks (`fnref:`) are
-  inert until M4b's tag panel / footnote scrolling.
+- **Same-document `[[#Heading]]` links** emit a `scroll:` URI; since M4b
+  they scroll the reading view to the matching heading (case-insensitive
+  match on the rendered heading text). `[[#^block-id]]` links still no-op —
+  the reading renderer's anchors are positional (`block-{index}`), not
+  Obsidian block ids, so an id→index map is still needed.
+- **Tag clicks** (`tag:`) since M4b open the sidebar Tags panel with that
+  tag selected; **footnote-reference clicks** (`fnref:`) scroll to the
+  footnote's definition block.
 - **Task checkboxes** in lists are display-only; toggling from reading view
   is deferred (it rewrites the source line).
 - **Callout fold state** is per-tab and keyed by traversal order, so it
@@ -166,3 +170,46 @@ express what HTML does — all honest approximations, revisitable later:
   a conflict banner for dirty tabs — Reload from disk / Keep mine / Save
   mine anyway (the deliberate overwrite passes the fresh disk text as the
   sentinel).
+
+## GUI navigation (M4b)
+
+Sidebar panels (Files / Search / Tags / Links / Outline) and the quick
+switcher, with the behaviors and limits decided for M4:
+
+- **Vault search is literal ripgrep as a library** (the `grep` + `ignore`
+  crates — ripgrep's own engine, no subprocess, no content index). Smart
+  case like ripgrep: a lowercase query matches case-insensitively, any
+  uppercase makes it case-sensitive; a query that is not a valid regex
+  falls back to a literal (escaped) match. Scope is `.md` notes only,
+  hidden entries (`.obsidian/`) skipped, ignore files not honored — the
+  same scan surface as vault-core's index. Runs off the UI thread on
+  submit (Enter or the Search button), capped at 200 hits. Opening a hit
+  opens the note and scrolls the reading view to the first block whose
+  plain text contains the query.
+- **Quick switcher (Ctrl+P)** is nucleo fuzzy matching (helix's engine)
+  over note paths, smart case + smart normalization, top 20. Enter
+  activates, arrows move, Esc closes; clicking a row opens it directly.
+  Inert when no vault is open.
+- **Outline panel** lists top-level headings with their block index;
+  clicking scrolls the reading view there. **Tags panel** lists all tags
+  (frontmatter + inline) with note counts, then the notes of the selected
+  tag (click the tag again to clear). **Links panel** shows backlinks of
+  the active note.
+- **Scroll-to-anchor** is a two-phase iced widget operation: measure the
+  target block container's Y and the reading scrollable's content Y in one
+  layout pass, then `scroll_to` the difference (minus a small margin). No
+  frame deferral is needed even when the pane just switched Source→Split:
+  iced's runner rebuilds all user interfaces *before* running the actions
+  returned by update, so the measure op always sees the fresh tree.
+- **Keyboard shortcuts** flow through a global `listen_with` subscription
+  that ignores capture status (so they work while the editor has focus):
+  Ctrl+P toggles the switcher, Ctrl+S saves. Everything else is filtered
+  out in `update`.
+- **Known fmt-gate note:** `cargo fmt --all` formats every non-registry
+  package in the dependency graph — including the whole pinned libcosmic
+  checkout at `/cella/Git/libcosmic` (113 files). The gate therefore uses
+  `cargo fmt -p vault-glass -p vault-core -p vault-md -p app` so our
+  formatting never rewrites the external checkout. (As of 2026-11-01 that
+  checkout also contains a broken iced example,
+  `iced/examples/sctk_subsurface_img/src/main.rs` — invalid pattern,
+  never compiled — which is what surfaced this.)

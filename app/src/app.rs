@@ -9,6 +9,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use cosmic::app::{Core, Task};
+use cosmic::iced::core::widget::Id;
+use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
 use cosmic::iced::widget::image::Handle as ImageHandle;
 use cosmic::iced::widget::text_editor::Content;
 use cosmic::iced::Color;
@@ -28,6 +30,53 @@ pub enum PaneMode {
     Source,
     Reading,
 }
+
+/// Which panel the sidebar shows (M4b).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SidePanel {
+    #[default]
+    Files,
+    Search,
+    Tags,
+    Links,
+    Outline,
+}
+
+impl SidePanel {
+    pub const ALL: [SidePanel; 5] = [
+        SidePanel::Files,
+        SidePanel::Search,
+        SidePanel::Tags,
+        SidePanel::Links,
+        SidePanel::Outline,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SidePanel::Files => "Files",
+            SidePanel::Search => "Search",
+            SidePanel::Tags => "Tags",
+            SidePanel::Links => "Links",
+            SidePanel::Outline => "Outline",
+        }
+    }
+}
+
+/// The quick switcher: a fuzzy overlay over all note paths (M4b, nucleo).
+#[derive(Debug, Default)]
+pub struct Switcher {
+    pub open: bool,
+    pub query: String,
+    /// Ranked note paths (already materialized from the index).
+    pub items: Vec<String>,
+    pub selected: usize,
+}
+
+/// Id of the switcher's text input (so it can be focused on open).
+pub const SWITCHER_INPUT: &str = "switcher-input";
+
+/// Cap on vault-wide search results shown.
+pub const SEARCH_MAX_HITS: usize = 200;
 
 /// Colors derived once per view pass from the active cosmic theme, so the
 /// reading renderer and views stay theme-agnostic (M4 decision 6: the
@@ -83,6 +132,8 @@ pub struct Tab {
     /// editor text actually changes (one parse per edit, not per frame).
     pub doc: Doc,
     doc_text: String,
+    /// Headings for the outline panel, in sync with `doc`.
+    pub outline: Vec<crate::reading::OutlineEntry>,
     /// Callouts the user folded by hand (ids from the reading renderer).
     pub folds: HashSet<u64>,
 }
@@ -98,6 +149,7 @@ impl Tab {
                 blocks: Vec::new(),
             },
             doc_text: String::new(),
+            outline: Vec::new(),
             folds: HashSet::new(),
         };
         tab.refresh_doc();
@@ -114,6 +166,7 @@ impl Tab {
         if text != self.doc_text {
             self.doc = parse_note(&text);
             self.doc_text = text;
+            self.outline = crate::reading::outline(&self.doc);
             // Ids are positional; after an edit they may point at different
             // callouts, so fold state resets with the content.
             self.folds.clear();
@@ -159,6 +212,24 @@ pub enum Message {
     OpenUri(String),
     /// An http(s) link: hand it to the OS opener.
     OpenExternal(String),
+    // --- M4b: navigation panels, quick switcher, search ---
+    SidePanel(SidePanel),
+    SearchInput(String),
+    SearchSubmitted,
+    SearchDone(Vec<crate::search::SearchHit>),
+    /// Open search hit `i` and scroll its reading view to the match.
+    SearchOpen(usize),
+    TagSelected(String),
+    /// Scroll the active tab's reading view to top-level block `idx`.
+    JumpToBlock(usize),
+    SwitcherToggle,
+    SwitcherInput(String),
+    SwitcherMove(i32),
+    SwitcherActivate,
+    /// Open switcher item `i` directly (mouse click).
+    SwitcherSelect(usize),
+    /// Raw key events; update decides what matters (switcher, shortcuts).
+    KeyPressed(Modifiers, Key),
 }
 
 pub struct VaultNotes {
@@ -178,6 +249,12 @@ pub struct VaultNotes {
     pub vault_input: String,
     pub strict_breaks: bool,
     pub images: RefCell<std::collections::HashMap<String, ImageHandle>>,
+    // --- M4b ---
+    pub panel: SidePanel,
+    pub search_query: String,
+    pub search_hits: Vec<crate::search::SearchHit>,
+    pub selected_tag: Option<String>,
+    pub switcher: Switcher,
 }
 
 impl VaultNotes {
@@ -208,6 +285,11 @@ impl VaultNotes {
             }
         }
         Task::none()
+    }
+
+    /// The tab currently shown, if any.
+    pub fn active_tab(&self) -> Option<&Tab> {
+        self.active.and_then(|idx| self.tabs.get(idx))
     }
 
     /// Path of the tab currently shown, if any.
@@ -279,6 +361,41 @@ impl VaultNotes {
                 Task::none()
             }
         }
+    }
+
+    /// Re-rank the switcher's items from the vault's note paths.
+    fn rerank_switcher(&mut self) {
+        let query = self.switcher.query.clone();
+        if let Some(vault) = self.vault.as_ref() {
+            let paths: Vec<String> = vault
+                .notes_sorted()
+                .iter()
+                .map(|note| note.path.clone())
+                .collect();
+            self.switcher.items = crate::fuzzy::rank(&query, &paths, 20)
+                .into_iter()
+                .map(|ranked| paths[ranked.index].clone())
+                .collect();
+        } else {
+            self.switcher.items.clear();
+        }
+        if self.switcher.selected >= self.switcher.items.len() {
+            self.switcher.selected = 0;
+        }
+    }
+
+    /// Scroll the active tab's reading view to top-level block `idx`,
+    /// switching out of source-only mode so the jump is visible.
+    fn jump_to_block(&mut self, idx: usize) -> Task<Message> {
+        if self.pane == PaneMode::Source {
+            self.pane = PaneMode::Split;
+        }
+        // No frame deferral needed even when the pane just switched: the
+        // iced runner rebuilds all user interfaces *before* running the
+        // actions returned by update, so the measure op below always sees
+        // the freshly built tree (iced/winit/src/lib.rs: build_user_interfaces
+        // precedes run_action!).
+        crate::scroll::to_block::<Message>(idx, 12.0)
     }
 
     /// Save the active tab through the safe write path: body-only edits
@@ -389,6 +506,11 @@ impl cosmic::Application for VaultNotes {
             vault_input: String::new(),
             strict_breaks: false,
             images: RefCell::new(std::collections::HashMap::new()),
+            panel: SidePanel::default(),
+            search_query: String::new(),
+            search_hits: Vec::new(),
+            selected_tag: None,
+            switcher: Switcher::default(),
         };
         app.core.set_header_title("Vault Notes".to_string());
 
@@ -544,9 +666,163 @@ impl cosmic::Application for VaultNotes {
                         }
                     }
                     "open" => self.update(Message::OpenExternal(rest.to_string())),
-                    // `tag:` routes to the tag pane in M4b; `fnref:` and
-                    // `scroll:` need scroll infrastructure (M4b). Inert now.
+                    // Same-document anchor: jump to the matching heading.
+                    "scroll" => {
+                        let wanted = rest.trim().to_lowercase();
+                        let idx = self.active_tab().and_then(|tab| {
+                            tab.outline
+                                .iter()
+                                .find(|entry| entry.text.to_lowercase() == wanted)
+                                .map(|entry| entry.block)
+                        });
+                        match idx {
+                            Some(idx) => self.jump_to_block(idx),
+                            None => Task::none(),
+                        }
+                    }
+                    // Footnote reference: jump to the definition.
+                    "fnref" => {
+                        let wanted = rest.trim();
+                        let idx = self.active_tab().and_then(|tab| {
+                            tab.doc.blocks.iter().position(|block| match block {
+                                vault_md::Block::FootnoteDef { label, .. } => label == wanted,
+                                _ => false,
+                            })
+                        });
+                        match idx {
+                            Some(idx) => self.jump_to_block(idx),
+                            None => Task::none(),
+                        }
+                    }
+                    // `tag:` routes to the tag panel (M4b).
+                    "tag" => {
+                        self.panel = SidePanel::Tags;
+                        self.selected_tag = Some(rest.to_string());
+                        Task::none()
+                    }
                     _ => Task::none(),
+                }
+            }
+            Message::SidePanel(panel) => {
+                self.panel = panel;
+                Task::none()
+            }
+            Message::SearchInput(query) => {
+                self.search_query = query;
+                Task::none()
+            }
+            Message::SearchSubmitted => {
+                let Some(vault) = self.vault.as_ref() else {
+                    return Task::none();
+                };
+                let root = vault.root().to_path_buf();
+                let query = self.search_query.clone();
+                // Off the UI thread (tokio worker): keeps typing responsive
+                // on large vaults. Sync file IO inside is fine at vault scale.
+                Task::perform(
+                    async move {
+                        crate::search::search(&root, &query, SEARCH_MAX_HITS).unwrap_or_default()
+                    },
+                    |hits| cosmic::Action::App(Message::SearchDone(hits)),
+                )
+            }
+            Message::SearchDone(hits) => {
+                self.search_hits = hits;
+                Task::none()
+            }
+            Message::SearchOpen(i) => {
+                let Some(hit) = self.search_hits.get(i) else {
+                    return Task::none();
+                };
+                let path = hit.path.clone();
+                let query = self.search_query.clone();
+                let open_task = self.open_tab(path);
+                if self.pane == PaneMode::Source {
+                    self.pane = PaneMode::Split;
+                }
+                // Scroll to the first block whose text contains the query.
+                // No deferral needed: the runner rebuilds the view (with the
+                // new tab and Split panes) *before* dispatching the widget
+                // operation, so the measure op sees the fresh tree.
+                let jump = self
+                    .active_tab()
+                    .and_then(|tab| crate::reading::find_block_with_text(&tab.doc, &query))
+                    .map(|idx| self.jump_to_block(idx))
+                    .unwrap_or_else(Task::none);
+                Task::batch([open_task, jump])
+            }
+            Message::TagSelected(tag) => {
+                // Clicking the selected tag again clears the filter.
+                if self.selected_tag.as_deref() == Some(tag.as_str()) {
+                    self.selected_tag = None;
+                } else {
+                    self.selected_tag = Some(tag);
+                }
+                Task::none()
+            }
+            Message::JumpToBlock(idx) => self.jump_to_block(idx),
+            Message::SwitcherToggle => {
+                if self.vault.is_none() {
+                    // No vault: the overlay would render nowhere (empty state).
+                    return Task::none();
+                }
+                self.switcher.open = !self.switcher.open;
+                if self.switcher.open {
+                    self.switcher.query.clear();
+                    self.switcher.selected = 0;
+                    self.rerank_switcher();
+                    return cosmic::widget::text_input::focus::<Message>(Id::new(SWITCHER_INPUT))
+                        .map(cosmic::Action::App);
+                }
+                Task::none()
+            }
+            Message::SwitcherInput(query) => {
+                self.switcher.query = query;
+                self.switcher.selected = 0;
+                self.rerank_switcher();
+                Task::none()
+            }
+            Message::SwitcherMove(delta) => {
+                if !self.switcher.items.is_empty() {
+                    let len = self.switcher.items.len() as i32;
+                    let next = (self.switcher.selected as i32 + delta).rem_euclid(len);
+                    self.switcher.selected = next as usize;
+                }
+                Task::none()
+            }
+            Message::SwitcherActivate => {
+                let Some(path) = self.switcher.items.get(self.switcher.selected).cloned() else {
+                    return Task::none();
+                };
+                self.switcher.open = false;
+                self.open_tab(path)
+            }
+            Message::SwitcherSelect(i) => {
+                let Some(path) = self.switcher.items.get(i).cloned() else {
+                    return Task::none();
+                };
+                self.switcher.open = false;
+                self.open_tab(path)
+            }
+            Message::KeyPressed(modifiers, key) => {
+                if self.switcher.open {
+                    match key {
+                        Key::Named(Named::ArrowUp) => self.update(Message::SwitcherMove(-1)),
+                        Key::Named(Named::ArrowDown) => self.update(Message::SwitcherMove(1)),
+                        Key::Named(Named::Escape) => {
+                            self.switcher.open = false;
+                            Task::none()
+                        }
+                        _ => Task::none(),
+                    }
+                } else if modifiers.control() {
+                    match &key {
+                        Key::Character(c) if c == "p" => self.update(Message::SwitcherToggle),
+                        Key::Character(c) if c == "s" => self.save_active(),
+                        _ => Task::none(),
+                    }
+                } else {
+                    Task::none()
                 }
             }
             Message::OpenExternal(url) => {
@@ -575,10 +851,23 @@ impl cosmic::Application for VaultNotes {
     }
 
     fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
-        if self.vault.is_some() {
-            cosmic::iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::WatchTick)
-        } else {
-            cosmic::iced::Subscription::none()
+        // Key events always flow (quick switcher + Ctrl+S work everywhere);
+        // update filters by app state, so unused keys are cheap noise.
+        let keys = cosmic::iced::event::listen_with(|event, _status, _window| match event {
+            cosmic::iced::Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                ..
+            }) => Some(Message::KeyPressed(modifiers, key)),
+            _ => None,
+        });
+        match &self.vault {
+            Some(_) => cosmic::iced::Subscription::batch([
+                keys,
+                cosmic::iced::time::every(std::time::Duration::from_secs(2))
+                    .map(|_| Message::WatchTick),
+            ]),
+            None => keys,
         }
     }
 }

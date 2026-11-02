@@ -1,15 +1,18 @@
-//! View composition: chrome, sidebar tree, tab bar, editor/reading panes.
+//! View composition: chrome, sidebar panels (files/search/tags/links/outline),
+//! tab bar, editor/reading panes, and the quick-switcher overlay.
 //!
 //! Pure functions of the model; every interactive element routes through
 //! `Message`. Colors come from the active cosmic theme via `Palette`.
 
-use cosmic::iced::widget::text_editor;
-use cosmic::iced::{alignment, Background, Length, Padding};
+use cosmic::iced::core::widget::Id;
+use cosmic::iced::widget::{opaque, stack, text_editor};
+use cosmic::iced::{alignment, border, Background, Length, Padding};
 use cosmic::widget::{button, column, container, row, scrollable, text, text_input};
 use cosmic::Element;
 
-use crate::app::{Message, Palette, PaneMode, VaultNotes};
+use crate::app::{title_of, Message, Palette, PaneMode, SidePanel, VaultNotes, SWITCHER_INPUT};
 use crate::reading;
+use crate::scroll::READING_SCROLL;
 use crate::tree::TreeNode;
 
 pub fn view(app: &VaultNotes) -> Element<'_, Message> {
@@ -17,7 +20,14 @@ pub fn view(app: &VaultNotes) -> Element<'_, Message> {
         empty_state(app)
     } else {
         let palette = Palette::from(&cosmic::theme::active());
-        main_view(app, palette)
+        let base = main_view(app, palette);
+        if app.switcher.open {
+            // The quick switcher floats above everything (Obsidian-style);
+            // `opaque` keeps mouse clicks from reaching the panes below.
+            stack([base, opaque(switcher_overlay(app, palette))]).into()
+        } else {
+            base
+        }
     }
 }
 
@@ -87,13 +97,10 @@ fn main_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
                 .push(button::text("×").on_press(Message::ErrorDismiss)),
         );
     }
-    let sidebar = container(scrollable::scrollable(tree_view(app, palette)).width(Length::Fill))
-        .width(Length::Fixed(250.0))
-        .height(Length::Fill);
     let note = container(note_area(app, palette))
         .width(Length::Fill)
         .height(Length::Fill);
-    col = col.push(row::Row::new().push(sidebar).push(note));
+    col = col.push(row::Row::new().push(sidebar(app, palette)).push(note));
     col.into()
 }
 
@@ -150,12 +157,43 @@ fn banner_view<'a>(banner: &crate::app::Banner, palette: Palette) -> Element<'a,
 fn titles(paths: &[String]) -> String {
     paths
         .iter()
-        .map(|path| crate::app::title_of(path))
+        .map(|path| title_of(path))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
 // --- sidebar ---------------------------------------------------------------
+
+/// Sidebar: a row of panel switcher tabs over the active panel's body.
+fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+    let mut col = column::Column::new().spacing(4).width(Length::Fill);
+    let mut switcher = row::Row::new().spacing(2);
+    for panel in SidePanel::ALL {
+        let btn = if app.panel == panel {
+            button::suggested(panel.label())
+        } else {
+            button::text(panel.label())
+        };
+        switcher = switcher.push(btn.on_press(Message::SidePanel(panel)));
+    }
+    col = col.push(switcher);
+    let body: Element<'a, Message> = match app.panel {
+        SidePanel::Files => tree_view(app, palette),
+        SidePanel::Search => search_panel(app, palette),
+        SidePanel::Tags => tags_panel(app, palette),
+        SidePanel::Links => links_panel(app, palette),
+        SidePanel::Outline => outline_panel(app, palette),
+    };
+    col = col.push(
+        scrollable::scrollable(body)
+            .width(Length::Fill)
+            .height(Length::Fill),
+    );
+    container(col)
+        .width(Length::Fixed(250.0))
+        .height(Length::Fill)
+        .into()
+}
 
 fn tree_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
     if app.tree.is_empty() {
@@ -224,6 +262,220 @@ fn nodes_view<'a>(
         }
     }
     col.into()
+}
+
+/// Vault-wide literal-ripgrep search (M4 decision 4): query box + flat hit
+/// list; a hit opens its note and scrolls the reading view to the match.
+fn search_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+    let mut col = column::Column::new()
+        .spacing(6)
+        .padding(8)
+        .width(Length::Fill);
+    col = col.push(
+        text_input("Search notes…", &app.search_query)
+            .on_input(Message::SearchInput)
+            .on_submit(|_| Message::SearchSubmitted)
+            .width(Length::Fill),
+    );
+    col = col.push(button::suggested("Search").on_press(Message::SearchSubmitted));
+    if app.search_hits.is_empty() {
+        if !app.search_query.trim().is_empty() {
+            col = col.push(text("No matches.").class(palette.muted));
+        }
+    } else {
+        col = col.push(text(format!("{} matches", app.search_hits.len())).class(palette.muted));
+        for (i, hit) in app.search_hits.iter().enumerate() {
+            col = col.push(
+                button::text(hit.path.clone())
+                    .on_press(Message::SearchOpen(i))
+                    .width(Length::Fill),
+            );
+            col = col.push(
+                text(format!("{}  {}", hit.line_no, snippet(&hit.line)))
+                    .size(12)
+                    .class(palette.muted),
+            );
+        }
+    }
+    col.into()
+}
+
+/// Tag index: all tags with note counts, or the notes of the selected tag.
+fn tags_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+    let Some(vault) = app.vault.as_ref() else {
+        return panel_hint("No vault open.", palette);
+    };
+    let mut col = column::Column::new()
+        .spacing(4)
+        .padding(8)
+        .width(Length::Fill);
+    match &app.selected_tag {
+        None => {
+            let mut tags = vault.all_tags();
+            tags.sort();
+            if tags.is_empty() {
+                col = col.push(text("No tags in this vault.").class(palette.muted));
+            }
+            for tag in tags {
+                let count = vault.notes_for_tag(&tag).len();
+                col = col.push(
+                    button::text(format!("#{tag} ({count})"))
+                        .on_press(Message::TagSelected(tag))
+                        .width(Length::Fill),
+                );
+            }
+        }
+        Some(tag) => {
+            // Clicking the selected tag again clears the filter (update).
+            col = col.push(
+                button::text(format!("← #{tag}"))
+                    .on_press(Message::TagSelected(tag.clone()))
+                    .width(Length::Fill),
+            );
+            let mut notes = vault.notes_for_tag(tag);
+            notes.sort();
+            for path in notes {
+                col = col.push(
+                    button::text(title_of(&path))
+                        .on_press(Message::TabOpen(path))
+                        .width(Length::Fill),
+                );
+            }
+        }
+    }
+    col.into()
+}
+
+/// Backlinks of the active note (nearest-first resolution already done by
+/// vault-core's index).
+fn links_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+    let Some(vault) = app.vault.as_ref() else {
+        return panel_hint("No vault open.", palette);
+    };
+    let Some(path) = app.active_tab_path() else {
+        return panel_hint("Open a note to see what links to it.", palette);
+    };
+    let mut col = column::Column::new()
+        .spacing(4)
+        .padding(8)
+        .width(Length::Fill);
+    col = col.push(text(format!("Links to “{}”", title_of(path))).class(palette.muted));
+    let mut backlinks = vault.backlinks(path);
+    backlinks.sort();
+    if backlinks.is_empty() {
+        col = col.push(text("No backlinks.").class(palette.muted));
+    }
+    for source in backlinks {
+        col = col.push(
+            button::text(title_of(&source))
+                .on_press(Message::TabOpen(source))
+                .width(Length::Fill),
+        );
+    }
+    col.into()
+}
+
+/// Headings of the active note; a click scrolls the reading view to it.
+fn outline_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+    let Some(idx) = app.active else {
+        return panel_hint("Open a note to see its outline.", palette);
+    };
+    let tab = &app.tabs[idx];
+    let mut col = column::Column::new()
+        .spacing(4)
+        .padding(8)
+        .width(Length::Fill);
+    if tab.outline.is_empty() {
+        col = col.push(text("No headings.").class(palette.muted));
+    }
+    for entry in &tab.outline {
+        let depth = (entry.level as usize).saturating_sub(1).min(4);
+        col = col.push(
+            container(
+                button::text(entry.text.clone())
+                    .on_press(Message::JumpToBlock(entry.block))
+                    .width(Length::Fill),
+            )
+            .padding(Padding {
+                left: 14.0 * depth as f32,
+                ..Padding::ZERO
+            })
+            .width(Length::Fill),
+        );
+    }
+    col.into()
+}
+
+fn panel_hint(message: &str, palette: Palette) -> Element<'static, Message> {
+    container(text(message.to_string()).class(palette.muted))
+        .padding(12)
+        .into()
+}
+
+/// Trim a matched line for the hit list.
+fn snippet(line: &str) -> String {
+    const MAX: usize = 64;
+    let line = line.trim();
+    if line.chars().count() <= MAX {
+        line.to_string()
+    } else {
+        let cut: String = line.chars().take(MAX).collect();
+        format!("{cut}…")
+    }
+}
+
+// --- quick switcher --------------------------------------------------------
+
+/// Modal fuzzy-file-finder overlay (Ctrl+P). Keys are routed in `update` via
+/// the global keyboard subscription; Enter activates, arrows move, Esc closes.
+fn switcher_overlay<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+    let mut col = column::Column::new().spacing(6).width(Length::Fill);
+    col = col.push(
+        text_input("Jump to note…", &app.switcher.query)
+            .id(Id::new(SWITCHER_INPUT))
+            .on_input(Message::SwitcherInput)
+            .on_submit(|_| Message::SwitcherActivate)
+            .width(Length::Fill),
+    );
+    if app.switcher.items.is_empty() {
+        col = col.push(text("No matching notes.").class(palette.muted));
+    }
+    for (i, path) in app.switcher.items.iter().enumerate() {
+        let selected = app.switcher.selected == i;
+        let mut label = title_of(path);
+        if selected {
+            label = format!("▸ {label}");
+        }
+        let btn = if selected {
+            button::suggested(label)
+        } else {
+            button::text(label)
+        };
+        col = col.push(btn.on_press(Message::SwitcherSelect(i)).width(Length::Fill));
+    }
+    container(container(col).padding(12).max_width(560).style(move |_| {
+        cosmic::widget::container::Style {
+            background: Some(Background::Color(palette.surface)),
+            border: border::Border {
+                radius: 8.0.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }))
+    .padding(60)
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(alignment::Horizontal::Center)
+    .align_y(alignment::Vertical::Top)
+    .style(move |_| cosmic::widget::container::Style {
+        background: Some(Background::Color(with_alpha(
+            cosmic::iced::Color::BLACK,
+            0.25,
+        ))),
+        ..Default::default()
+    })
+    .into()
 }
 
 // --- note area -------------------------------------------------------------
@@ -326,7 +578,9 @@ fn reading_pane<'a>(
         folds: &tab.folds,
         images: &app.images,
     };
+    // The id anchors outline/search/footnote jumps (see scroll.rs).
     scrollable::scrollable(reading::render_doc(&tab.doc, &ctx))
+        .id(Id::new(READING_SCROLL))
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
