@@ -7,6 +7,7 @@
 
 mod app;
 mod fuzzy;
+mod glass;
 mod reading;
 mod scroll;
 mod search;

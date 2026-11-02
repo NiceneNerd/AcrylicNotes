@@ -19,7 +19,7 @@ use vault_core::vault::VaultError;
 use vault_core::{NoteSource, ObsidianSettings, Vault, VaultIndex};
 use vault_md::{parse_note, Doc};
 
-use crate::settings::{self, AppSettings};
+use crate::settings;
 use crate::tree::{self, TreeNode};
 
 /// How the note area is laid out.
@@ -203,6 +203,8 @@ pub enum Message {
     TabOpen(String),
     /// Open (creating if needed) today's daily note.
     DailyNote,
+    /// Switch between dark and light themes (persisted).
+    ToggleTheme,
     TabClose(usize),
     TabSelect(usize),
     EditorAction(cosmic::iced::widget::text_editor::Action),
@@ -260,6 +262,10 @@ pub struct VaultNotes {
     // --- M4c ---
     /// When the editor last saw an edit action; drives autosave-on-idle.
     pub last_edit: Option<std::time::Instant>,
+    /// The backdrop style the platform offered at startup (glass).
+    pub glass_style: vault_glass::GlassStyle,
+    /// The theme choice the user made (persisted; `System` follows desktop).
+    pub theme: settings::ThemeChoice,
 }
 
 /// Save the active note ~2 s after its last edit (M4 decision, user-tuned).
@@ -269,6 +275,18 @@ const AUTOSAVE_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 /// due for a save. Unit-testable without an `Instant`.
 fn autosave_due(idle_since_last_edit: Option<std::time::Duration>) -> bool {
     idle_since_last_edit.is_some_and(|d| d >= AUTOSAVE_IDLE)
+}
+
+/// The libcosmic task that applies a stored theme choice (M4c).
+fn theme_task(choice: settings::ThemeChoice) -> Task<Message> {
+    let theme = match choice {
+        settings::ThemeChoice::System => cosmic::theme::system_preference(),
+        settings::ThemeChoice::Dark => cosmic::theme::Theme::dark(),
+        settings::ThemeChoice::Light => cosmic::theme::Theme::light(),
+    };
+    Task::done(cosmic::Action::Cosmic(cosmic::app::Action::AppThemeChange(
+        theme,
+    )))
 }
 
 impl VaultNotes {
@@ -291,9 +309,10 @@ impl VaultNotes {
                 self.collapsed = tree::folder_paths(&self.tree).into_iter().collect();
                 self.core
                     .set_header_title(format!("Vault Notes — {}", self.vault_name));
-                settings::store(&AppSettings {
-                    last_vault: Some(path),
-                });
+                // Load-modify-store so theme and glass choices survive.
+                let mut persisted = settings::load();
+                persisted.last_vault = Some(path);
+                settings::store(&persisted);
             }
             Err(error) => {
                 self.error = Some(format!("cannot open {}: {error}", path.display()));
@@ -592,16 +611,35 @@ impl cosmic::Application for VaultNotes {
             selected_tag: None,
             switcher: Switcher::default(),
             last_edit: None,
+            glass_style: vault_glass::GlassStyle::Opaque,
+            theme: settings::ThemeChoice::default(),
         };
         app.core.set_header_title("Vault Notes".to_string());
 
-        // Restore the last-used vault (M4 decision 1) when it still exists.
-        let restored = settings::load().last_vault.filter(|path| path.is_dir());
-        let task = restored
-            .map(|path| app.open_vault(path))
-            .unwrap_or_else(Task::none);
+        // Restore preferences (M4c): theme choice, then the glass request,
+        // then the last-used vault (M4 decision 1) when it still exists.
+        let settings = settings::load();
+        app.theme = settings.theme;
+        app.glass_style = crate::glass::plan(settings.glass_enabled);
 
-        (app, task)
+        let mut tasks = Vec::new();
+        tasks.push(theme_task(settings.theme));
+        if app.glass_style == vault_glass::GlassStyle::Blur {
+            // Ask the compositor for the frosted window; visibility still
+            // depends on the theme's frosted-windows setting.
+            tasks.push(Task::done(cosmic::Action::Cosmic(
+                cosmic::app::Action::BlurEnabled,
+            )));
+        }
+        tasks.push(
+            settings
+                .last_vault
+                .filter(|path| path.is_dir())
+                .map(|path| app.open_vault(path))
+                .unwrap_or_else(Task::none),
+        );
+
+        (app, Task::batch(tasks))
     }
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
@@ -677,6 +715,20 @@ impl cosmic::Application for VaultNotes {
             }
             Message::TabOpen(path) => self.open_tab(path),
             Message::DailyNote => self.open_daily_note(),
+            Message::ToggleTheme => {
+                // System starts the cycle at dark; dark and light alternate.
+                let next = match self.theme {
+                    settings::ThemeChoice::Dark | settings::ThemeChoice::System => {
+                        settings::ThemeChoice::Light
+                    }
+                    settings::ThemeChoice::Light => settings::ThemeChoice::Dark,
+                };
+                self.theme = next;
+                let mut persisted = settings::load();
+                persisted.theme = next;
+                settings::store(&persisted);
+                theme_task(next)
+            }
             Message::TabClose(idx) => self.close_tab(idx),
             Message::TabSelect(idx) => {
                 if idx < self.tabs.len() {

@@ -47,6 +47,14 @@ pub fn header_start(app: &VaultNotes) -> Vec<Element<'_, Message>> {
     vec![
         button::text("Save").on_press(Message::Save).into(),
         button::text("Daily").on_press(Message::DailyNote).into(),
+        // Label shows the theme a click switches to.
+        button::text(if cosmic::theme::is_dark() {
+            "Light"
+        } else {
+            "Dark"
+        })
+        .on_press(Message::ToggleTheme)
+        .into(),
         pane_button("Source", PaneMode::Source),
         pane_button("Reading", PaneMode::Reading),
         pane_button("Split", PaneMode::Split),
@@ -70,6 +78,8 @@ fn empty_state(app: &VaultNotes) -> Element<'_, Message> {
             .width(Length::Fill),
     );
     col = col.push(button::suggested("Open vault").on_press(Message::VaultOpenSubmitted));
+    // The backdrop actually offered by this platform (M4c glass probe).
+    col = col.push(text::caption(format!("Backdrop: {}", app.glass_style)));
     if let Some(error) = &app.error {
         col = col.push(text(error).class(palette.danger));
     }

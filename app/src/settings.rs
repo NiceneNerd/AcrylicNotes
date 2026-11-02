@@ -1,17 +1,49 @@
-//! Persistent app settings (M4a: last-used vault), stored as JSON in the XDG
-//! config directory. A plain file — not cosmic-config — so the app also works
-//! outside a full COSMIC session.
+//! Persistent app settings (M4a: last-used vault; M4c: theme + glass),
+//! stored as JSON in the XDG config directory. A plain file — not
+//! cosmic-config — so the app also works outside a full COSMIC session.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// Which visual theme the app uses (M4c). `System` follows the desktop.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThemeChoice {
+    #[default]
+    #[serde(rename = "system")]
+    System,
+    #[serde(rename = "dark")]
+    Dark,
+    #[serde(rename = "light")]
+    Light,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     /// Vault opened last; restored on startup when it still exists.
     #[serde(default)]
     pub last_vault: Option<PathBuf>,
+    /// UI theme choice; `system` follows the desktop (M4c).
+    #[serde(default)]
+    pub theme: ThemeChoice,
+    /// Whether to request a frosted (blur) backdrop from the platform (M4c).
+    #[serde(default = "default_true")]
+    pub glass_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            last_vault: None,
+            theme: ThemeChoice::default(),
+            glass_enabled: true,
+        }
+    }
 }
 
 /// `$XDG_CONFIG_HOME/vault-handoff/settings.json`.
@@ -64,6 +96,8 @@ mod tests {
         // Roundtrip.
         let settings = AppSettings {
             last_vault: Some(PathBuf::from("/home/nn/Notes")),
+            theme: ThemeChoice::Dark,
+            glass_enabled: true,
         };
         store_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -71,5 +105,27 @@ mod tests {
         // Corrupt file -> no settings, not a crash.
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load_from(&path), None);
+    }
+
+    #[test]
+    fn missing_fields_take_safe_defaults() {
+        // A pre-M4c settings file has only last_vault: glass stays enabled
+        // and the theme follows the system.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{"last_vault": "/notes"}"#).unwrap();
+        let loaded = load_from(&path).unwrap();
+        assert_eq!(loaded.last_vault, Some(PathBuf::from("/notes")));
+        assert_eq!(loaded.theme, ThemeChoice::System);
+        assert!(loaded.glass_enabled);
+
+        // A glass_enabled=false must survive the roundtrip.
+        let path2 = tmp.path().join("settings2.json");
+        let settings = AppSettings {
+            glass_enabled: false,
+            ..AppSettings::default()
+        };
+        store_to(&path2, &settings).unwrap();
+        assert!(!load_from(&path2).unwrap().glass_enabled);
     }
 }
