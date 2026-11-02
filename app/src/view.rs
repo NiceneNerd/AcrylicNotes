@@ -7,7 +7,7 @@
 use cosmic::iced::core::widget::Id;
 use cosmic::iced::widget::{opaque, stack, text_editor};
 use cosmic::iced::{alignment, border, Background, Length, Padding};
-use cosmic::widget::{button, column, container, row, scrollable, text, text_input};
+use cosmic::widget::{button, column, container, flex_row, row, scrollable, text, text_input};
 use cosmic::Element;
 
 use crate::app::{title_of, Message, Palette, PaneMode, SidePanel, VaultNotes, SWITCHER_INPUT};
@@ -167,16 +167,22 @@ fn titles(paths: &[String]) -> String {
 /// Sidebar: a row of panel switcher tabs over the active panel's body.
 fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
     let mut col = column::Column::new().spacing(4).width(Length::Fill);
-    let mut switcher = row::Row::new().spacing(2);
-    for panel in SidePanel::ALL {
-        let btn = if app.panel == panel {
-            button::suggested(panel.label())
-        } else {
-            button::text(panel.label())
-        };
-        switcher = switcher.push(btn.on_press(Message::SidePanel(panel)));
-    }
-    col = col.push(switcher);
+    // flex_row wraps the five panel buttons within the 250px sidebar; a plain
+    // row overflows and clips the last button (Outline) off the edge.
+    let switcher: Vec<Element<'a, Message>> = SidePanel::ALL
+        .iter()
+        .map(|panel| {
+            let btn = if app.panel == *panel {
+                button::suggested(panel.label())
+            } else {
+                button::text(panel.label())
+            };
+            btn.height(Length::Shrink)
+                .on_press(Message::SidePanel(*panel))
+                .into()
+        })
+        .collect();
+    col = col.push(flex_row(switcher));
     let body: Element<'a, Message> = match app.panel {
         SidePanel::Files => tree_view(app, palette),
         SidePanel::Search => search_panel(app, palette),
@@ -227,6 +233,7 @@ fn nodes_view<'a>(
                     container(
                         button::text(format!("{icon} {name}"))
                             .on_press(Message::ToggleFolder(path.clone()))
+                            .height(Length::Shrink)
                             .width(Length::Fill),
                     )
                     .padding(Padding {
@@ -250,6 +257,7 @@ fn nodes_view<'a>(
                     container(
                         button::text(label)
                             .on_press(Message::TabOpen(path.clone()))
+                            .height(Length::Shrink)
                             .width(Length::Fill),
                     )
                     .padding(Padding {
@@ -288,6 +296,7 @@ fn search_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Messag
             col = col.push(
                 button::text(hit.path.clone())
                     .on_press(Message::SearchOpen(i))
+                    .height(Length::Shrink)
                     .width(Length::Fill),
             );
             col = col.push(
@@ -321,6 +330,7 @@ fn tags_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message>
                 col = col.push(
                     button::text(format!("#{tag} ({count})"))
                         .on_press(Message::TagSelected(tag))
+                        .height(Length::Shrink)
                         .width(Length::Fill),
                 );
             }
@@ -330,6 +340,7 @@ fn tags_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message>
             col = col.push(
                 button::text(format!("← #{tag}"))
                     .on_press(Message::TagSelected(tag.clone()))
+                    .height(Length::Shrink)
                     .width(Length::Fill),
             );
             let mut notes = vault.notes_for_tag(tag);
@@ -338,6 +349,7 @@ fn tags_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message>
                 col = col.push(
                     button::text(title_of(&path))
                         .on_press(Message::TabOpen(path))
+                        .height(Length::Shrink)
                         .width(Length::Fill),
                 );
             }
@@ -369,6 +381,7 @@ fn links_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message
         col = col.push(
             button::text(title_of(&source))
                 .on_press(Message::TabOpen(source))
+                .height(Length::Shrink)
                 .width(Length::Fill),
         );
     }
@@ -394,6 +407,7 @@ fn outline_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Messa
             container(
                 button::text(entry.text.clone())
                     .on_press(Message::JumpToBlock(entry.block))
+                    .height(Length::Shrink)
                     .width(Length::Fill),
             )
             .padding(Padding {
@@ -451,11 +465,17 @@ fn switcher_overlay<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Me
         } else {
             button::text(label)
         };
-        col = col.push(btn.on_press(Message::SwitcherSelect(i)).width(Length::Fill));
+        col = col.push(
+            btn.on_press(Message::SwitcherSelect(i))
+                .height(Length::Shrink)
+                .width(Length::Fill),
+        );
     }
     container(container(col).padding(12).max_width(560).style(move |_| {
         cosmic::widget::container::Style {
-            background: Some(Background::Color(palette.surface)),
+            // Slightly translucent so the frosted-window blur (when the
+            // compositor provides it) shows through the dialog.
+            background: Some(Background::Color(with_alpha(palette.surface, 0.88))),
             border: border::Border {
                 radius: 8.0.into(),
                 ..Default::default()
@@ -558,6 +578,16 @@ fn editor_pane<'a>(tab: &'a crate::app::Tab, palette: Palette) -> Element<'a, Me
     .padding(8)
     .width(Length::Fill)
     .height(Length::Fill)
+    .style(|_| cosmic::widget::container::Style {
+        // Darker editor overlay (M4 decision 6): darkens the surface now,
+        // and its translucency is what shows the compositor's frosted-window
+        // blur through once that is active (COSMIC transparency setting).
+        background: Some(Background::Color(with_alpha(
+            cosmic::iced::Color::BLACK,
+            0.18,
+        ))),
+        ..Default::default()
+    })
     .into()
 }
 

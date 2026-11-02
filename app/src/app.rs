@@ -271,9 +271,10 @@ impl VaultNotes {
                 self.active = None;
                 self.banner = None;
                 self.error = None;
-                self.collapsed.clear();
                 self.vault = Some(vault);
                 self.rebuild_index();
+                // Start with every folder collapsed (user preference).
+                self.collapsed = tree::folder_paths(&self.tree).into_iter().collect();
                 self.core
                     .set_header_title(format!("Vault Notes — {}", self.vault_name));
                 settings::store(&AppSettings {

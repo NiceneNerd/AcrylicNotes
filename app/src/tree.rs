@@ -74,6 +74,22 @@ pub fn build(paths: &[&str]) -> Vec<TreeNode> {
     convert("", &root)
 }
 
+/// Every folder path in the tree, depth-first — used to start the sidebar
+/// with all folders collapsed.
+pub fn folder_paths(nodes: &[TreeNode]) -> Vec<String> {
+    fn walk(nodes: &[TreeNode], out: &mut Vec<String>) {
+        for node in nodes {
+            if let TreeNode::Folder { path, children, .. } = node {
+                out.push(path.clone());
+                walk(children, out);
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    walk(nodes, &mut paths);
+    paths
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +149,14 @@ mod tests {
     #[test]
     fn empty_input_gives_an_empty_tree() {
         assert!(build(&[]).is_empty());
+    }
+
+    #[test]
+    fn folder_paths_lists_every_folder_depth_first() {
+        let tree = build(&["a/b/note.md", "a/top.md", "c.md"]);
+        assert_eq!(
+            folder_paths(&tree),
+            vec!["a".to_string(), "a/b".to_string()]
+        );
     }
 }
