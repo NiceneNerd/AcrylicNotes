@@ -16,6 +16,7 @@ use crate::links::{
     scan_block_ids, scan_headings, scan_links, scan_md_links, scan_tags, LinkKind, RawLink,
 };
 use crate::resolve::VaultIndex;
+use crate::source::{moment_to_chrono, render_daily_template, DailyNotesSettings};
 use crate::write::{atomic_write, atomic_write_full, WriteResult};
 
 /// A note file in the vault.
@@ -388,6 +389,77 @@ impl Vault {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    /// The vault-relative path today's daily note lives at, from
+    /// `.obsidian/daily-notes.json` (falling back to `Journal/YYYY/MM/DD.md`).
+    pub fn daily_note_path(&self, date: chrono::NaiveDate) -> String {
+        let settings = DailyNotesSettings::load(&self.root);
+        let name = date
+            .format(&moment_to_chrono(settings.format()))
+            .to_string();
+        let folder = settings.folder().trim_matches('/');
+        if folder.is_empty() {
+            format!("{name}.md")
+        } else {
+            format!("{folder}/{name}.md")
+        }
+    }
+
+    /// Open today's daily note, creating it from the configured template if
+    /// it does not exist (folders are created as needed). Returns the
+    /// vault-relative path and whether it was just created. The write goes
+    /// through the same guarded, watcher-bracketed path as manual saves.
+    pub fn open_or_create_daily_note(
+        &mut self,
+        date: chrono::NaiveDate,
+    ) -> Result<(String, bool), VaultError> {
+        let path = self.daily_note_path(date);
+        if self.root.join(&path).exists() {
+            return Ok((path, false));
+        }
+        // The same guards as save_note: never write into dot-directories,
+        // and only produce notes.
+        if is_ignored(&path) {
+            return Err(VaultError::ProtectedPath(path));
+        }
+        if !path.ends_with(".md") {
+            return Err(VaultError::NotANote(path));
+        }
+
+        let settings = DailyNotesSettings::load(&self.root);
+        let template = settings
+            .template
+            .as_deref()
+            .map(|rel| fs::read_to_string(self.root.join(rel)))
+            .transpose()?
+            .unwrap_or_default();
+        let title = path
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.strip_suffix(".md"))
+            .unwrap_or(&path)
+            .to_string();
+        let now = chrono::Local::now().time();
+        let content = render_daily_template(&template, date, &title, now);
+
+        // Daily-note formats may contain '/' (e.g. YYYY/MM/DD): create the
+        // folder chain before the atomic write needs it.
+        if let Some(parent) = Path::new(&path).parent() {
+            fs::create_dir_all(self.root.join(parent))?;
+        }
+
+        self.mark_pending_write(&path);
+        match atomic_write_full(&self.root.join(&path), "", &content) {
+            Ok(_result) => {
+                self.reload(std::slice::from_ref(&path))?;
+                Ok((path, true))
+            }
+            Err(e) => {
+                self.unmark_pending_write(&path);
+                Err(e.into())
+            }
+        }
+    }
 }
 
 /// Dot-directories (`.obsidian`, `.git`, `.trash`, …) are ignored everywhere.
@@ -698,5 +770,73 @@ mod tests {
             fs::read_to_string(tmp.path().join("b.md")).unwrap(),
             fs::read_to_string(tmp.path().join("b.md")).unwrap()
         );
+    }
+
+    #[test]
+    fn daily_note_path_uses_fallback_without_settings() {
+        let (_tmp, vault) = test_vault();
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        assert_eq!(vault.daily_note_path(d), "Journal/2026/11/02.md");
+    }
+
+    #[test]
+    fn daily_note_path_honors_obsidian_settings() {
+        let (tmp, vault) = test_vault();
+        fs::write(
+            tmp.path().join(".obsidian/daily-notes.json"),
+            r#"{"folder": "Days", "format": "YYYY-MM-DD"}"#,
+        )
+        .unwrap();
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        assert_eq!(vault.daily_note_path(d), "Days/2026-11-02.md");
+    }
+
+    #[test]
+    fn daily_note_creates_folders_template_and_index_entry() {
+        let (tmp, mut vault) = test_vault();
+        fs::create_dir(tmp.path().join("Templates")).unwrap();
+        fs::write(
+            tmp.path().join("Templates/Daily.md"),
+            "# {{date}}\n\n{{title}}\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join(".obsidian/daily-notes.json"),
+            r#"{"folder": "Journal", "format": "YYYY-MM-DD", "template": "Templates/Daily.md"}"#,
+        )
+        .unwrap();
+
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        let (path, created) = vault.open_or_create_daily_note(d).unwrap();
+        assert_eq!(path, "Journal/2026-11-02.md");
+        assert!(created);
+        let content = fs::read_to_string(tmp.path().join(&path)).unwrap();
+        assert_eq!(content, "# 2026-11-02\n\n2026-11-02\n");
+        // Indexed: the new note is visible and its {{title}}-style name resolves.
+        assert!(vault.get_note(&path).is_some());
+
+        // Second call opens the existing note instead of recreating it.
+        let (path2, created2) = vault.open_or_create_daily_note(d).unwrap();
+        assert_eq!(path2, path);
+        assert!(!created2);
+        assert_eq!(fs::read_to_string(tmp.path().join(&path)).unwrap(), content);
+    }
+
+    #[test]
+    fn daily_note_refuses_protected_paths() {
+        let (tmp, mut vault) = test_vault();
+        // A folder setting pointing into .obsidian must be refused, not written.
+        fs::write(
+            tmp.path().join(".obsidian/daily-notes.json"),
+            r#"{"folder": ".obsidian"}"#,
+        )
+        .unwrap();
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        assert!(matches!(
+            vault.open_or_create_daily_note(d),
+            Err(VaultError::ProtectedPath(_))
+        ));
+        // Nothing was written.
+        assert!(!tmp.path().join(".obsidian/2026-11-02.md").exists());
     }
 }

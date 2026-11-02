@@ -10,6 +10,7 @@ vault-md = { path = "../vault-md" }
 # Used from M4c on (glass backdrop); kept listed so the dependency stays honest.
 vault-glass = { path = "../vault-glass" }
 dirs = "6.0"
+chrono = "0.4"
 # Same version cosmic-theme uses (0.7.7 in the lock) — for Srgba conversions.
 palette = "0.7"
 # Literal ripgrep as a library (M4 decision 4): ripgrep's own crates.

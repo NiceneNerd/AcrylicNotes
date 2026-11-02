@@ -46,6 +46,7 @@ pub fn header_start(app: &VaultNotes) -> Vec<Element<'_, Message>> {
     };
     vec![
         button::text("Save").on_press(Message::Save).into(),
+        button::text("Daily").on_press(Message::DailyNote).into(),
         pane_button("Source", PaneMode::Source),
         pane_button("Reading", PaneMode::Reading),
         pane_button("Split", PaneMode::Split),

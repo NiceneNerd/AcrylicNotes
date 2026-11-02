@@ -201,6 +201,8 @@ pub enum Message {
     BannerDismiss,
     ErrorDismiss,
     TabOpen(String),
+    /// Open (creating if needed) today's daily note.
+    DailyNote,
     TabClose(usize),
     TabSelect(usize),
     EditorAction(cosmic::iced::widget::text_editor::Action),
@@ -359,6 +361,24 @@ impl VaultNotes {
             }
             Err(error) => {
                 self.error = Some(format!("cannot create {path}: {error}"));
+                Task::none()
+            }
+        }
+    }
+
+    /// Open today's daily note, creating it from the configured template.
+    fn open_daily_note(&mut self) -> Task<Message> {
+        let today = chrono::Local::now().date_naive();
+        let Some(vault) = self.vault.as_mut() else {
+            return Task::none();
+        };
+        match vault.open_or_create_daily_note(today) {
+            Ok((path, _created)) => {
+                self.rebuild_index();
+                self.open_tab(path)
+            }
+            Err(error) => {
+                self.error = Some(format!("cannot open daily note: {error}"));
                 Task::none()
             }
         }
@@ -592,6 +612,7 @@ impl cosmic::Application for VaultNotes {
                 Task::none()
             }
             Message::TabOpen(path) => self.open_tab(path),
+            Message::DailyNote => self.open_daily_note(),
             Message::TabClose(idx) => {
                 if idx < self.tabs.len() {
                     self.tabs.remove(idx);
@@ -820,6 +841,7 @@ impl cosmic::Application for VaultNotes {
                     match &key {
                         Key::Character(c) if c == "p" => self.update(Message::SwitcherToggle),
                         Key::Character(c) if c == "s" => self.save_active(),
+                        Key::Character(c) if c == "d" => self.update(Message::DailyNote),
                         _ => Task::none(),
                     }
                 } else {

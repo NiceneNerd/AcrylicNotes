@@ -18,6 +18,8 @@ pub use frontmatter::{
 };
 pub use links::{LinkKind, RawLink};
 pub use resolve::VaultIndex;
-pub use source::{NoteSource, ObsidianSettings};
+pub use source::{
+    moment_to_chrono, render_daily_template, DailyNotesSettings, NoteSource, ObsidianSettings,
+};
 pub use vault::{Heading, Note, Vault};
 pub use write::{atomic_write, atomic_write_raw, WriteError, WriteResult};
