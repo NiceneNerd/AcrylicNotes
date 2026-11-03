@@ -213,3 +213,68 @@ switcher, with the behaviors and limits decided for M4:
   checkout also contains a broken iced example,
   `iced/examples/sctk_subsurface_img/src/main.rs` — invalid pattern,
   never compiled — which is what surfaced this.)
+
+## GUI polish + safety (M4c)
+
+Daily notes, autosave, glass, themes, shortcuts, and tree file
+manipulation, per the M4c plan and user decisions:
+
+- **Daily notes** are explicit only (header "Daily" button or Ctrl+D —
+  never auto-opened). Configuration comes from
+  `.obsidian/daily-notes.json` (`folder`, `format`, `template` keys);
+  a missing file falls back to `Journal/YYYY/MM/DD`, and a file without
+  a format uses Obsidian's plugin default `YYYY-MM-DD`. The moment.js
+  format tokens daily notes use are translated to chrono (longest token
+  first, `[bracket]` escapes literal, unknown tokens verbatim).
+  Templates fill `{{date}}`, `{{time}}`, `{{date:FMT}}`, `{{time:FMT}}`,
+  `{{title}}` (unknown placeholders survive verbatim). Creating a note
+  makes its folder chain and goes through the same guarded, atomic,
+  watcher-bracketed write path as manual saves; dot-directory folders
+  are refused. An existing daily note is simply opened.
+- **Autosave** fires ~2 s (user-tuned) after the last editor activity,
+  through the same guarded save path: an external change refuses the
+  write and raises the conflict banner instead of clobbering. Clean
+  tabs never re-save. Closing a tab (Ctrl+W or the tab's ✕) saves
+  unsaved edits first; a refused save keeps the tab open.
+- **Glass**: at startup `vault-glass` probes the platform (`platform::native()`);
+  when glass is enabled and the session can blur (Wayland), the app sends
+  libcosmic `Action::BlurEnabled` → `iced::window::enable_blur`
+  (`ext-background-effect-v1`). Whether blur is visible remains up to the
+  compositor and the theme's frosted-windows setting; without support the
+  translucent surfaces (editor dark overlay, switcher dialog) simply stay
+  unblurred — never an error. The offered style shows as "Backdrop:
+  <style>" on the empty state.
+- **Theme**: dark/light toggle in the header (label shows the target
+  theme), applied via `Action::AppThemeChange` and persisted in
+  `AppSettings.theme` (`system` follows the desktop). `AppSettings` also
+  gained `glass_enabled` (default true); pre-M4c settings files keep
+  working through serde defaults, and vault open load-modify-stores
+  instead of overwriting.
+- **Keyboard shortcuts** (all through the global `listen_with`
+  subscription): Ctrl+P switcher, Ctrl+S save, Ctrl+D daily note,
+  Ctrl+Shift+F search panel, Ctrl+W close tab, Esc cancels an open
+  inline tree edit (after the switcher's Esc).
+- **Tree right-click menu** (cosmic `context_menu`, one menu per row):
+  New note, New folder, Rename, Delete. The opened menu records its
+  target (`on_open`) since cosmic's `menu::Action` is `Copy` and cannot
+  carry a path. Commands open an auto-focused inline name input under
+  (or replacing) the row; Enter submits, Esc cancels. Empty folders
+  materialize in the tree (`Vault::folders` + `build_with_folders`) so
+  they can receive notes. Semantics:
+  - **New note/folder** land beside the target (inside a folder; in a
+    note's parent folder). Names may contain `/` to nest; dot-directory
+    components are rejected.
+  - **Rename** moves the file or folder (target must not exist). Links
+    in other notes are NOT rewritten — their text keeps pointing at the
+    old name and shows as unresolved (Obsidian parity is future work).
+  - **Delete** moves the file/folder into the vault's `.trash/`
+    (Obsidian-compatible: recoverable; dot-ignored so it vanishes from
+    the app index). Trash names never collide (`name (2).md`, …).
+    Unsaved edits of affected tabs are saved first so nothing lands in
+    the trash half-written; a refused save aborts the deletion. Tabs of
+    deleted paths close; folder renames remap tab paths and collapse
+    state.
+- **Tests** grew to 150: daily-note settings/translation/template/path
+  and creation (vault-core), folder/rename/delete/trash semantics
+  (vault-core), tree edit targets + empty-folder materialization (app),
+  autosave decision + settings serde defaults (app), glass plan (app).
