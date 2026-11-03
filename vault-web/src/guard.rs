@@ -57,7 +57,7 @@ mod tests {
 
     #[test]
     fn resolves_notes_and_attachments_inside_the_vault() {
-        let (tmp, root) = setup();
+        let (_tmp, root) = setup();
         assert_eq!(
             safe_resolve(&root, "Note.md"),
             Some(root.join("Note.md").canonicalize().unwrap())

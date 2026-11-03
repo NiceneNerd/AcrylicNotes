@@ -337,3 +337,16 @@ now `-p vault-glass -p vault-core -p vault-md -p app -p vault-web`).
   traversal suite (`..`, encoded, double-encoded, dotfiles, symlinked
   file + directory escapes) and auth/headers. Plus a live curl smoke
   test against the running binary. 185 tests workspace-wide.
+
+- **Web fixes from first real use** (user-reported): the index page
+  opened a `<ul>` per folder but closed only the last one — runaway
+  nesting for every folder, siblings included. It is now flat: one
+  `<h2>` + one closed `<ul>` per folder, empty folders shown as
+  `(empty)` (parity with the GUI tree). Authentication now survives
+  navigation: the first `?token=`-authenticated response sets an
+  `HttpOnly; SameSite=Lax` session cookie (`vault_token`), which the
+  middleware accepts as a third credential alongside `?token=` and
+  `Authorization: Bearer`. This also fixed broken image embeds — `<img>`
+  fetches are separate requests that carry no token/header, so they
+  401'd before the cookie existed. The cookie is session-scoped (dies
+  with the browser); the token still works standalone for curl.

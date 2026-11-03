@@ -40,6 +40,7 @@ h1, h2, h3 { line-height: 1.25; }
 nav { max-width: 46rem; margin: 0 auto 1.5rem; display: flex; gap: 1rem; align-items: baseline; }
 nav form { margin-left: auto; display: flex; gap: 0.3rem; }
 footer { max-width: 46rem; margin: 3rem auto 0; color: #888; font-size: 0.85em; }
+.muted { color: #888; }
 .tag { color: #06c; }
 ";
 

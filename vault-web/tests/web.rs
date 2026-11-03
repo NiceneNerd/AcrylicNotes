@@ -27,7 +27,7 @@ fn setup() -> (tempfile::TempDir, PathBuf) {
     std::fs::create_dir_all(root.join(".obsidian")).unwrap();
     std::fs::write(
         root.join("Note.md"),
-        "---\ntitle: Note One\ntags: [mytag]\n---\n\n# Hello\n\nsee [[Notes/Nested]] and ![[attachments/img.png]]\n\ntagged #mytag here\n",
+        "---\ntitle: Note One\ntags: [mytag]\n---\n\n# Hello\n\nsee [[Notes/Nested]] and ![[img.png]] ![[attachments/img.png]]\n\ntagged #mytag here\n",
     )
     .unwrap();
     std::fs::write(root.join("Notes/Nested.md"), "some glassware notes\n").unwrap();
@@ -123,6 +123,93 @@ async fn index_lists_notes_and_tags() {
     assert!(body.contains("Note One"), "{body}");
     assert!(body.contains("href=\"/n/Notes/Nested.md\""), "{body}");
     assert!(body.contains("href=\"/tag/mytag\""), "{body}");
+}
+
+#[tokio::test]
+async fn index_groups_are_flat_and_every_list_closes() {
+    let (_tmp, root) = setup();
+    let (status, _, body) = get(app(&root), "/").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // One ul per group, every one of them closed (the runaway-indent bug
+    // opened a ul per folder and closed none but the last).
+    assert_eq!(
+        body.matches("<ul>").count(),
+        body.matches("</ul>").count(),
+        "{body}"
+    );
+    // Folders are siblings: each header starts a fresh group.
+    assert!(body.contains("<h2>Notes</h2>\n<ul>"), "{body}");
+    // Empty folders appear too (attachments holds no notes).
+    assert!(body.contains("<h2>attachments</h2>"), "{body}");
+    assert!(body.contains("(empty)"), "{body}");
+}
+
+#[tokio::test]
+async fn cookie_session_keeps_you_signed_in() {
+    let (_tmp, root) = setup();
+    let app = token_app(&root);
+
+    // First visit with the token in the query: 200 + session cookie.
+    let (status, headers, _) = get(app.clone(), "/?token=tok123").await;
+    assert_eq!(status, StatusCode::OK);
+    let set_cookie = headers[header::SET_COOKIE].to_str().unwrap();
+    assert!(set_cookie.starts_with("vault_token=tok123"), "{set_cookie}");
+    assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+
+    // A plain follow-up navigation with only the cookie: still 200.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/n/Note.md")
+                .header(header::COOKIE, "vault_token=tok123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // A wrong cookie is still refused.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header(header::COOKIE, "vault_token=nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn embeds_resolve_and_load_with_the_cookie() {
+    let (_tmp, root) = setup();
+    let app = token_app(&root);
+
+    // The note page routes both embeds (bare name AND direct path) to /files.
+    let (status, _, body) = get(app.clone(), "/n/Note.md?token=tok123").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("src=\"/files/attachments/img.png\""),
+        "{body}"
+    );
+
+    // A browser fetches the image as its own request; the cookie set by the
+    // page visit must carry it through (this was the broken-images bug).
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/files/attachments/img.png")
+                .header(header::COOKIE, "vault_token=tok123")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

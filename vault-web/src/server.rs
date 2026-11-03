@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderValue, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
@@ -67,6 +67,22 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .with_state(state)
 }
 
+/// Cookie that carries the token after the first authenticated visit, so
+/// plain navigation, image fetches, and form submits stay authenticated
+/// (browsers do not attach Authorization headers to ordinary requests).
+const COOKIE_NAME: &str = "vault_token";
+
+/// Whether the request's `Cookie` headers contain the expected token.
+fn cookie_matches(headers: &HeaderMap, expected: &str) -> bool {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .any(|(name, value)| name == COOKIE_NAME && value == expected)
+}
+
 /// Auth gate (when a token is configured) plus the security headers every
 /// response must carry: a CSP that allows no script at all, and nosniff.
 async fn check_auth(
@@ -86,8 +102,19 @@ async fn check_auth(
                     .is_some_and(|(key, value)| key == "token" && value == expected)
             })
         });
-        if bearer_ok || query_ok {
-            next.run(request).await
+        let cookie_ok = cookie_matches(request.headers(), expected);
+        if bearer_ok || query_ok || cookie_ok {
+            let mut response = next.run(request).await;
+            // First token-authenticated visit (by query or header): hand the
+            // browser a session cookie so the token is not needed again.
+            if !cookie_ok {
+                if let Ok(value) = HeaderValue::from_str(&format!(
+                    "{COOKIE_NAME}={expected}; HttpOnly; SameSite=Lax; Path=/"
+                )) {
+                    response.headers_mut().append(header::SET_COOKIE, value);
+                }
+            }
+            response
         } else {
             unauthorized(&state)
         }
@@ -110,8 +137,9 @@ fn unauthorized(state: &ServerState) -> Response {
     let body = page::page(
         "Unauthorized",
         &state.vault_name,
-        "<h1>401 — unauthorized</h1><p>Pass the token as <code>?token=…</code> \
-         or an <code>Authorization: Bearer …</code> header.</p>",
+        "<h1>401 — unauthorized</h1><p>Open any page with <code>?token=…</code> \
+         once (or an <code>Authorization: Bearer …</code> header); a session \
+         cookie keeps you signed in from then on.</p>",
     );
     (
         StatusCode::UNAUTHORIZED,
@@ -133,27 +161,48 @@ fn not_found(state: &ServerState) -> Response {
 
 // --- handlers --------------------------------------------------------------
 
-/// Index: every note grouped by folder, plus the tag list.
+/// Index: every note grouped under its folder (flat — one `<h2>` + one
+/// closed `<ul>` per folder, no nesting), empty folders included so the
+/// web index matches the GUI's tree. Tags listed below.
 async fn index_page(State(state): State<Arc<ServerState>>) -> Response {
-    let mut body = String::from("<h1>Notes</h1>\n");
-    let mut current_folder = None;
+    // folder -> (path, title), "" for the root.
+    let mut groups: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
     for note in state.vault.notes_sorted() {
-        let (folder, _) = match note.path.rsplit_once('/') {
-            Some((parent, name)) => (Some(parent), name),
-            None => (None, note.path.as_str()),
-        };
-        if folder != current_folder {
-            let label = folder.unwrap_or("(root)");
-            body.push_str(&format!("<h2>{}</h2>\n<ul>\n", page::escape(label)));
-            current_folder = folder;
-        }
-        body.push_str(&format!(
-            "<li><a href=\"/n/{}\">{}</a></li>\n",
-            path_encode(&note.path),
-            page::escape(&note.title)
-        ));
+        let folder = note
+            .path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_string())
+            .unwrap_or_default();
+        groups
+            .entry(folder)
+            .or_default()
+            .push((note.path.clone(), note.title.clone()));
     }
-    body.push_str("</ul>\n");
+    // Folders without notes still appear (they are valid navigation targets
+    // from the GUI's perspective and new notes can land in them).
+    for folder in state.vault.folders() {
+        groups.entry(folder).or_default();
+    }
+
+    let mut body = String::from("<h1>Notes</h1>\n");
+    for (folder, notes) in &groups {
+        let label = if folder.is_empty() { "(root)" } else { folder };
+        body.push_str(&format!("<h2>{}</h2>\n", page::escape(label)));
+        if notes.is_empty() {
+            body.push_str("<p class=\"muted\">(empty)</p>\n");
+            continue;
+        }
+        body.push_str("<ul>\n");
+        for (path, title) in notes {
+            body.push_str(&format!(
+                "<li><a href=\"/n/{}\">{}</a></li>\n",
+                path_encode(path),
+                page::escape(title)
+            ));
+        }
+        body.push_str("</ul>\n");
+    }
 
     let tags = state.vault.all_tags();
     if !tags.is_empty() {
