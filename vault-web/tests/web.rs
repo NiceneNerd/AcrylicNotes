@@ -126,22 +126,27 @@ async fn index_lists_notes_and_tags() {
 }
 
 #[tokio::test]
-async fn index_groups_are_flat_and_every_list_closes() {
+async fn index_shows_a_collapsible_folder_tree() {
     let (_tmp, root) = setup();
     let (status, _, body) = get(app(&root), "/").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    // One ul per group, every one of them closed (the runaway-indent bug
-    // opened a ul per folder and closed none but the last).
+    // Folders are <details> elements with their path as the anchor id, and
+    // every one of them is closed (collapsed by default, like the GUI).
+    assert!(body.contains("<details id=\"Notes\">"), "{body}");
     assert_eq!(
-        body.matches("<ul>").count(),
-        body.matches("</ul>").count(),
+        body.matches("<details").count(),
+        body.matches("</details>").count(),
         "{body}"
     );
-    // Folders are siblings: each header starts a fresh group.
-    assert!(body.contains("<h2>Notes</h2>\n<ul>"), "{body}");
-    // Empty folders appear too (attachments holds no notes).
-    assert!(body.contains("<h2>attachments</h2>"), "{body}");
-    assert!(body.contains("(empty)"), "{body}");
+    // Notes hang off their folder; the count includes subfolders.
+    assert!(
+        body.contains("href=\"/n/Notes/Nested.md\""),
+        "notes inside folders: {body}"
+    );
+    assert!(body.contains("(1)"), "note count in the summary: {body}");
+    // Root-level notes render outside the tree.
+    assert!(body.contains("<h2>(root)</h2>"), "{body}");
+    assert!(body.contains("href=\"/n/Note.md\""), "{body}");
 }
 
 #[tokio::test]
@@ -392,4 +397,58 @@ async fn raw_html_in_notes_is_sanitized() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(!body.contains("<script>"), "{body}");
     assert!(!body.contains("onerror"), "{body}");
+}
+
+// --- note page chrome -------------------------------------------------------
+
+#[tokio::test]
+async fn note_pages_have_title_and_breadcrumbs() {
+    let (_tmp, root) = setup();
+    let (status, _, body) = get(app(&root), "/n/Notes/Nested.md").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Visible title (frontmatter or file stem), not just <title>.
+    assert!(
+        body.contains("<h1 class=\"note-title\">Nested</h1>"),
+        "{body}"
+    );
+    // Breadcrumbs: vault -> each folder segment, linking into the index tree.
+    assert!(
+        body.contains(
+            "<nav class=\"crumbs\"><a href=\"/\">vault</a> / <a href=\"/#Notes\">Notes</a></nav>"
+        ),
+        "{body}"
+    );
+    // A root-level note has no folder segments.
+    let (_, _, body) = get(app(&root), "/n/Note.md").await;
+    assert!(
+        body.contains("<nav class=\"crumbs\"><a href=\"/\">vault</a></nav>"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn footnotes_render_numbered_with_back_links() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().join("vault");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("FN.md"),
+        "ref[^note] here.\n\n[^note]: the definition\n",
+    )
+    .unwrap();
+    let (status, _, body) = get(app(&root), "/n/FN.md").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Numbered section, aligned numbers, working round trip.
+    assert!(body.contains("<section class=\"footnotes\">"), "{body}");
+    assert!(
+        body.contains(
+            "<sup class=\"footnote-ref\" id=\"fnref-note\"><a href=\"#fn-note\">1</a></sup>"
+        ),
+        "{body}"
+    );
+    assert!(body.contains("<li id=\"fn-note\" value=\"1\">"), "{body}");
+    assert!(
+        body.contains("<a class=\"footnote-back\" href=\"#fnref-note\">"),
+        "{body}"
+    );
 }

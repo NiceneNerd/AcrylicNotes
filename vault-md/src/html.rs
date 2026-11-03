@@ -28,6 +28,11 @@ pub struct RenderContext<'a> {
     chain: RefCell<Vec<String>>,
     /// Footnote label -> display number, in document definition order.
     footnote_defs: RefCell<std::collections::HashMap<String, usize>>,
+    /// Labels referenced at least once (for footnote back-links).
+    footnote_refs: RefCell<std::collections::HashSet<String>>,
+    /// Labels whose FIRST reference is being rendered (gets the back-link
+    /// target id). Filled by the pre-pass, consumed while rendering refs.
+    footnote_first_refs: RefCell<std::collections::HashSet<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +82,8 @@ impl<'a> RenderContext<'a> {
             options,
             chain: RefCell::new(vec![from_note.to_string()]),
             footnote_defs: RefCell::new(std::collections::HashMap::new()),
+            footnote_refs: RefCell::new(std::collections::HashSet::new()),
+            footnote_first_refs: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -173,8 +180,20 @@ pub fn render_html(doc: &Doc, ctx: &RenderContext) -> String {
         assign_unused_def_numbers(block, ctx);
     }
     let mut out = String::new();
+    // Footnote definitions are pulled out of the flow into one numbered
+    // section at the end (Obsidian renders them at the bottom too).
+    let mut defs = String::new();
     for block in &doc.blocks {
-        render_block(block, ctx, &mut out);
+        if matches!(block, Block::FootnoteDef { .. }) {
+            render_block(block, ctx, &mut defs);
+        } else {
+            render_block(block, ctx, &mut out);
+        }
+    }
+    if !defs.is_empty() {
+        out.push_str("<section class=\"footnotes\">\n<ol>\n");
+        out.push_str(&defs);
+        out.push_str("</ol>\n</section>\n");
     }
     out
 }
@@ -224,7 +243,13 @@ fn collect_inline_refs(inlines: &[Inline], ctx: &RenderContext) {
     for inline in inlines {
         match inline {
             Inline::FootnoteRef(label) => {
+                // First reference in reading order gets the back-link target.
+                let first = !ctx.footnote_refs.borrow().contains(label);
                 ctx.footnote_number(label);
+                ctx.footnote_refs.borrow_mut().insert(label.clone());
+                if first {
+                    ctx.footnote_first_refs.borrow_mut().insert(label.clone());
+                }
             }
             Inline::Emph(children)
             | Inline::Strong(children)
@@ -418,18 +443,27 @@ fn render_block(block: &Block, ctx: &RenderContext, out: &mut String) {
         Block::Rule => out.push_str("<hr>\n"),
         Block::EmbedBlock(embed) => render_embed_block(embed, ctx, out),
         Block::FootnoteDef { label, body } => {
-            // The number is the reference-order number, so the definition
-            // shows the same number the reference used.
+            // Rendered inside the footnotes <ol>; `value` keeps the visible
+            // number equal to the reference-order number even when the
+            // definitions appear in a different document order.
             let number = ctx.footnote_number(label);
-            let _ = writeln!(
+            let _ = write!(
                 out,
-                "<div class=\"footnote-def\" id=\"fn-{}\" data-footnote-number=\"{number}\">",
+                "<li id=\"fn-{}\" value=\"{number}\">",
                 escape_attr(label)
             );
             for block in body {
                 render_block(block, ctx, out);
             }
-            out.push_str("</div>\n");
+            // Back-link to the first reference, when there was one.
+            if ctx.footnote_refs.borrow().contains(label) {
+                let _ = write!(
+                    out,
+                    " <a class=\"footnote-back\" href=\"#fnref-{}\">\u{21a9}</a>",
+                    escape_attr(label)
+                );
+            }
+            out.push_str("</li>\n");
         }
         Block::Html(html) => out.push_str(&sanitize(html, ctx)),
     }
@@ -661,9 +695,15 @@ fn render_inline(inline: &Inline, ctx: &RenderContext, out: &mut String) {
         }
         Inline::FootnoteRef(label) => {
             let number = ctx.footnote_number(label);
+            // The first reference carries the back-link target id.
+            let anchor = if ctx.footnote_first_refs.borrow().contains(label) {
+                format!(" id=\"fnref-{}\"", escape_attr(label))
+            } else {
+                String::new()
+            };
             let _ = write!(
                 out,
-                "<sup class=\"footnote-ref\"><a href=\"#fn-{}\">{}</a></sup>",
+                "<sup class=\"footnote-ref\"{anchor}><a href=\"#fn-{}\">{}</a></sup>",
                 escape_attr(label),
                 number
             );
@@ -963,15 +1003,30 @@ mod tests {
         // The first reference is 1 even though its definition comes second.
         assert!(html.contains("href=\"#fn-b\">1</a>"), "{html}");
         assert!(html.contains("href=\"#fn-a\">2</a>"), "{html}");
-        // The definitions carry the same numbers.
+        // Definitions render in ONE numbered section, in document order,
+        // with `value` keeping the visible number equal to the reference
+        // number even when the two orders differ.
+        assert!(html.contains("<section class=\"footnotes\">"), "{html}");
+        assert!(html.contains("<li id=\"fn-b\" value=\"1\">"), "{html}");
+        assert!(html.contains("<li id=\"fn-a\" value=\"2\">"), "{html}");
+        // Back-links: the first reference carries the target id, the
+        // definition links back to it.
+        assert!(html.contains("id=\"fnref-b\""), "{html}");
         assert!(
-            html.contains("id=\"fn-b\" data-footnote-number=\"1\""),
+            html.contains("<a class=\"footnote-back\" href=\"#fnref-b\">"),
             "{html}"
         );
-        assert!(
-            html.contains("id=\"fn-a\" data-footnote-number=\"2\""),
-            "{html}"
-        );
+    }
+
+    #[test]
+    fn orphan_definitions_do_not_render() {
+        // comrak drops never-referenced definitions from the AST entirely:
+        // only the referenced footnote shows up, with its back-link.
+        let html = render("used[^u].\n\n[^u]: used def\n\n[^x]: orphan def\n");
+        assert!(html.contains("<li id=\"fn-u\" value=\"1\">"), "{html}");
+        assert!(html.contains("href=\"#fnref-u\""), "{html}");
+        assert!(!html.contains("fn-x"), "{html}");
+        assert!(!html.contains("orphan"), "{html}");
     }
 
     /// Confirmed against real Obsidian (M3): a block reference shows only

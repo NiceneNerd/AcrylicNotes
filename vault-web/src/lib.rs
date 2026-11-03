@@ -11,3 +11,4 @@ pub mod config;
 pub mod guard;
 pub mod page;
 pub mod server;
+pub mod tree;

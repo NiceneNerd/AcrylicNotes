@@ -181,20 +181,19 @@ async fn index_page(State(state): State<Arc<ServerState>>) -> Response {
     }
     // Folders without notes still appear (they are valid navigation targets
     // from the GUI's perspective and new notes can land in them).
-    for folder in state.vault.folders() {
-        groups.entry(folder).or_default();
-    }
+    let folder_list = state.vault.folders();
 
-    let mut body = String::from("<h1>Notes</h1>\n");
-    for (folder, notes) in &groups {
-        let label = if folder.is_empty() { "(root)" } else { folder };
-        body.push_str(&format!("<h2>{}</h2>\n", page::escape(label)));
-        if notes.is_empty() {
-            body.push_str("<p class=\"muted\">(empty)</p>\n");
-            continue;
-        }
-        body.push_str("<ul>\n");
-        for (path, title) in notes {
+    let mut body = String::new();
+    // The vault as a collapsible folder tree (pure <details>/CSS, collapsed
+    // by default like the GUI sidebar).
+    let tree = crate::tree::build(&folder_list, &groups);
+    body.push_str(&crate::tree::render(&tree));
+
+    // Root-level notes (the tree holds folders only).
+    let root_notes = groups.get("").cloned().unwrap_or_default();
+    if !root_notes.is_empty() {
+        body.push_str("<h2>(root)</h2>\n<ul>\n");
+        for (path, title) in &root_notes {
             body.push_str(&format!(
                 "<li><a href=\"/n/{}\">{}</a></li>\n",
                 path_encode(path),
@@ -250,7 +249,34 @@ async fn note_page(State(state): State<Arc<ServerState>>, Path(path): Path<Strin
         .get_note(rel)
         .map(|note| note.title.clone())
         .unwrap_or_else(|| title_of(rel).trim_end_matches(".md").to_string());
-    Html(page::page(&title, &state.vault_name, &rendered)).into_response()
+    // Breadcrumbs up the folder chain; folder segments link to their tree
+    // entry on the index page.
+    let mut crumbs = format!(
+        "<nav class=\"crumbs\"><a href=\"/\">{}</a>",
+        page::escape(&state.vault_name)
+    );
+    let mut walked = String::new();
+    for segment in rel
+        .split('/')
+        .take(rel.split('/').count().saturating_sub(1))
+    {
+        walked = if walked.is_empty() {
+            segment.to_string()
+        } else {
+            format!("{walked}/{segment}")
+        };
+        crumbs.push_str(&format!(
+            " / <a href=\"/#{}\">{}</a>",
+            page::path_encode(&walked),
+            page::escape(segment)
+        ));
+    }
+    crumbs.push_str("</nav>\n");
+    let body = format!(
+        "{crumbs}<h1 class=\"note-title\">{}</h1>\n{rendered}",
+        page::escape(&title)
+    );
+    Html(page::page(&title, &state.vault_name, &body)).into_response()
 }
 
 /// The notes of one tag (nested tags arrive as `a/b`).
@@ -353,16 +379,4 @@ fn title_of(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Percent-encode a vault-relative path for use in an href.
-fn path_encode(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for byte in path.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
+use crate::page::path_encode;

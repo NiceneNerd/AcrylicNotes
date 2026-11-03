@@ -350,3 +350,20 @@ now `-p vault-glass -p vault-core -p vault-md -p app -p vault-web`).
   fetches are separate requests that carry no token/header, so they
   401'd before the cookie existed. The cookie is session-scoped (dies
   with the browser); the token still works standalone for curl.
+
+- **Web polish from second round of use** (user-requested): the index is
+  now an actual folder tree — nested `<details>`/`<summary>` elements
+  (pure HTML/CSS, no JS), collapsed by default like the GUI sidebar,
+  each summary showing the recursive note count and each folder carrying
+  its path as the anchor `id`. Note pages gained a visible
+  `<h1 class="note-title">` (frontmatter title or file stem) and
+  breadcrumbs (vault → each folder segment), where folder segments link
+  to their tree entry on the index (`/#Notes/Sub`). Footnote
+  definitions now render as one numbered `<section class="footnotes">`
+  (`<ol>` with `<li value=…>` so visible numbers always match the
+  reference-order numbers even when definition order differs) with `↩`
+  back-links to the first reference; footnote definitions are pulled to
+  the end of the page as Obsidian does. This changed the M2 golden
+  `03-footnotes.html` deliberately (regenerated with `UPDATE_EXPECT=1`);
+  numbering semantics (reference order) are unchanged. New tree module
+  (`vault-web/src/tree.rs`) is pure data + pure rendering, unit-tested.

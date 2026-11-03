@@ -42,6 +42,18 @@ nav form { margin-left: auto; display: flex; gap: 0.3rem; }
 footer { max-width: 46rem; margin: 3rem auto 0; color: #888; font-size: 0.85em; }
 .muted { color: #888; }
 .tag { color: #06c; }
+.crumbs { color: #888; font-size: 0.9em; }
+.crumbs a { color: #888; }
+.note-title { margin-top: 0.2em; }
+.footnotes { margin-top: 2em; border-top: 1px solid #999; padding-top: 0.4em; font-size: 0.92em; }
+.footnotes p { margin: 0.2em 0; }
+.footnote-back { text-decoration: none; color: #888; }
+.tree details { margin: 0.15rem 0; }
+.tree details details { margin-left: 1.1rem; border-left: 1px solid color-mix(in srgb, currentColor 25%, transparent); padding-left: 0.5rem; }
+.tree summary { cursor: pointer; user-select: none; }
+.tree summary .count { color: #888; font-size: 0.85em; }
+.tree ul { list-style: none; margin: 0.15rem 0 0.3rem; padding-left: 1.4rem; }
+.tree li { margin: 0.1rem 0; }
 ";
 
 /// Wrap rendered note/page HTML in the site chrome.
@@ -74,3 +86,17 @@ pub fn page(title: &str, vault_name: &str, body_html: &str) -> String {
 /// The Content-Security-Policy sent with every response: no script, no
 /// remote anything; the inline stylesheet is the one exception.
 pub const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; base-uri 'none'";
+
+/// Percent-encode a vault-relative path for use in an href.
+pub fn path_encode(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
