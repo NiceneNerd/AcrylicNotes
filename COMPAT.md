@@ -286,3 +286,54 @@ manipulation, per the M4c plan and user decisions:
   and the accent from the theme itself, so a synthetic default theme would
   turn frosted windows (blur) off and drop the accent — the loaded system
   configs keep both intact.
+
+## Read-only web server (M5)
+
+New `vault-web` crate: axum, same core and IR as everything else,
+server-rendered HTML, no JavaScript. Added to the workspace's
+default-members, so plain `cargo fmt`/`clippy`/`test` cover it (fmt gate
+now `-p vault-glass -p vault-core -p vault-md -p app -p vault-web`).
+
+- **Run**: `vault-web [VAULT_PATH] [--port N] [--bind ADDR] [--token T]
+  [--no-auth]`. The vault defaults to the GUI's last-used vault
+  (same settings.json). Binds `127.0.0.1:8177` by default.
+- **Routes**: `/` (index: notes grouped by folder + tag list),
+  `/n/{*path}` (rendered note), `/tag/{*tag}` (wildcard so nested tags
+  work), `/search?q=` (literal ripgrep, 200-hit cap), `/files/{*path}`
+  (attachments, guessed MIME). Non-notes under `/n/` redirect to
+  `/files/`.
+- **Search moved to vault-core** (`vault_core::search`): the literal
+  ripgrep module lifted out of the app so GUI and server share one
+  implementation; grep/ignore/regex deps moved with it. No content
+  index, per the M4 decision.
+- **Link routing** (vault-md `RenderOptions` web mode): `note_base`/
+  `file_base`/`tag_base` prefixes — resolved wikilinks → `/n/…`, media
+  embeds and resolvable relative markdown images → `/files/…`,
+  relative markdown links to notes → `/n/…`, tags → `/tag/…`.
+  Absolute URLs and anchors pass through; `javascript:`/`vbscript:`/
+  `data:` schemes are defused to `#`. Defaults are `None`, so the GUI
+  HTML goldens are byte-identical to before.
+- **Security** (the milestone's core): every user-controlled path passes
+  one guard — `..` and dotfile components are rejected before any
+  filesystem call (covers `..`, `%2e%2e`, `..%2F`, double-encoded), then
+  the path is canonicalized and must stay inside the canonical vault
+  root, which stops symlink escapes (notes and directories). Notes use
+  the same guard because `note_source` alone would follow a symlinked
+  note out of the vault. Every response carries `Content-Security-Policy:
+  default-src 'none'` (inline stylesheet excepted) and
+  `X-Content-Type-Options: nosniff`; raw HTML in notes goes through the
+  existing ammonia sanitization.
+- **Auth**: on by default — a token is generated and printed at startup;
+  pass it as `?token=…` or `Authorization: Bearer …`. `--token T` sets
+  it, `--no-auth` disables it (refused together with a non-loopback
+  bind — a LAN-exposed vault must have an explicit token).
+- **Snapshot semantics**: the index is built at startup; files added or
+  changed on disk after startup appear only after a restart. In-vault
+  changes to note bodies ARE picked up live for rendering
+  (`note_source` reads from disk), but the link index is the startup
+  snapshot.
+- **Tests** (29 in vault-web): CLI parsing, the confinement unit tests,
+  and 17 integration tests through the real router — including the
+  traversal suite (`..`, encoded, double-encoded, dotfiles, symlinked
+  file + directory escapes) and auth/headers. Plus a live curl smoke
+  test against the running binary. 185 tests workspace-wide.
