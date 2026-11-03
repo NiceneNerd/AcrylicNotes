@@ -278,3 +278,11 @@ manipulation, per the M4c plan and user decisions:
   and creation (vault-core), folder/rename/delete/trash semantics
   (vault-core), tree edit targets + empty-folder materialization (app),
   autosave decision + settings serde defaults (app), glass plan (app).
+
+- **Theme toggle and blur** (fix): switching dark/light loads the user's
+  *system* theme configs (`cosmic::theme::system_dark()`/`system_light()`),
+  never the built-in default themes. libcosmic's `AppThemeChange` handler
+  recomputes window blur from the incoming theme's `frosted_windows` flag
+  and the accent from the theme itself, so a synthetic default theme would
+  turn frosted windows (blur) off and drop the accent — the loaded system
+  configs keep both intact.

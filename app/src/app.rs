@@ -320,11 +320,17 @@ fn contains_hidden_component(name: &str) -> bool {
 }
 
 /// The libcosmic task that applies a stored theme choice (M4c).
+///
+/// Dark and light load the *system* theme configs (`system_dark()` /
+/// `system_light()`), not the built-in defaults: the runner recomputes
+/// window blur on theme change from the theme's `frosted_windows` flag
+/// (and the accent from the theme itself), so a synthetic default theme
+/// would silently turn frosted windows off.
 fn theme_task(choice: settings::ThemeChoice) -> Task<Message> {
     let theme = match choice {
         settings::ThemeChoice::System => cosmic::theme::system_preference(),
-        settings::ThemeChoice::Dark => cosmic::theme::Theme::dark(),
-        settings::ThemeChoice::Light => cosmic::theme::Theme::light(),
+        settings::ThemeChoice::Dark => cosmic::theme::system_dark(),
+        settings::ThemeChoice::Light => cosmic::theme::system_light(),
     };
     Task::done(cosmic::Action::Cosmic(cosmic::app::Action::AppThemeChange(
         theme,
