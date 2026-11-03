@@ -367,3 +367,29 @@ now `-p vault-glass -p vault-core -p vault-md -p app -p vault-web`).
   `03-footnotes.html` deliberately (regenerated with `UPDATE_EXPECT=1`);
   numbering semantics (reference order) are unchanged. New tree module
   (`vault-web/src/tree.rs`) is pure data + pure rendering, unit-tested.
+
+- **Light/dark theme switcher** (user-requested): pure HTML/CSS, no JS.
+  The choice lives in a cookie `vault_theme=light|dark|auto` (Path=/,
+  SameSite=Lax, HttpOnly, Max-Age 1 year); any URL accepts
+  `?theme=light|dark|auto`, which sets the cookie and 303-redirects to
+  the same location with the parameter stripped (other query parameters
+  survive, e.g. `/search?q=x&theme=dark` → `/search?q=x`). An invalid
+  value is ignored (rendered normally, no cookie). Themes are CSS
+  custom properties scoped by `[data-theme='light'|'dark']` on `<html>`;
+  `auto` (or no cookie) emits no attribute and a
+  `@media (prefers-color-scheme: dark)` branch decides, so the default
+  follows the OS. The nav bar gains Light / Dark / Auto links back to
+  the current location (using `?` or `&` as appropriate), with the
+  active choice highlighted. When a token is configured, a first visit
+  with `?token=…&theme=…` sets both cookies and redirects (one click
+  signs in and themes). Palette: the dark theme is the user's Substack
+  palette verbatim (bg rgb(27 22 33)/rgb(41 36 46)/rgb(58 54 63), fg
+  white/rgb(164 162 166)/rgb(124 121 128), accent rgb(161 136 101),
+  accent-hover rgb(147 123 90), bg-accent rgb(255 103 25 / 0.2)) — note
+  that palette ships identical values for both modes, so the light
+  theme is derived: warm-paper bg rgb(250 248 244), bg-secondary white,
+  bg-tertiary rgb(233 229 222), fg = the dark bg rgb(27 22 33),
+  fg-secondary rgb(91 88 96), accents unchanged. Links across the site
+  now use the tan accent instead of blue; `mark` uses bg-accent.
+  CSP is unchanged (still no script; the inline stylesheet remains the
+  only style exception).

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -85,11 +85,18 @@ fn cookie_matches(headers: &HeaderMap, expected: &str) -> bool {
 
 /// Auth gate (when a token is configured) plus the security headers every
 /// response must carry: a CSP that allows no script at all, and nosniff.
+/// Also honors `?theme=light|dark|auto` by setting the theme cookie and
+/// redirecting to the same location without the parameter.
 async fn check_auth(
     State(state): State<Arc<ServerState>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    // Theme switch requested? Set the cookie, redirect to the same location
+    // without the parameter — works pre-render, so the very next response
+    // already carries the chosen theme. Allowed before auth: it only sets a
+    // cookie and redirects, it exposes nothing.
+    let theme_redirect = theme_switch(request.uri());
     let mut response = if let Some(expected) = &state.auth {
         let bearer_ok = request
             .headers()
@@ -104,22 +111,46 @@ async fn check_auth(
         });
         let cookie_ok = cookie_matches(request.headers(), expected);
         if bearer_ok || query_ok || cookie_ok {
-            let mut response = next.run(request).await;
-            // First token-authenticated visit (by query or header): hand the
-            // browser a session cookie so the token is not needed again.
-            if !cookie_ok {
-                if let Ok(value) = HeaderValue::from_str(&format!(
-                    "{COOKIE_NAME}={expected}; HttpOnly; SameSite=Lax; Path=/"
-                )) {
-                    response.headers_mut().append(header::SET_COOKIE, value);
+            match &theme_redirect {
+                Some((cleaned, theme_cookie)) => {
+                    let mut response = axum::response::Redirect::to(cleaned).into_response();
+                    // First visit: hand out the auth session cookie too, so
+                    // one click both signs in and themes.
+                    if !cookie_ok {
+                        append_set_cookie(
+                            &mut response,
+                            &format!("{COOKIE_NAME}={expected}; HttpOnly; SameSite=Lax; Path=/"),
+                        );
+                    }
+                    append_set_cookie(&mut response, theme_cookie);
+                    response
+                }
+                None => {
+                    let mut response = next.run(request).await;
+                    // First token-authenticated visit (by query or header):
+                    // hand the browser a session cookie so the token is not
+                    // needed again.
+                    if !cookie_ok {
+                        append_set_cookie(
+                            &mut response,
+                            &format!("{COOKIE_NAME}={expected}; HttpOnly; SameSite=Lax; Path=/"),
+                        );
+                    }
+                    response
                 }
             }
-            response
         } else {
             unauthorized(&state)
         }
     } else {
-        next.run(request).await
+        match &theme_redirect {
+            Some((cleaned, theme_cookie)) => {
+                let mut response = axum::response::Redirect::to(cleaned).into_response();
+                append_set_cookie(&mut response, theme_cookie);
+                response
+            }
+            None => next.run(request).await,
+        }
     };
     let headers = response.headers_mut();
     headers.insert(
@@ -133,6 +164,57 @@ async fn check_auth(
     response
 }
 
+/// Append a Set-Cookie header (skipped for values that are not valid
+/// header text).
+fn append_set_cookie(response: &mut Response, value: &str) {
+    if let Ok(header_value) = HeaderValue::from_str(value) {
+        response
+            .headers_mut()
+            .append(header::SET_COOKIE, header_value);
+    }
+}
+
+/// If the request carries `?theme=light|dark|auto`, return the redirect
+/// target with the parameter stripped plus the Set-Cookie value for the
+/// choice. Unknown values are ignored (rendered normally).
+fn theme_switch(uri: &axum::http::Uri) -> Option<(String, String)> {
+    let query = uri.query()?;
+    let mut theme_value = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for pair in query.split('&') {
+        match pair.split_once('=') {
+            Some(("theme", value)) if matches!(value, "light" | "dark" | "auto") => {
+                theme_value = Some(value);
+            }
+            _ => kept.push(pair),
+        }
+    }
+    let value = theme_value?;
+    let target = if kept.is_empty() {
+        uri.path().to_string()
+    } else {
+        format!("{}?{}", uri.path(), kept.join("&"))
+    };
+    Some((
+        target,
+        format!(
+            "{}={value}; Path=/; SameSite=Lax; HttpOnly; Max-Age=31536000",
+            page::THEME_COOKIE
+        ),
+    ))
+}
+
+/// The per-request chrome for `page()`: current location + theme choice.
+fn chrome(headers: &HeaderMap, uri: &axum::http::Uri) -> page::Chrome {
+    page::Chrome {
+        location: uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| uri.path().to_string()),
+        theme: page::theme_of_headers(headers),
+    }
+}
+
 fn unauthorized(state: &ServerState) -> Response {
     let body = page::page(
         "Unauthorized",
@@ -140,6 +222,10 @@ fn unauthorized(state: &ServerState) -> Response {
         "<h1>401 — unauthorized</h1><p>Open any page with <code>?token=…</code> \
          once (or an <code>Authorization: Bearer …</code> header); a session \
          cookie keeps you signed in from then on.</p>",
+        &page::Chrome {
+            location: "/".to_string(),
+            theme: page::ThemePref::Auto,
+        },
     );
     (
         StatusCode::UNAUTHORIZED,
@@ -155,16 +241,24 @@ fn not_found(state: &ServerState) -> Response {
         &state.vault_name,
         "<h1>404 — not in this vault</h1><p>The path does not exist inside the \
          vault, or it is hidden (dotfile) or escapes the vault.</p>",
+        &page::Chrome {
+            location: "/".to_string(),
+            theme: page::ThemePref::Auto,
+        },
     );
     (StatusCode::NOT_FOUND, Html(body)).into_response()
 }
 
 // --- handlers --------------------------------------------------------------
 
-/// Index: every note grouped under its folder (flat — one `<h2>` + one
-/// closed `<ul>` per folder, no nesting), empty folders included so the
-/// web index matches the GUI's tree. Tags listed below.
-async fn index_page(State(state): State<Arc<ServerState>>) -> Response {
+/// Index: the vault as a collapsible folder tree (pure `<details>`/CSS),
+/// root-level notes beside it, tags below.
+async fn index_page(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
+    let chrome = chrome(&headers, &uri);
     // folder -> (path, title), "" for the root.
     let mut groups: std::collections::BTreeMap<String, Vec<(String, String)>> =
         std::collections::BTreeMap::new();
@@ -215,11 +309,17 @@ async fn index_page(State(state): State<Arc<ServerState>>) -> Response {
         }
         body.push_str("</p>\n");
     }
-    Html(page::page("Index", &state.vault_name, &body)).into_response()
+    Html(page::page("Index", &state.vault_name, &body, &chrome)).into_response()
 }
 
 /// One rendered note. Non-notes redirect to `/files/`.
-async fn note_page(State(state): State<Arc<ServerState>>, Path(path): Path<String>) -> Response {
+async fn note_page(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    Path(path): Path<String>,
+) -> Response {
+    let chrome = chrome(&headers, &uri);
     let rel = path.trim_start_matches('/');
     // Same confinement as attachments, BEFORE anything else: dot-dot and
     // dotfile components are refused (a redirect would leak their shape),
@@ -276,11 +376,17 @@ async fn note_page(State(state): State<Arc<ServerState>>, Path(path): Path<Strin
         "{crumbs}<h1 class=\"note-title\">{}</h1>\n{rendered}",
         page::escape(&title)
     );
-    Html(page::page(&title, &state.vault_name, &body)).into_response()
+    Html(page::page(&title, &state.vault_name, &body, &chrome)).into_response()
 }
 
 /// The notes of one tag (nested tags arrive as `a/b`).
-async fn tag_page(State(state): State<Arc<ServerState>>, Path(tag): Path<String>) -> Response {
+async fn tag_page(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    Path(tag): Path<String>,
+) -> Response {
+    let chrome = chrome(&headers, &uri);
     let tag = tag.trim_start_matches('/');
     let mut notes = state.vault.notes_for_tag(tag);
     notes.sort();
@@ -310,7 +416,13 @@ async fn tag_page(State(state): State<Arc<ServerState>>, Path(tag): Path<String>
         }
         body.push_str("</p>\n");
     }
-    Html(page::page(&format!("#{tag}"), &state.vault_name, &body)).into_response()
+    Html(page::page(
+        &format!("#{tag}"),
+        &state.vault_name,
+        &body,
+        &chrome,
+    ))
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -321,8 +433,11 @@ struct SearchQuery {
 /// Literal ripgrep over the vault's notes (same engine as the GUI).
 async fn search_page(
     State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Query(query): Query<SearchQuery>,
 ) -> Response {
+    let chrome = chrome(&headers, &uri);
     let q = query.q.clone().unwrap_or_default();
     let mut body = String::from(
         "<form action=\"/search\" method=\"get\">\
@@ -349,7 +464,7 @@ async fn search_page(
         }
         body.push_str("</ul>\n");
     }
-    Html(page::page("Search", &state.vault_name, &body)).into_response()
+    Html(page::page("Search", &state.vault_name, &body, &chrome)).into_response()
 }
 
 /// Attachments: raw bytes with a guessed content type. Same confinement as

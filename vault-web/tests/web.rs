@@ -80,6 +80,27 @@ async fn get(app: Router, uri: &str) -> (StatusCode, HeaderMap, String) {
     )
 }
 
+/// Same, with a Cookie header (theme/auth cookie tests).
+async fn get_cookie(app: Router, uri: &str, cookie: &str) -> (StatusCode, HeaderMap, String) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (parts, body) = response.into_parts();
+    let bytes = BodyExt::collect(body).await.unwrap().to_bytes();
+    (
+        parts.status,
+        parts.headers,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    )
+}
+
 // --- routes ----------------------------------------------------------------
 
 #[tokio::test]
@@ -451,4 +472,123 @@ async fn footnotes_render_numbered_with_back_links() {
         body.contains("<a class=\"footnote-back\" href=\"#fnref-note\">"),
         "{body}"
     );
+}
+
+// --- theme switcher ---------------------------------------------------------
+
+#[tokio::test]
+async fn theme_query_sets_cookie_and_redirects_clean() {
+    let (_tmp, root) = setup();
+    let (status, headers, body) = get(app(&root), "/?theme=dark").await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
+    let cookie = headers[header::SET_COOKIE].to_str().unwrap();
+    assert_eq!(
+        cookie, "vault_theme=dark; Path=/; SameSite=Lax; HttpOnly; Max-Age=31536000",
+        "{cookie}"
+    );
+    // Redirect strips the theme parameter from the location.
+    assert_eq!(headers[header::LOCATION], "/");
+}
+
+#[tokio::test]
+async fn theme_redirect_keeps_other_query_params() {
+    let (_tmp, root) = setup();
+    let (status, headers, _) = get(app(&root), "/search?q=glass&theme=dark").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers[header::LOCATION], "/search?q=glass");
+}
+
+#[tokio::test]
+async fn theme_cookie_renders_data_theme() {
+    let (_tmp, root) = setup();
+    let (status, _, body) = get_cookie(app(&root), "/", "vault_theme=dark").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("<html lang=\"en\" data-theme=\"dark\">"),
+        "{body}"
+    );
+
+    let (status, _, body) = get_cookie(app(&root), "/", "vault_theme=light").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("<html lang=\"en\" data-theme=\"light\">"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn auto_theme_omits_the_attribute_and_keeps_the_media_query() {
+    let (_tmp, root) = setup();
+    // No cookie at all. (The absence check targets the <html> tag because
+    // the stylesheet itself legitimately contains the attribute selector.)
+    let (status, _, body) = get(app(&root), "/").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("<html lang=\"en\" data-theme"), "{body}");
+    // ... and the auto branch of the CSS follows prefers-color-scheme.
+    assert!(
+        body.contains("@media (prefers-color-scheme: dark)"),
+        "{body}"
+    );
+    // An explicit `auto` cookie is the same: no pinned attribute.
+    let (status, _, body) = get_cookie(app(&root), "/", "vault_theme=auto").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("<html lang=\"en\" data-theme"), "{body}");
+}
+
+#[tokio::test]
+async fn invalid_theme_value_is_ignored() {
+    let (_tmp, root) = setup();
+    let (status, headers, body) = get(app(&root), "/?theme=purple").await;
+    // No redirect, no cookie, normal render.
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!headers.contains_key(header::SET_COOKIE), "{body:?}");
+    assert!(!body.contains("<html lang=\"en\" data-theme"), "{body}");
+}
+
+#[tokio::test]
+async fn theme_nav_highlights_the_active_choice_and_routes_through_the_current_url() {
+    let (_tmp, root) = setup();
+    // Dark cookie: the Dark link is active, pointing back at the same page.
+    let (status, _, body) = get_cookie(app(&root), "/n/Note.md", "vault_theme=dark").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("<a class=\"active\" href=\"/n/Note.md?theme=dark\">Dark</a>"),
+        "{body}"
+    );
+    assert!(body.contains("href=\"/n/Note.md?theme=light\""), "{body}");
+    assert!(body.contains("href=\"/n/Note.md?theme=auto\""), "{body}");
+    // With an existing query the theme links append with `&`.
+    let (_, _, body) = get(app(&root), "/search?q=glass").await;
+    assert!(
+        body.contains("href=\"/search?q=glass&theme=dark\""),
+        "{body}"
+    );
+    assert!(
+        body.contains("href=\"/search?q=glass&theme=light\""),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn first_token_visit_can_sign_in_and_theme_in_one_click() {
+    let (_tmp, root) = setup();
+    let (status, headers, _) = get(token_app(&root), "/?token=tok123&theme=light").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    // Both cookies: the auth session and the theme choice.
+    let cookies: Vec<String> = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    assert!(
+        cookies.iter().any(|c| c.starts_with("vault_token=tok123;")),
+        "{cookies:?}"
+    );
+    assert!(
+        cookies.iter().any(|c| c.starts_with("vault_theme=light;")),
+        "{cookies:?}"
+    );
+    // The redirect keeps the token (the browser re-presents it; the session
+    // cookie is already in hand) but drops the theme parameter.
+    assert_eq!(headers[header::LOCATION], "/?token=tok123");
 }
