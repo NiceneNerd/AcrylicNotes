@@ -1,8 +1,9 @@
 //! Vault-wide content search via ripgrep's own crates (the `grep` family),
 //! used as a library — M4 decision 4 is *literal ripgrep*, not a re-rolled
-//! regex walk, and no content index.
+//! regex walk, and no content index. Shared by the GUI and the M5 web
+//! server.
 //!
-//! Scope: `.md` notes only (M4a scope), hidden entries skipped (`.obsidian/`),
+//! Scope: `.md` notes only, hidden entries skipped (`.obsidian/`),
 //! gitignore files ignored so the search sees exactly what vault-core
 //! indexes. Smart-case like ripgrep: a lowercase query matches
 //! case-insensitively, any uppercase makes it case-sensitive. A query that is

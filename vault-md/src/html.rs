@@ -39,6 +39,15 @@ pub struct RenderOptions {
     pub max_embed_depth: usize,
     /// Sanitize raw HTML fragments with ammonia.
     pub sanitize_html: bool,
+    /// Web-server mode (M5): route prefix for resolved note links, e.g.
+    /// `/n`. `None` (default) keeps relative hrefs — the GUI goldens depend
+    /// on that.
+    pub note_base: Option<String>,
+    /// Web-server mode: route prefix for resolved attachment/embed sources,
+    /// e.g. `/files`.
+    pub file_base: Option<String>,
+    /// Web-server mode: route prefix for tag links, e.g. `/tag`.
+    pub tag_base: Option<String>,
 }
 
 impl Default for RenderOptions {
@@ -47,6 +56,9 @@ impl Default for RenderOptions {
             strict_line_breaks: false,
             max_embed_depth: 3,
             sanitize_html: true,
+            note_base: None,
+            file_base: None,
+            tag_base: None,
         }
     }
 }
@@ -87,6 +99,61 @@ impl<'a> RenderContext<'a> {
 
     fn leaving(&self) {
         self.chain.borrow_mut().pop();
+    }
+
+    /// Whether web-server link rewriting is active (any route prefix set).
+    fn web_mode(&self) -> bool {
+        self.options.note_base.is_some() || self.options.file_base.is_some()
+    }
+
+    /// An href for a resolved note path: prefixed in web mode, else relative
+    /// (the GUI goldens depend on the relative form).
+    fn note_href(&self, path: &str) -> String {
+        match &self.options.note_base {
+            Some(base) => format!("{base}/{}", href_encode(path)),
+            None => href_encode(path),
+        }
+    }
+
+    /// A src/href for a resolved attachment path.
+    fn file_href(&self, path: &str) -> String {
+        match &self.options.file_base {
+            Some(base) => format!("{base}/{}", href_encode(path)),
+            None => href_encode(path),
+        }
+    }
+
+    /// Rewrite a markdown-authored URL for the web: dangerous schemes are
+    /// defused, relative paths that resolve inside the vault get the right
+    /// route prefix (notes under `note_base`, everything else under
+    /// `file_base`); absolute URLs and anchors pass through untouched.
+    /// Inactive (default options) the URL is returned as authored.
+    fn web_url(&self, url: &str, is_image: bool) -> String {
+        let lower = url.to_ascii_lowercase();
+        if lower.starts_with("javascript:")
+            || lower.starts_with("vbscript:")
+            || lower.starts_with("data:")
+        {
+            return "#".to_string();
+        }
+        if !self.web_mode() || is_external_or_anchor(url) {
+            return url.to_string();
+        }
+        match self
+            .index
+            .resolve_relative(url, self.from_note)
+            .map(str::to_string)
+        {
+            Some(path) => {
+                if !is_image && path.ends_with(".md") {
+                    self.note_href(&path)
+                } else {
+                    self.file_href(&path)
+                }
+            }
+            // Unresolvable relative URL: leave as authored.
+            None => url.to_string(),
+        }
     }
 }
 
@@ -383,10 +450,11 @@ fn render_embed_block(embed: &crate::ir::Embed, ctx: &RenderContext, out: &mut S
 fn render_embed_media(embed: &crate::ir::Embed, ctx: &RenderContext, out: &mut String) {
     let target = &embed.target;
     let resolved = ctx.index.resolve(&target.note, ctx.from_note);
+    let src = resolved.map(|p| ctx.file_href(p)).unwrap_or_default();
     let _ = write!(
         out,
         "<img class=\"internal-embed\" src=\"{}\" alt=\"{}\"",
-        resolved.map(href_encode).as_deref().unwrap_or(""),
+        src,
         escape_attr(&target.note)
     );
     if let Some((w, h)) = embed.size {
@@ -560,7 +628,7 @@ fn render_inline(inline: &Inline, ctx: &RenderContext, out: &mut String) {
             let _ = write!(
                 out,
                 "<a href=\"{}\"{}>",
-                escape_attr(url),
+                escape_attr(&ctx.web_url(url, false)),
                 title
                     .as_ref()
                     .map(|t| format!(" title=\"{}\"", escape_attr(t)))
@@ -573,17 +641,21 @@ fn render_inline(inline: &Inline, ctx: &RenderContext, out: &mut String) {
             let _ = write!(
                 out,
                 "<img src=\"{}\" alt=\"{}\">",
-                escape_attr(url),
+                escape_attr(&ctx.web_url(url, true)),
                 escape_attr(alt)
             );
         }
         Inline::WikiLink(link) => render_wikilink(link, ctx, out),
         Inline::Embed(embed) => render_embed_media(embed, ctx, out),
         Inline::Tag(name) => {
+            let href = match &ctx.options.tag_base {
+                Some(base) => format!("{base}/{}", href_encode(name)),
+                None => format!("#{name}"),
+            };
             let _ = write!(
                 out,
-                "<a class=\"tag\" href=\"#{}\">#{}</a>",
-                escape_attr(name),
+                "<a class=\"tag\" href=\"{}\">#{}</a>",
+                escape_attr(&href),
                 escape(name)
             );
         }
@@ -670,7 +742,7 @@ fn render_wikilink(link: &crate::ir::WikiLink, ctx: &RenderContext, out: &mut St
             let _ = write!(
                 out,
                 "<a class=\"internal-link\" href=\"{}{fragment}\" data-href=\"{}\">{}</a>",
-                href_encode(&path),
+                ctx.note_href(&path),
                 escape_attr(&path),
                 escape(&label)
             );
@@ -764,6 +836,15 @@ fn escape_attr(text: &str) -> String {
     escape(text).replace('"', "\u{26}quot;")
 }
 
+/// Whether a URL must pass through untouched: an in-page anchor,
+/// protocol-relative, mailto, or any absolute scheme (`https://`, …).
+fn is_external_or_anchor(url: &str) -> bool {
+    url.starts_with('#')
+        || url.starts_with("//")
+        || url.starts_with("mailto:")
+        || url.contains("://")
+}
+
 /// Percent-encode a vault-relative path for use in an href/src.
 fn href_encode(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
@@ -799,6 +880,79 @@ mod tests {
         let notes = NoNotes;
         let ctx = RenderContext::new(&index, "fixture.md", &notes, RenderOptions::default());
         render_html(&doc, &ctx)
+    }
+
+    /// Web-mode render: route prefixes set, index over notes + an attachment.
+    fn render_web(src: &str) -> String {
+        let doc = parse_note(src);
+        let index = VaultIndex::new(["Note.md", "Note2.md", "attachments/img.png"]);
+        let notes = NoNotes;
+        let options = RenderOptions {
+            note_base: Some("/n".to_string()),
+            file_base: Some("/files".to_string()),
+            tag_base: Some("/tag".to_string()),
+            ..RenderOptions::default()
+        };
+        let ctx = RenderContext::new(&index, "Note.md", &notes, options);
+        render_html(&doc, &ctx)
+    }
+
+    #[test]
+    fn web_mode_prefixes_resolved_links_and_embeds() {
+        // Wikilink to a note and a media embed land under their routes.
+        let html = render_web("see [[Note2]] and ![[attachments/img.png]]\n");
+        assert!(
+            html.contains("href=\"/n/Note2.md\""),
+            "wikilink must be routed: {html}"
+        );
+        assert!(
+            html.contains("src=\"/files/attachments/img.png\""),
+            "embed must be routed: {html}"
+        );
+    }
+
+    #[test]
+    fn web_mode_rewrites_relative_markdown_links_and_images() {
+        let html = render_web(
+            "[note](Note2.md) [file](attachments/img.png) ![img](attachments/img.png)\n",
+        );
+        assert!(html.contains("href=\"/n/Note2.md\""), "{html}");
+        assert!(
+            html.contains("href=\"/files/attachments/img.png\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("src=\"/files/attachments/img.png\""),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn web_mode_passes_through_anchors_and_absolute_urls() {
+        let html = render_web("[anchor](#heading) [site](https://example.net/x)\n");
+        assert!(html.contains("href=\"#heading\""), "{html}");
+        assert!(html.contains("href=\"https://example.net/x\""), "{html}");
+    }
+
+    #[test]
+    fn web_mode_defuses_dangerous_schemes() {
+        let html = render_web("[click](javascript:alert(1)) [data](data:text/html,hi)\n");
+        assert!(!html.contains("javascript:"), "{html}");
+        assert!(!html.contains("data:text/html"), "{html}");
+        assert!(html.contains("href=\"#\""), "{html}");
+    }
+
+    #[test]
+    fn web_mode_routes_tags() {
+        let html = render_web("a #project/deep tag\n");
+        assert!(html.contains("href=\"/tag/project/deep\""), "{html}");
+    }
+
+    #[test]
+    fn default_options_keep_relative_hrefs() {
+        // The GUI goldens depend on the unprefixed form.
+        let html = render("see [[Note]]\n");
+        assert!(html.contains("href=\"Note.md\""), "{html}");
     }
 
     /// Confirmed against real Obsidian (M3): footnote numbers follow

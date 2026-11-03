@@ -5,6 +5,7 @@ members = [
     "vault-core",
     "vault-md",
     "app",
+    "vault-web",
 ]
 # `app` depends on libcosmic via a path dependency outside this repository
 # (/cella/Git/libcosmic), so the default commands build/test the UI-free
@@ -13,4 +14,5 @@ default-members = [
     "vault-glass",
     "vault-core",
     "vault-md",
+    "vault-web",
 ]

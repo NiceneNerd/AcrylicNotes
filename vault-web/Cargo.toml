@@ -1,0 +1,20 @@
+[package]
+name = "vault-web"
+version = "0.1.0"
+edition = "2021"
+description = "Vault Notes — read-only web server (M5): same core and IR, server-rendered HTML, no JS"
+
+[dependencies]
+vault-core = { path = "../vault-core" }
+vault-md = { path = "../vault-md" }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+mime_guess = "2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6.0"
+
+[dev-dependencies]
+tempfile = "3.27"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

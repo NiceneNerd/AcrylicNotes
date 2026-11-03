@@ -10,7 +10,6 @@ mod fuzzy;
 mod glass;
 mod reading;
 mod scroll;
-mod search;
 mod settings;
 mod tree;
 mod view;

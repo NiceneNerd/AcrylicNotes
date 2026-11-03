@@ -230,7 +230,7 @@ pub enum Message {
     SidePanel(SidePanel),
     SearchInput(String),
     SearchSubmitted,
-    SearchDone(Vec<crate::search::SearchHit>),
+    SearchDone(Vec<vault_core::search::SearchHit>),
     /// Open search hit `i` and scroll its reading view to the match.
     SearchOpen(usize),
     TagSelected(String),
@@ -266,7 +266,7 @@ pub struct VaultNotes {
     // --- M4b ---
     pub panel: SidePanel,
     pub search_query: String,
-    pub search_hits: Vec<crate::search::SearchHit>,
+    pub search_hits: Vec<vault_core::search::SearchHit>,
     pub selected_tag: Option<String>,
     pub switcher: Switcher,
     // --- M4c ---
@@ -1179,7 +1179,8 @@ impl cosmic::Application for VaultNotes {
                 // on large vaults. Sync file IO inside is fine at vault scale.
                 Task::perform(
                     async move {
-                        crate::search::search(&root, &query, SEARCH_MAX_HITS).unwrap_or_default()
+                        vault_core::search::search(&root, &query, SEARCH_MAX_HITS)
+                            .unwrap_or_default()
                     },
                     |hits| cosmic::Action::App(Message::SearchDone(hits)),
                 )

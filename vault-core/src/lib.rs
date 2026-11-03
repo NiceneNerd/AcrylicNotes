@@ -9,6 +9,7 @@
 pub mod frontmatter;
 pub mod links;
 pub mod resolve;
+pub mod search;
 pub mod source;
 pub mod vault;
 pub mod write;
