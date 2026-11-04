@@ -214,6 +214,25 @@ pub(crate) fn title_of(path: &str) -> String {
         .to_string()
 }
 
+/// The directory part of a vault-relative path ("Notes/Journal" for
+/// "Notes/Journal/Daily.md"), or "" for root-level files.
+pub(crate) fn parent_of(path: &str) -> String {
+    match path.rfind('/') {
+        Some(pos) => path[..pos].to_string(),
+        None => String::new(),
+    }
+}
+
+/// A note row's label in the file tree: the file name, with the `.md`
+/// extension hidden when the setting asks for it (Obsidian's default).
+pub(crate) fn tree_note_label(name: &str, hide_md_extension: bool) -> String {
+    if hide_md_extension {
+        name.trim_end_matches(".md").to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 /// Inline markdown formatting a shortcut can apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -317,7 +336,10 @@ pub enum Message {
     /// Open switcher item `i` directly (mouse click).
     SwitcherSelect(usize),
     /// Raw key events; update decides what matters (switcher, shortcuts).
-    KeyPressed(Modifiers, Key),
+    /// A keyboard event reached the global subscription, with the status
+    /// telling whether a widget already captured it (editor-scoped
+    /// bindings capture; we must not double-fire global shortcuts then).
+    KeyPressed(cosmic::iced::event::Status, Modifiers, Key),
 }
 
 pub struct VaultNotes {
@@ -350,6 +372,8 @@ pub struct VaultNotes {
     pub glass_style: vault_glass::GlassStyle,
     /// The theme choice the user made (persisted; `System` follows desktop).
     pub theme: settings::ThemeChoice,
+    /// Hide the `.md` extension on note rows in the file tree.
+    pub hide_md_extension: bool,
     /// Pending inline tree edit (new note / new folder / rename), if any.
     pub tree_edit: Option<tree::TreeEdit>,
     /// The node path the open context menu belongs to (`None` when closed).
@@ -526,6 +550,14 @@ fn count_words(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
+/// Whether the global keyboard subscription may act on a key event.
+/// Captured events are skipped (a widget — usually the text editor's own
+/// bindings — already consumed them), unless one of the app's own text
+/// inputs has focus: their keys are exactly what the global handler routes.
+fn global_key_allowed(status: cosmic::iced::event::Status, overlay_input_open: bool) -> bool {
+    !matches!(status, cosmic::iced::event::Status::Captured) || overlay_input_open
+}
+
 // --- auto-pairs -----------------------------------------------------------
 
 /// The bracket/quote pairs that are typed as a pair. `None` for every
@@ -618,23 +650,26 @@ pub(crate) fn editor_shortcut(press: text_editor::KeyPress) -> Option<Message> {
     }
     let ctrl = press.modifiers.command();
     let shift = press.modifiers.shift();
+    let alt = press.modifiers.alt();
     match &press.key {
         cosmic::iced::keyboard::Key::Character(c) if ctrl => {
             let lower = c.to_lowercase();
-            match (lower.as_str(), shift) {
-                ("z", _) => Some(if shift {
+            match (lower.as_str(), shift, alt) {
+                ("z", _, false) => Some(if shift {
                     Message::EditorRedo
                 } else {
                     Message::EditorUndo
                 }),
-                ("y", false) => Some(Message::EditorRedo),
-                ("b", _) => Some(Message::EditorFormat(Format::Bold)),
-                ("i", _) => Some(Message::EditorFormat(Format::Italic)),
-                ("k", _) => Some(Message::EditorFormat(Format::Link)),
-                ("`", _) => Some(Message::EditorFormat(Format::Code)),
-                ("x", true) => Some(Message::EditorFormat(Format::Strike)),
-                ("h", true) => Some(Message::EditorFormat(Format::Highlight)),
-                ("f", true) => Some(Message::EditorFootnote),
+                ("y", false, false) => Some(Message::EditorRedo),
+                ("b", _, false) => Some(Message::EditorFormat(Format::Bold)),
+                ("i", _, false) => Some(Message::EditorFormat(Format::Italic)),
+                ("k", _, false) => Some(Message::EditorFormat(Format::Link)),
+                ("`", _, false) => Some(Message::EditorFormat(Format::Code)),
+                ("x", true, false) => Some(Message::EditorFormat(Format::Strike)),
+                ("h", true, false) => Some(Message::EditorFormat(Format::Highlight)),
+                // Footnote lives on Ctrl+Alt+F: Ctrl+Shift+F belongs to the
+                // global vault search.
+                ("f", _, true) => Some(Message::EditorFootnote),
                 _ => None,
             }
         }
@@ -797,6 +832,27 @@ impl VaultNotes {
         self.active.and_then(|idx| self.tabs.get(idx))
     }
 
+    /// The desktop window title (what the task switcher shows): the open
+    /// note within the vault, the vault alone, or the app name.
+    fn window_title(&self) -> String {
+        match self.active_tab() {
+            Some(tab) => format!("{} — {}", tab.title(), self.vault_name),
+            None if !self.vault_name.is_empty() => self.vault_name.clone(),
+            None => "Vault Notes".to_string(),
+        }
+    }
+
+    /// Whether one of the app's own text inputs (quick switcher, inline
+    /// tree rename) currently owns the keyboard.
+    fn overlay_input_open(&self) -> bool {
+        self.switcher.open || self.tree_edit.is_some()
+    }
+
+    /// Push the current window title to the platform.
+    fn sync_window_title(&self) -> Task<Message> {
+        self.core.set_title(None, self.window_title())
+    }
+
     /// The path being renamed inline in the sidebar tree, if any.
     pub fn tree_rename_target(&self) -> Option<&str> {
         match &self.tree_edit {
@@ -858,7 +914,7 @@ impl VaultNotes {
         if let Some(i) = self.tabs.iter().position(|tab| tab.path == path) {
             self.active = Some(i);
             self.sync_tab_model();
-            return Task::none();
+            return self.sync_window_title();
         }
         let source = self
             .vault
@@ -868,7 +924,7 @@ impl VaultNotes {
         self.tabs.push(Tab::open(path, &source));
         self.active = Some(self.tabs.len() - 1);
         self.sync_tab_model();
-        Task::none()
+        self.sync_window_title()
     }
 
     /// Create a note for an unresolved link and open it.
@@ -1022,7 +1078,7 @@ impl VaultNotes {
             other => other,
         };
         self.sync_tab_model();
-        Task::none()
+        self.sync_window_title()
     }
 
     /// Rebuild the tab-strip model from `tabs` + `active` (after every
@@ -1402,6 +1458,7 @@ impl cosmic::Application for VaultNotes {
             last_edit: None,
             glass_style: vault_glass::GlassStyle::Opaque,
             theme: settings::ThemeChoice::default(),
+            hide_md_extension: settings::load().hide_md_extension,
             tree_edit: None,
             tree_menu_target: None,
             nav_model: build_nav_model(),
@@ -1447,7 +1504,10 @@ impl cosmic::Application for VaultNotes {
                 let path = expand_tilde(&raw).unwrap_or(PathBuf::from(raw));
                 self.update(Message::VaultOpen(path))
             }
-            Message::VaultOpen(path) => self.open_vault(path),
+            Message::VaultOpen(path) => {
+                let opened = self.open_vault(path);
+                Task::batch([opened, self.sync_window_title()])
+            }
             Message::WatchTick => {
                 let autosave = self.autosave_tick();
                 let poll = self.poll_watcher();
@@ -1569,7 +1629,7 @@ impl cosmic::Application for VaultNotes {
                         self.active = Some(idx);
                     }
                 }
-                Task::none()
+                self.sync_window_title()
             }
             Message::TabCloseRequested(id) => match self.tab_model.data::<usize>(id).copied() {
                 Some(idx) => self.close_tab(idx),
@@ -1838,7 +1898,14 @@ impl cosmic::Application for VaultNotes {
                 self.switcher.open = false;
                 self.open_tab(path)
             }
-            Message::KeyPressed(modifiers, key) => {
+            Message::KeyPressed(status, modifiers, key) => {
+                // Editor-scoped bindings (and any focused widget) capture
+                // their events; a captured key must not also fire a global
+                // shortcut. Our own text inputs (switcher, tree rename) are
+                // the exception: their keys are exactly what we route here.
+                if !global_key_allowed(status, self.overlay_input_open()) {
+                    return Task::none();
+                }
                 if self.switcher.open {
                     match key {
                         Key::Named(Named::ArrowUp) => self.update(Message::SwitcherMove(-1)),
@@ -1859,9 +1926,10 @@ impl cosmic::Application for VaultNotes {
                         Key::Character(c) if c == "p" => self.update(Message::SwitcherToggle),
                         Key::Character(c) if c == "s" => self.save_active(),
                         Key::Character(c) if c == "d" => self.update(Message::DailyNote),
-                        // Shift+F arrives as either case depending on the
-                        // platform's key mapping.
-                        Key::Character(c) if c == "f" || c == "F" => {
+                        // Ctrl+F only: lowercase arrives on every layout
+                        // without Shift, and matching "F" here would
+                        // double-fire for Ctrl+Shift chords.
+                        Key::Character(c) if c == "f" => {
                             self.update(Message::SidePanel(SidePanel::Search))
                         }
                         Key::Character(c) if c == "w" => match self.active {
@@ -1901,13 +1969,15 @@ impl cosmic::Application for VaultNotes {
 
     fn subscription(&self) -> cosmic::iced::Subscription<Self::Message> {
         // Key events always flow (quick switcher + Ctrl+S work everywhere);
-        // update filters by app state, so unused keys are cheap noise.
-        let keys = cosmic::iced::event::listen_with(|event, _status, _window| match event {
+        // update filters by app state, so unused keys are cheap noise. The
+        // capture status rides along so update can skip events a widget
+        // (e.g. the text editor's own bindings) already consumed.
+        let keys = cosmic::iced::event::listen_with(|event, status, _window| match event {
             cosmic::iced::Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
                 key,
                 modifiers,
                 ..
-            }) => Some(Message::KeyPressed(modifiers, key)),
+            }) => Some(Message::KeyPressed(status, modifiers, key)),
             _ => None,
         });
         match &self.vault {
@@ -2275,6 +2345,8 @@ mod editor_tests {
     fn editor_shortcuts_map_to_messages() {
         let ctrl = Modifiers::CTRL;
         let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        let ctrl_shift_alt = Modifiers::CTRL | Modifiers::SHIFT | Modifiers::ALT;
+        let ctrl_alt = Modifiers::CTRL | Modifiers::ALT;
 
         assert!(matches!(
             editor_shortcut(key_press(Key::Character("z".into()), ctrl)),
@@ -2314,9 +2386,14 @@ mod editor_tests {
             Some(Message::EditorFormat(Format::Highlight))
         ));
         assert!(matches!(
-            editor_shortcut(key_press(Key::Character("f".into()), ctrl_shift)),
+            editor_shortcut(key_press(Key::Character("f".into()), ctrl_alt)),
             Some(Message::EditorFootnote)
         ));
+        // Ctrl+Shift+F is the global vault search — the editor must not
+        // claim it.
+        assert!(editor_shortcut(key_press(Key::Character("f".into()), ctrl_shift)).is_none());
+        // Ctrl+Alt+B etc. are unclaimed (no accidental Alt variants).
+        assert!(editor_shortcut(key_press(Key::Character("b".into()), ctrl_shift_alt)).is_none());
         assert!(matches!(
             editor_shortcut(key_press(Key::Named(Named::Backspace), ctrl)),
             Some(Message::EditorDeleteWord(false))
@@ -2474,6 +2551,17 @@ mod editor_tests {
         assert_eq!(count_words(""), 0);
         assert_eq!(count_words("hello"), 1);
         assert_eq!(count_words("  two  words\nand more "), 4);
+    }
+
+    #[test]
+    fn captured_keys_reach_global_handlers_only_for_our_own_inputs() {
+        use cosmic::iced::event::Status;
+        // An ignored event always reaches the global handler.
+        assert!(global_key_allowed(Status::Ignored, false));
+        // A captured event does not — unless one of the app's own text
+        // inputs (switcher, tree rename) owns the keyboard.
+        assert!(!global_key_allowed(Status::Captured, false));
+        assert!(global_key_allowed(Status::Captured, true));
     }
 }
 

@@ -30,6 +30,10 @@ pub struct AppSettings {
     /// Whether to request a frosted (blur) backdrop from the platform (M4c).
     #[serde(default = "default_true")]
     pub glass_enabled: bool,
+    /// Hide the `.md` extension on note rows in the file tree (Obsidian's
+    /// default presentation).
+    #[serde(default = "default_true")]
+    pub hide_md_extension: bool,
 }
 
 fn default_true() -> bool {
@@ -42,6 +46,7 @@ impl Default for AppSettings {
             last_vault: None,
             theme: ThemeChoice::default(),
             glass_enabled: true,
+            hide_md_extension: true,
         }
     }
 }
@@ -98,6 +103,7 @@ mod tests {
             last_vault: Some(PathBuf::from("/home/nn/Notes")),
             theme: ThemeChoice::Dark,
             glass_enabled: true,
+            hide_md_extension: true,
         };
         store_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -118,6 +124,8 @@ mod tests {
         assert_eq!(loaded.last_vault, Some(PathBuf::from("/notes")));
         assert_eq!(loaded.theme, ThemeChoice::System);
         assert!(loaded.glass_enabled);
+        // The `.md`-hiding default applies to files that predate the field.
+        assert!(loaded.hide_md_extension);
 
         // A glass_enabled=false must survive the roundtrip.
         let path2 = tmp.path().join("settings2.json");

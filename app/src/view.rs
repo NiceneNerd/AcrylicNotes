@@ -14,8 +14,8 @@ use cosmic::widget::{
 use cosmic::Element;
 
 use crate::app::{
-    editor_shortcut, title_of, Message, Palette, PaneMode, SidePanel, TreeMenuAction, VaultNotes,
-    SWITCHER_INPUT, TREE_EDIT_INPUT,
+    editor_shortcut, parent_of, title_of, tree_note_label, Message, Palette, PaneMode, SidePanel,
+    TreeMenuAction, VaultNotes, SWITCHER_INPUT, TREE_EDIT_INPUT,
 };
 use crate::reading;
 use crate::scroll::READING_SCROLL;
@@ -49,17 +49,29 @@ pub fn header_start(app: &VaultNotes) -> Vec<Element<'_, Message>> {
         button::icon(icon::from_name("date-symbolic"))
             .on_press(Message::DailyNote)
             .into(),
-        // Label shows the theme a click switches to.
-        button::text(if cosmic::theme::is_dark() {
-            "Light"
+        // Icon shows the theme a click switches to (both names verified in
+        // the installed Pop and Cosmic icon themes).
+        button::icon(icon::from_name(if cosmic::theme::is_dark() {
+            "weather-clear-symbolic"
         } else {
-            "Dark"
-        })
+            "weather-clear-night-symbolic"
+        }))
         .on_press(Message::ToggleTheme)
         .into(),
-        segmented_button::horizontal(&app.pane_model)
-            .on_activate(Message::PaneActivated)
-            .into(),
+        // The segmented control's default button padding is zero, which
+        // cramps the labels.
+        container(
+            segmented_button::horizontal(&app.pane_model)
+                .button_padding([
+                    cosmic::theme::spacing().space_s,
+                    cosmic::theme::spacing().space_xxs,
+                    cosmic::theme::spacing().space_s,
+                    cosmic::theme::spacing().space_xxs,
+                ])
+                .on_activate(Message::PaneActivated),
+        )
+        .padding([2, 4])
+        .into(),
     ]
 }
 
@@ -337,7 +349,7 @@ fn nodes_view<'a>(
                 let row = if app.tree_rename_target() == Some(path.as_str()) {
                     tree_edit_row(app, indent + 10.0)
                 } else {
-                    let mut label = name.clone();
+                    let mut label = tree_note_label(name, app.hide_md_extension);
                     if app.active_tab_path() == Some(path.as_str()) {
                         label = format!("● {label}");
                     } else if app.is_tab_dirty(path) {
@@ -562,12 +574,16 @@ fn switcher_overlay<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Me
             button::suggested(label)
         } else {
             button::text(label)
-        };
-        col = col.push(
-            btn.on_press(Message::SwitcherSelect(i))
-                .height(Length::Shrink)
-                .width(Length::Fill),
-        );
+        }
+        .on_press(Message::SwitcherSelect(i));
+        // The note's parentage rides along, dimmed, so same-named notes in
+        // different folders are distinguishable at a glance.
+        let parent = parent_of(path);
+        let mut row = row::Row::new().push(btn.width(Length::Shrink).height(Length::Shrink));
+        if !parent.is_empty() {
+            row = row.push(text(parent).size(12).class(palette.muted));
+        }
+        col = col.push(row.width(Length::Fill));
     }
     container(container(col).padding(12).max_width(560).style(move |_| {
         cosmic::widget::container::Style {
@@ -738,15 +754,20 @@ fn reading_pane<'a>(
     };
     // The id anchors outline/search/footnote jumps (see scroll.rs). The
     // document column is centered at a readable measure (matching the web
-    // view's ~46rem) instead of stretching edge to edge, with breathing
-    // room around it.
-    scrollable::scrollable(
-        container(reading::render_doc(&tab.doc, &ctx))
-            .max_width(736)
-            .width(Length::Fill)
-            .align_x(alignment::Horizontal::Center),
+    // view's ~46rem) instead of stretching edge to edge. Padding goes on
+    // the wrapping container: a Scrollable's own `padding` only insets its
+    // scrollbar, not its content.
+    container(
+        scrollable::scrollable(
+            container(reading::render_doc(&tab.doc, &ctx))
+                .max_width(736)
+                .width(Length::Fill)
+                .align_x(alignment::Horizontal::Center),
+        )
+        .id(Id::new(READING_SCROLL))
+        .width(Length::Fill)
+        .height(Length::Fill),
     )
-    .id(Id::new(READING_SCROLL))
     .width(Length::Fill)
     .height(Length::Fill)
     .padding(16)
