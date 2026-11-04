@@ -636,10 +636,13 @@ fn note_area<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
         col = col.push(find_bar(app, palette));
     }
     let content: Element<'_, Message> = match app.pane {
-        PaneMode::Source => editor_pane(tab, palette),
+        PaneMode::Source => editor_pane(tab, palette, app.wiki_complete.as_ref()),
         PaneMode::Reading => reading_pane(app, tab, palette),
         PaneMode::Split => row::Row::new()
-            .push(container(editor_pane(tab, palette)).width(Length::FillPortion(1)))
+            .push(
+                container(editor_pane(tab, palette, app.wiki_complete.as_ref()))
+                    .width(Length::FillPortion(1)),
+            )
             .push(container(reading_pane(app, tab, palette)).width(Length::FillPortion(1)))
             .into(),
     };
@@ -733,7 +736,11 @@ fn find_bar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
 
 // --- panes -----------------------------------------------------------------
 
-fn editor_pane<'a>(tab: &'a crate::app::Tab, palette: Palette) -> Element<'a, Message> {
+fn editor_pane<'a>(
+    tab: &'a crate::app::Tab,
+    palette: Palette,
+    wiki: Option<&'a crate::app::WikiComplete>,
+) -> Element<'a, Message> {
     // Syntect Markdown grammar via iced's highlighter (M4 decision 3);
     // theme follows the system light/dark preference.
     let highlighter_theme = if palette.is_dark {
@@ -741,66 +748,125 @@ fn editor_pane<'a>(tab: &'a crate::app::Tab, palette: Palette) -> Element<'a, Me
     } else {
         cosmic::iced::highlighter::Theme::InspiredGitHub
     };
+    let editor = text_editor(&tab.content)
+        .height(Length::Fill)
+        .on_action(Message::EditorAction)
+        // Inset the text from the editor's border.
+        .padding(8)
+        .font(cosmic::font::mono())
+        .highlight_with::<cosmic::iced::highlighter::Highlighter>(
+            cosmic::iced::highlighter::Settings {
+                theme: highlighter_theme,
+                token: "md".to_string(),
+            },
+            |highlight, _theme| highlight.to_format(),
+        )
+        // Editor-scoped shortcuts: undo/redo, formatting, footnotes,
+        // word delete. Anything else falls back to the editor's own
+        // bindings (copy/cut/paste/select-all, arrows, …).
+        .key_binding(move |press: text_editor::KeyPress| {
+            // While the wikilink dropdown is open, Esc dismisses it
+            // instead of the editor's default unfocus. (Tab and
+            // Ctrl+Tab are not editor-bound; they reach the global
+            // handler, which accepts/cycles the dropdown.)
+            if wiki.is_some()
+                && press.key
+                    == cosmic::iced::keyboard::Key::Named(
+                        cosmic::iced::keyboard::key::Named::Escape,
+                    )
+            {
+                return Some(text_editor::Binding::Custom(Message::WikiDismiss));
+            }
+            match editor_shortcut(press.clone()) {
+                Some(message) => Some(text_editor::Binding::Custom(message)),
+                None => text_editor::Binding::from_key_press(press),
+            }
+        })
+        .style(|theme: &cosmic::Theme, status: text_editor::Status| {
+            // Cosmic's default text_editor style paints an opaque
+            // bg_color, which hides the pane's translucent overlay (and
+            // any compositor frosted-window blur behind it). Keep only
+            // the border and text colors; the pane container's dark
+            // overlay is the visible editor surface.
+            let cosmic = theme.cosmic();
+            let border_color = match status {
+                text_editor::Status::Focused { .. } => cosmic.accent.base,
+                _ => cosmic.bg_divider(),
+            };
+            text_editor::Style {
+                background: Background::Color(cosmic::iced::Color::TRANSPARENT),
+                border: border::Border {
+                    radius: cosmic.corner_radii.radius_0.into(),
+                    width: 1.0,
+                    color: border_color.into(),
+                },
+                placeholder: with_alpha(cosmic.palette.neutral_9.into(), 0.7),
+                value: cosmic.palette.neutral_9.into(),
+                selection: cosmic.accent.base.into(),
+            }
+        });
+    let surface: Element<'a, Message> = container(editor)
+        .padding(12)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| cosmic::widget::container::Style {
+            // Darker editor overlay (M4 decision 6): darkens the surface now,
+            // and its translucency is what shows the compositor's frosted-window
+            // blur through once that is active (COSMIC transparency setting).
+            background: Some(Background::Color(with_alpha(
+                cosmic::iced::Color::BLACK,
+                0.18,
+            ))),
+            ..Default::default()
+        })
+        .into();
+    match wiki {
+        // The suggestion list floats over the editor's bottom edge. The
+        // layer is deliberately not `opaque`: clicks outside the list
+        // fall through to the editor, so typing and clicking keep working.
+        Some(wiki) => stack([surface, wiki_dropdown(wiki, palette)]).into(),
+        None => surface,
+    }
+}
+
+/// The wikilink suggestion dropdown: a small popup anchored to the editor's
+/// bottom edge (iced exposes no caret pixel position). Rows accept with a
+/// click; keyboard handling (Tab / Ctrl+Tab / Esc) is routed globally.
+fn wiki_dropdown<'a>(wiki: &'a crate::app::WikiComplete, palette: Palette) -> Element<'a, Message> {
+    let mut col = column::Column::new().spacing(2).padding(6);
+    for (i, title) in wiki.items.iter().enumerate() {
+        let btn = if i == wiki.selected {
+            button::suggested(title.clone())
+        } else {
+            button::text(title.clone())
+        };
+        col = col.push(
+            btn.on_press(Message::WikiSelect(i))
+                .width(Length::Fill)
+                .height(Length::Shrink),
+        );
+    }
+    // The outer container fills the editor area so the popup can anchor to
+    // its bottom edge; the inner one is the popup itself.
     container(
-        text_editor(&tab.content)
-            .height(Length::Fill)
-            .on_action(Message::EditorAction)
-            // Inset the text from the editor's border.
-            .padding(8)
-            .font(cosmic::font::mono())
-            .highlight_with::<cosmic::iced::highlighter::Highlighter>(
-                cosmic::iced::highlighter::Settings {
-                    theme: highlighter_theme,
-                    token: "md".to_string(),
+        container(col)
+            .width(Length::Shrink)
+            .max_width(280)
+            .style(move |_| cosmic::widget::container::Style {
+                background: Some(Background::Color(with_alpha(palette.surface, 0.94))),
+                border: border::Border {
+                    radius: 8.0.into(),
+                    width: 1.0,
+                    color: with_alpha(palette.muted, 0.5),
                 },
-                |highlight, _theme| highlight.to_format(),
-            )
-            // Editor-scoped shortcuts: undo/redo, formatting, footnotes,
-            // word delete. Anything else falls back to the editor's own
-            // bindings (copy/cut/paste/select-all, arrows, …).
-            .key_binding(
-                |press: text_editor::KeyPress| match editor_shortcut(press.clone()) {
-                    Some(message) => Some(text_editor::Binding::Custom(message)),
-                    None => text_editor::Binding::from_key_press(press),
-                },
-            )
-            .style(|theme: &cosmic::Theme, status: text_editor::Status| {
-                // Cosmic's default text_editor style paints an opaque
-                // bg_color, which hides the pane's translucent overlay (and
-                // any compositor frosted-window blur behind it). Keep only
-                // the border and text colors; the pane container's dark
-                // overlay is the visible editor surface.
-                let cosmic = theme.cosmic();
-                let border_color = match status {
-                    text_editor::Status::Focused { .. } => cosmic.accent.base,
-                    _ => cosmic.bg_divider(),
-                };
-                text_editor::Style {
-                    background: Background::Color(cosmic::iced::Color::TRANSPARENT),
-                    border: border::Border {
-                        radius: cosmic.corner_radii.radius_0.into(),
-                        width: 1.0,
-                        color: border_color.into(),
-                    },
-                    placeholder: with_alpha(cosmic.palette.neutral_9.into(), 0.7),
-                    value: cosmic.palette.neutral_9.into(),
-                    selection: cosmic.accent.base.into(),
-                }
+                ..Default::default()
             }),
     )
-    .padding(12)
     .width(Length::Fill)
     .height(Length::Fill)
-    .style(|_| cosmic::widget::container::Style {
-        // Darker editor overlay (M4 decision 6): darkens the surface now,
-        // and its translucency is what shows the compositor's frosted-window
-        // blur through once that is active (COSMIC transparency setting).
-        background: Some(Background::Color(with_alpha(
-            cosmic::iced::Color::BLACK,
-            0.18,
-        ))),
-        ..Default::default()
-    })
+    .align_x(alignment::Horizontal::Left)
+    .align_y(alignment::Vertical::Bottom)
+    .padding([0, 12, 4, 12])
     .into()
 }
 

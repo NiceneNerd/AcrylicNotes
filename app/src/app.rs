@@ -102,6 +102,17 @@ pub struct Find {
     pub current: usize,
 }
 
+/// Wikilink suggestions for the `[[` currently being typed in the editor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WikiComplete {
+    /// Ranked note titles.
+    pub items: Vec<String>,
+    pub selected: usize,
+}
+
+/// How many wikilink suggestions to show at once.
+const WIKI_MAX_ITEMS: usize = 8;
+
 /// Cap on vault-wide search results shown.
 pub const SEARCH_MAX_HITS: usize = 200;
 
@@ -333,6 +344,15 @@ pub enum Message {
     FindReplace,
     /// Replace every match in the active tab.
     FindReplaceAll,
+    // --- wikilink autocomplete ---
+    /// Accept the highlighted suggestion (Tab or click on a row).
+    WikiAccept,
+    /// Accept the suggestion at `index` (a dropdown row was clicked).
+    WikiSelect(usize),
+    /// Move the highlight (Ctrl+Tab / Ctrl+Shift+Tab).
+    WikiCycle(i32),
+    /// Dismiss the dropdown (Esc).
+    WikiDismiss,
     /// Delete the word before (false) or after (true) the cursor.
     EditorDeleteWord(bool),
     /// A bracket/quote was typed: pair it around the selection, or insert
@@ -404,6 +424,8 @@ pub struct VaultNotes {
     pub tree_edit: Option<tree::TreeEdit>,
     /// The in-note find bar state (Ctrl+F), when open.
     pub find: Option<Find>,
+    /// Wikilink suggestions for the `[[` being typed, when active.
+    pub wiki_complete: Option<WikiComplete>,
     /// The node path the open context menu belongs to (`None` when closed).
     pub tree_menu_target: Option<String>,
     // --- COSMIC chrome models ---
@@ -690,6 +712,36 @@ fn replace_spans(text: &str, spans: &[TextMatch], replacement: &str) -> String {
         }
     }
     out
+}
+
+// --- wikilink autocomplete --------------------------------------------------
+
+/// The wikilink being typed at a cursor position, if any: the byte column
+/// of the opening `[[` in the cursor's line and the partial link text.
+/// Suggesting stops when the link is closed (`]`), aliases are being typed
+/// (`|`), or the `[[` sits on an earlier line.
+pub(crate) fn wiki_query_at(text: &str, cursor: Position) -> Option<(usize, String)> {
+    let line = text.split('\n').nth(cursor.line)?;
+    let end = line.len().min(cursor.column);
+    if !line.is_char_boundary(end) {
+        return None;
+    }
+    let before = &line[..end];
+    let open = before.rfind("[[")?;
+    let query = &before[open + 2..];
+    if query.contains(']') || query.contains('|') {
+        return None;
+    }
+    Some((open, query.to_string()))
+}
+
+/// Rank note titles against a partial wikilink query (empty queries pass
+/// everything through, like the quick switcher).
+pub(crate) fn wiki_items(query: &str, titles: &[String]) -> Vec<String> {
+    crate::fuzzy::rank(query, titles, WIKI_MAX_ITEMS)
+        .into_iter()
+        .map(|ranked| titles[ranked.index].clone())
+        .collect()
 }
 
 // --- auto-pairs -----------------------------------------------------------
@@ -979,7 +1031,10 @@ impl VaultNotes {
     /// Whether one of the app's own text inputs (quick switcher, inline
     /// tree rename, find bar) currently owns the keyboard.
     fn overlay_input_open(&self) -> bool {
-        self.switcher.open || self.tree_edit.is_some() || self.find.is_some()
+        self.switcher.open
+            || self.tree_edit.is_some()
+            || self.find.is_some()
+            || self.wiki_complete.is_some()
     }
 
     /// Push the current window title to the platform.
@@ -1045,6 +1100,7 @@ impl VaultNotes {
     }
 
     fn open_tab(&mut self, path: String) -> Task<Message> {
+        self.wiki_complete = None;
         if let Some(i) = self.tabs.iter().position(|tab| tab.path == path) {
             self.active = Some(i);
             self.sync_tab_model();
@@ -1200,6 +1256,7 @@ impl VaultNotes {
         if self.tabs[idx].is_dirty() && !self.save_tab(idx) {
             return Task::none();
         }
+        self.wiki_complete = None;
         self.tabs.remove(idx);
         self.active = match self.active {
             Some(active) if active >= self.tabs.len() => {
@@ -1257,6 +1314,8 @@ impl VaultNotes {
         if self.tabs[idx].is_dirty() != was_dirty {
             self.sync_tab_text(idx);
         }
+        // A command can move the cursor into or out of an unclosed `[[`.
+        self.update_wiki_complete();
     }
 
     /// Select find match `index` in the active tab (cursor at its end, the
@@ -1379,6 +1438,7 @@ impl VaultNotes {
             find.current = len.min(index);
         }
         self.select_match(self.find.as_ref().map_or(0, |f| f.current));
+        self.update_wiki_complete();
     }
 
     /// Replace every match in the active tab (one undoable step).
@@ -1417,6 +1477,97 @@ impl VaultNotes {
         if let Some(find) = self.find.as_mut() {
             find.current = 0;
         }
+        self.update_wiki_complete();
+    }
+
+    /// Re-evaluate the wikilink dropdown against the active tab's text and
+    /// cursor: open while an unclosed `[[` is being typed, gone otherwise.
+    fn update_wiki_complete(&mut self) {
+        let Some(idx) = self.active else {
+            self.wiki_complete = None;
+            return;
+        };
+        let text = self.tabs[idx].content.text();
+        let cursor = self.tabs[idx].content.cursor().position;
+        let Some((_, query)) = wiki_query_at(&text, cursor) else {
+            self.wiki_complete = None;
+            return;
+        };
+        let titles: Vec<String> = self
+            .vault
+            .as_ref()
+            .map(|vault| {
+                vault
+                    .notes_sorted()
+                    .iter()
+                    .map(|note| title_of(&note.path))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let items = wiki_items(&query, &titles);
+        if items.is_empty() {
+            self.wiki_complete = None;
+        } else {
+            let selected = self
+                .wiki_complete
+                .as_ref()
+                .map_or(0, |wiki| wiki.selected.min(items.len() - 1));
+            self.wiki_complete = Some(WikiComplete { items, selected });
+        }
+    }
+
+    /// Accept the highlighted wikilink suggestion: replace the partial
+    /// `[[query` up to the cursor with `[[Title]]` (one undoable step).
+    fn wiki_accept(&mut self) {
+        let Some(title) = self
+            .wiki_complete
+            .as_ref()
+            .and_then(|wiki| wiki.items.get(wiki.selected).cloned())
+        else {
+            return;
+        };
+        let Some(idx) = self.active else {
+            return;
+        };
+        let text = self.tabs[idx].content.text();
+        let cursor = self.tabs[idx].content.cursor().position;
+        let Some((open_col, _)) = wiki_query_at(&text, cursor) else {
+            self.wiki_complete = None;
+            return;
+        };
+        let was_dirty = self.tabs[idx].is_dirty();
+        {
+            let tab = &mut self.tabs[idx];
+            push_undo(tab);
+            tab.content.move_to(Cursor {
+                position: cursor,
+                selection: Some(Position {
+                    line: cursor.line,
+                    column: open_col,
+                }),
+            });
+            tab.content
+                .perform(Action::Edit(Edit::Paste(Arc::new(format!("[[{title}]]")))));
+            tab.refresh_doc();
+        }
+        self.last_edit = Some(std::time::Instant::now());
+        if self.tabs[idx].is_dirty() != was_dirty {
+            self.sync_tab_text(idx);
+        }
+        self.wiki_complete = None;
+    }
+
+    /// Move the dropdown highlight (wrapping).
+    fn wiki_cycle(&mut self, delta: i32) {
+        let Some(wiki) = self.wiki_complete.as_mut() else {
+            return;
+        };
+        let len = wiki.items.len();
+        if len == 0 {
+            return;
+        }
+        let selected = wiki.selected as i64 + delta as i64;
+        wiki.selected = (selected.rem_euclid(len as i64)) as usize;
     }
     /// A tree context-menu command, applied to the node the menu was opened
     /// on (`Message::TreeMenuTarget` recorded it when the menu opened).
@@ -1756,6 +1907,7 @@ impl cosmic::Application for VaultNotes {
             tree_edit: None,
             tree_menu_target: None,
             find: None,
+            wiki_complete: None,
             nav_model: build_nav_model(),
             pane_model: build_pane_model(),
             tab_model: segmented_button::Model::default(),
@@ -1908,6 +2060,7 @@ impl cosmic::Application for VaultNotes {
                 if let Some(panel) = self.nav_model.data::<SidePanel>(id).copied() {
                     self.panel = panel;
                 }
+                self.wiki_complete = None;
                 Task::none()
             }
             Message::PaneActivated(id) => {
@@ -1915,6 +2068,7 @@ impl cosmic::Application for VaultNotes {
                 if let Some(mode) = self.pane_model.data::<PaneMode>(id).copied() {
                     self.pane = mode;
                 }
+                self.wiki_complete = None;
                 Task::none()
             }
             Message::TabActivated(id) => {
@@ -1951,6 +2105,9 @@ impl cosmic::Application for VaultNotes {
                         self.sync_tab_text(idx);
                     }
                 }
+                // Every editor interaction may open, move through, or close
+                // an unclosed `[[`.
+                self.update_wiki_complete();
                 Task::none()
             }
             Message::EditorUndo => {
@@ -1965,6 +2122,7 @@ impl cosmic::Application for VaultNotes {
                         }
                     }
                 }
+                self.update_wiki_complete();
                 Task::none()
             }
             Message::EditorRedo => {
@@ -1979,6 +2137,7 @@ impl cosmic::Application for VaultNotes {
                         }
                     }
                 }
+                self.update_wiki_complete();
                 Task::none()
             }
             Message::EditorFormat(format) => {
@@ -2069,6 +2228,25 @@ impl cosmic::Application for VaultNotes {
             }
             Message::FindReplaceAll => {
                 self.find_replace_all();
+                Task::none()
+            }
+            Message::WikiAccept => {
+                self.wiki_accept();
+                Task::none()
+            }
+            Message::WikiSelect(index) => {
+                if let Some(wiki) = self.wiki_complete.as_mut() {
+                    wiki.selected = index;
+                }
+                self.wiki_accept();
+                Task::none()
+            }
+            Message::WikiCycle(delta) => {
+                self.wiki_cycle(delta);
+                Task::none()
+            }
+            Message::WikiDismiss => {
+                self.wiki_complete = None;
                 Task::none()
             }
             Message::Save => self.save_active(),
@@ -2279,6 +2457,19 @@ impl cosmic::Application for VaultNotes {
                         }
                         Key::Named(Named::Enter) => self.update(Message::FindNext),
                         Key::Named(Named::Escape) => self.update(Message::FindClose),
+                        _ => Task::none(),
+                    }
+                } else if self.wiki_complete.is_some() {
+                    // The editor's own key_binding already intercepts these
+                    // (returning WikiDismiss for Esc), so events here are
+                    // ones the editor ignored — e.g. the editor not focused.
+                    match key {
+                        Key::Named(Named::Tab) if modifiers.control() => {
+                            let step: i32 = if modifiers.shift() { -1 } else { 1 };
+                            self.update(Message::WikiCycle(step))
+                        }
+                        Key::Named(Named::Tab) => self.update(Message::WikiAccept),
+                        Key::Named(Named::Escape) => self.update(Message::WikiDismiss),
                         _ => Task::none(),
                     }
                 } else if modifiers.control() {
@@ -3248,7 +3439,7 @@ mod find_tests {
     }
 
     /// A minimal app with one open tab, for find tests.
-    fn test_app_with_tab(text: &str) -> VaultNotes {
+    pub(crate) fn test_app_with_tab(text: &str) -> VaultNotes {
         let mut app = VaultNotes {
             core: cosmic::app::Core::default(),
             vault: None,
@@ -3276,6 +3467,7 @@ mod find_tests {
             tree_edit: None,
             tree_menu_target: None,
             find: None,
+            wiki_complete: None,
             nav_model: build_nav_model(),
             pane_model: build_pane_model(),
             tab_model: segmented_button::Model::default(),
@@ -3283,5 +3475,146 @@ mod find_tests {
         app.tabs.push(Tab::open("t.md".to_string(), text));
         app.active = Some(0);
         app
+    }
+}
+
+#[cfg(test)]
+mod wiki_tests {
+    use super::*;
+    use cosmic::Application as _;
+
+    #[test]
+    fn wiki_query_detects_the_open_link_being_typed() {
+        let text = "see [[An\ntail\n";
+        // Cursor after "[[An": link start at byte 4, partial "An".
+        assert_eq!(
+            wiki_query_at(text, Position { line: 0, column: 8 }),
+            Some((4, "An".to_string()))
+        );
+        // Empty query right after "[[".
+        assert_eq!(
+            wiki_query_at(text, Position { line: 0, column: 6 }),
+            Some((4, String::new()))
+        );
+    }
+
+    #[test]
+    fn wiki_query_stops_at_closers_and_earlier_lines() {
+        // A closed link suggests nothing.
+        assert_eq!(
+            wiki_query_at("see [[An]]|", Position { line: 0, column: 9 }),
+            None
+        );
+        // Typing an alias (`|`) suggests nothing.
+        assert_eq!(
+            wiki_query_at(
+                "see [[An|ali",
+                Position {
+                    line: 0,
+                    column: 12
+                }
+            ),
+            None
+        );
+        // An unclosed `[[` on an earlier line does not reach across lines.
+        assert_eq!(
+            wiki_query_at("see [[An\ntail\n", Position { line: 1, column: 4 }),
+            None
+        );
+        // No link at all.
+        assert_eq!(
+            wiki_query_at(
+                "plain text",
+                Position {
+                    line: 0,
+                    column: 10
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn wiki_query_columns_are_byte_offsets() {
+        // "é[[no" — é is two bytes, so `[[` starts at byte 2.
+        let text = "é[[no\n";
+        assert_eq!(
+            wiki_query_at(text, Position { line: 0, column: 6 }),
+            Some((2, "no".to_string()))
+        );
+    }
+
+    #[test]
+    fn wiki_items_rank_titles_like_the_switcher() {
+        let titles: Vec<String> = ["Alpha", "Alphabet", "Beta"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Empty query passes everything through, in order.
+        assert_eq!(wiki_items("", &titles).len(), 3);
+        let ranked = wiki_items("alp", &titles);
+        assert!(ranked.contains(&"Alpha".to_string()));
+        assert!(ranked.contains(&"Alphabet".to_string()));
+        assert!(!ranked.contains(&"Beta".to_string()));
+        // No matches -> empty (which closes the dropdown).
+        assert!(wiki_items("zzz", &titles).is_empty());
+    }
+
+    #[test]
+    fn wiki_accept_completes_the_link_in_one_undo_step() {
+        let mut app = find_tests::test_app_with_tab("see [[no\n");
+        // Cursor right after "[[no" (byte column 8).
+        app.tabs[0].content.move_to(Cursor {
+            position: Position { line: 0, column: 8 },
+            selection: None,
+        });
+        app.wiki_complete = Some(WikiComplete {
+            items: vec!["Note Title".to_string()],
+            selected: 0,
+        });
+        app.wiki_accept();
+        assert_eq!(app.tabs[0].content.text(), "see [[Note Title]]\n");
+        // The dropdown closed.
+        assert!(app.wiki_complete.is_none());
+        // The whole completion is one undo step.
+        let tab = &mut app.tabs[0];
+        assert!(undo_tab(tab));
+        assert_eq!(tab.content.text(), "see [[no\n");
+    }
+
+    #[test]
+    fn wiki_messages_cycle_and_dismiss() {
+        let mut app = find_tests::test_app_with_tab("see [[\n");
+        app.wiki_complete = Some(WikiComplete {
+            items: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            selected: 0,
+        });
+        app.update(Message::WikiCycle(1));
+        assert_eq!(app.wiki_complete.as_ref().unwrap().selected, 1);
+        // Wraps backwards: 0 - 1 -> 2.
+        app.update(Message::WikiCycle(-1));
+        app.update(Message::WikiCycle(-1));
+        assert_eq!(app.wiki_complete.as_ref().unwrap().selected, 2);
+        app.update(Message::WikiDismiss);
+        assert!(app.wiki_complete.is_none());
+    }
+
+    #[test]
+    fn wiki_dropdown_closes_without_an_open_link() {
+        let mut app = find_tests::test_app_with_tab("see [[note]] done\n");
+        app.tabs[0].content.move_to(Cursor {
+            position: Position {
+                line: 0,
+                column: 18,
+            },
+            selection: None,
+        });
+        app.wiki_complete = Some(WikiComplete {
+            items: vec!["note".to_string()],
+            selected: 0,
+        });
+        // The cursor sits past the closed link: no query, dropdown closes.
+        app.update_wiki_complete();
+        assert!(app.wiki_complete.is_none());
     }
 }
