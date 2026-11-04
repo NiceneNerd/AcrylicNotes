@@ -13,7 +13,7 @@ use cosmic::app::{Core, Task};
 use cosmic::iced::core::widget::Id;
 use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
 use cosmic::iced::widget::image::Handle as ImageHandle;
-use cosmic::iced::widget::text_editor::{self, Action, Content, Cursor, Edit, Motion};
+use cosmic::iced::widget::text_editor::{self, Action, Content, Cursor, Edit, Motion, Position};
 use cosmic::iced::Color;
 use cosmic::widget::{icon, nav_bar, segmented_button};
 
@@ -290,6 +290,9 @@ pub enum Message {
     EditorFootnote,
     /// Delete the word before (false) or after (true) the cursor.
     EditorDeleteWord(bool),
+    /// A bracket/quote was typed: pair it around the selection, or insert
+    /// the pair with the cursor in the middle.
+    EditorAutoPair(char),
     Save,
     ToggleFolder(String),
     ToggleFold(u64),
@@ -523,6 +526,88 @@ fn count_words(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
+// --- auto-pairs -----------------------------------------------------------
+
+/// The bracket/quote pairs that are typed as a pair. `None` for every
+/// other character. Both members map to the same pair, so a closing
+/// bracket can be recognised (and stepped over).
+fn pair_for(typed: char) -> Option<(char, char)> {
+    match typed {
+        '(' | ')' => Some(('(', ')')),
+        '[' | ']' => Some(('[', ']')),
+        '{' | '}' => Some(('{', '}')),
+        '"' => Some(('"', '"')),
+        '\'' => Some(('\'', '\'')),
+        '`' => Some(('`', '`')),
+        _ => None,
+    }
+}
+
+/// The character at a cursor position. Iced cursor columns are byte
+/// offsets within the line (cosmic-text glyph indices).
+fn char_at(text: &str, pos: Position) -> Option<char> {
+    let line = text.split('\n').nth(pos.line)?;
+    line.get(pos.column..)?.chars().next()
+}
+
+/// The character just before a cursor position.
+fn char_before(text: &str, pos: Position) -> Option<char> {
+    let line = text.split('\n').nth(pos.line)?;
+    line.get(..pos.column)?.chars().next_back()
+}
+
+/// The editor actions for a typed bracket/quote:
+/// - a selection is wrapped in the pair,
+/// - typing the closing character right before the same character steps
+///   over it instead of duplicating it,
+/// - quotes only pair at word boundaries, so an apostrophe inside a word
+///   stays a plain character ("don't" must not become "don''t"),
+/// - otherwise the pair is inserted with the cursor between the markers.
+fn autopair_actions(
+    text: &str,
+    cursor: Cursor,
+    typed: char,
+    selection: Option<String>,
+) -> Vec<Action> {
+    let Some((open, close)) = pair_for(typed) else {
+        return Vec::new();
+    };
+    let is_opener = typed == open;
+
+    // A selection is wrapped in the pair (openers only).
+    if let Some(sel) = selection.filter(|s| !s.is_empty()) {
+        let wrapped = if is_opener {
+            format!("{open}{sel}{close}")
+        } else {
+            typed.to_string()
+        };
+        return vec![Action::Edit(Edit::Paste(Arc::new(wrapped)))];
+    }
+
+    // Typing the closing character right before the same character steps
+    // over it instead of duplicating it.
+    if typed == close && char_at(text, cursor.position) == Some(close) {
+        return vec![Action::Move(Motion::Right)];
+    }
+
+    // A closing bracket on its own is just the character.
+    if !is_opener {
+        return vec![Action::Edit(Edit::Insert(typed))];
+    }
+
+    // Quotes only pair at word boundaries, so an apostrophe inside a word
+    // stays a plain character ("don't" must not become "don''t").
+    if open == close && char_before(text, cursor.position).is_some_and(|c| c.is_alphanumeric()) {
+        return vec![Action::Edit(Edit::Insert(typed))];
+    }
+
+    // Otherwise insert the pair with the cursor between the markers.
+    vec![
+        Action::Edit(Edit::Paste(Arc::new(format!("{open}{close}")))),
+        Action::Move(Motion::Left),
+    ]
+}
+
 /// Map an editor key press to a shortcut message, or `None` to fall
 /// through (the caller then defers to the editor's default bindings).
 /// Only fires while the editor is focused, so quick-switcher and global
@@ -558,6 +643,17 @@ pub(crate) fn editor_shortcut(press: text_editor::KeyPress) -> Option<Message> {
         }
         cosmic::iced::keyboard::Key::Named(Named::Delete) if ctrl => {
             Some(Message::EditorDeleteWord(true))
+        }
+        cosmic::iced::keyboard::Key::Character(_) => {
+            // A plainly typed bracket/quote: pair it. The produced text
+            // (not the raw key) tells us which character was typed, so
+            // shifted symbols work on any layout.
+            let typed = press
+                .text
+                .as_deref()
+                .and_then(|t| t.chars().find(|c| !c.is_control()))?;
+            pair_for(typed)?;
+            Some(Message::EditorAutoPair(typed))
         }
         _ => None,
     }
@@ -955,6 +1051,9 @@ impl VaultNotes {
     /// Perform a multi-action editor command (formatting, word delete) as
     /// one undoable step, then refresh derived state.
     fn run_editor_command(&mut self, idx: usize, actions: Vec<Action>) {
+        if actions.is_empty() {
+            return;
+        }
         let was_dirty = self.tabs[idx].is_dirty();
         {
             let tab = &mut self.tabs[idx];
@@ -1547,6 +1646,16 @@ impl cosmic::Application for VaultNotes {
                 if let Some(idx) = self.active {
                     let has_selection = self.tabs[idx].content.selection().is_some();
                     let actions = word_delete_actions(has_selection, right);
+                    self.run_editor_command(idx, actions);
+                }
+                Task::none()
+            }
+            Message::EditorAutoPair(typed) => {
+                if let Some(idx) = self.active {
+                    let text = self.tabs[idx].content.text();
+                    let cursor = self.tabs[idx].content.cursor();
+                    let selection = self.tabs[idx].content.selection();
+                    let actions = autopair_actions(&text, cursor, typed, selection);
                     self.run_editor_command(idx, actions);
                 }
                 Task::none()
@@ -2365,5 +2474,135 @@ mod editor_tests {
         assert_eq!(count_words(""), 0);
         assert_eq!(count_words("hello"), 1);
         assert_eq!(count_words("  two  words\nand more "), 4);
+    }
+}
+
+#[cfg(test)]
+mod autopair_tests {
+    use super::*;
+
+    /// A cursor at a line/byte-column position.
+    fn cursor_at(line: usize, column: usize) -> Cursor {
+        Cursor {
+            position: Position { line, column },
+            selection: None,
+        }
+    }
+
+    #[test]
+    fn pair_table_covers_brackets_and_quotes() {
+        assert_eq!(pair_for('('), Some(('(', ')')));
+        assert_eq!(pair_for(')'), Some(('(', ')')));
+        assert_eq!(pair_for('['), Some(('[', ']')));
+        assert_eq!(pair_for(']'), Some(('[', ']')));
+        assert_eq!(pair_for('{'), Some(('{', '}')));
+        assert_eq!(pair_for('}'), Some(('{', '}')));
+        assert_eq!(pair_for('"'), Some(('"', '"')));
+        assert_eq!(pair_for('\''), Some(('\'', '\'')));
+        assert_eq!(pair_for('`'), Some(('`', '`')));
+        assert_eq!(pair_for('a'), None);
+    }
+
+    #[test]
+    fn char_helpers_read_around_the_cursor() {
+        let text = "ab\ncd\n";
+        assert_eq!(char_at(text, Position { line: 0, column: 0 }), Some('a'));
+        assert_eq!(char_at(text, Position { line: 0, column: 2 }), None);
+        assert_eq!(char_at(text, Position { line: 1, column: 1 }), Some('d'));
+        assert_eq!(char_before(text, Position { line: 1, column: 0 }), None);
+        assert_eq!(
+            char_before(text, Position { line: 1, column: 1 }),
+            Some('c')
+        );
+        // Columns are byte offsets: the 'é' occupies two bytes.
+        let text = "héllo";
+        assert_eq!(
+            char_before(text, Position { line: 0, column: 3 }),
+            Some('é')
+        );
+        assert_eq!(char_at(text, Position { line: 0, column: 3 }), Some('l'));
+    }
+
+    #[test]
+    fn a_selection_is_wrapped_in_the_pair() {
+        assert_eq!(
+            autopair_actions(
+                "hello world\n",
+                cursor_at(0, 0),
+                '(',
+                Some("world".to_string())
+            ),
+            vec![Action::Edit(Edit::Paste(Arc::new("(world)".to_string())))]
+        );
+        assert_eq!(
+            autopair_actions("x\n", cursor_at(0, 0), '"', Some("q".to_string())),
+            vec![Action::Edit(Edit::Paste(Arc::new("\"q\"".to_string())))]
+        );
+    }
+
+    #[test]
+    fn without_a_selection_the_pair_is_inserted() {
+        assert_eq!(
+            autopair_actions("", cursor_at(0, 0), '(', None),
+            vec![
+                Action::Edit(Edit::Paste(Arc::new("()".to_string()))),
+                Action::Move(Motion::Left),
+            ]
+        );
+    }
+
+    #[test]
+    fn typing_the_closer_steps_over_it() {
+        // The cursor sits before the ")" of "()" — typing ")" moves past it.
+        assert_eq!(
+            autopair_actions("()", cursor_at(0, 1), ')', None),
+            vec![Action::Move(Motion::Right)]
+        );
+        // Not before a closer: the character is simply inserted.
+        assert_eq!(
+            autopair_actions("x", cursor_at(0, 1), ')', None),
+            vec![Action::Edit(Edit::Insert(')'))]
+        );
+    }
+
+    #[test]
+    fn quotes_do_not_pair_inside_a_word() {
+        // An apostrophe inside a word stays a plain character.
+        assert_eq!(
+            autopair_actions("don", cursor_at(0, 3), '\'', None),
+            vec![Action::Edit(Edit::Insert('\''))]
+        );
+        // After a space (or at the start) they pair.
+        assert_eq!(
+            autopair_actions("don ", cursor_at(0, 4), '\'', None).len(),
+            2
+        );
+        assert_eq!(autopair_actions("", cursor_at(0, 0), '"', None).len(), 2);
+    }
+
+    #[test]
+    fn typing_a_pair_end_to_end_does_not_duplicate_closers() {
+        let mut tab = Tab::open("t.md".to_string(), "");
+        // Type "(" → "()" with the cursor in the middle.
+        for action in autopair_actions("", tab.content.cursor(), '(', None) {
+            tab.content.perform(action);
+        }
+        assert_eq!(tab.content.text(), "()");
+        // Type ")" → the cursor steps over the existing closer.
+        for action in autopair_actions(&tab.content.text(), tab.content.cursor(), ')', None) {
+            tab.content.perform(action);
+        }
+        assert_eq!(tab.content.text(), "()");
+        // The cursor now sits after the pair, so a new opener starts there.
+        for action in autopair_actions(&tab.content.text(), tab.content.cursor(), '[', None) {
+            tab.content.perform(action);
+        }
+        assert_eq!(tab.content.text(), "()[]");
+        // Typing the closer of that pair steps over it too.
+        for action in autopair_actions(&tab.content.text(), tab.content.cursor(), ']', None) {
+            tab.content.perform(action);
+        }
+        assert_eq!(tab.content.text(), "()[]");
+        tab.refresh_doc();
     }
 }

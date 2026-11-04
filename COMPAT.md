@@ -391,3 +391,55 @@ now `-p vault-glass -p vault-core -p vault-md -p app -p vault-web`).
   now use the tan accent instead of blue; `mark` uses bg-accent.
   CSP is unchanged (still no script; the inline stylesheet remains the
   only style exception).
+
+## GUI chrome + editor polish (M4c follow-up)
+
+Follow-up pass on the desktop app after user testing: COSMIC-native
+chrome, readable spacing, and standard editing shortcuts.
+
+- **Chrome**: the sidebar panel switcher is a real COSMIC nav bar (icon +
+  label per panel: folder/edit-find/edit-tag/link/view-list `-symbolic`),
+  the Source/Reading/Split switcher is a single-select segmented control,
+  and open notes use the COSMIC tab strip (real close buttons, dirty dot
+  in the label). The nav bar's default style paints a solid
+  `primary.base` surface and fills the parent height; both are overridden
+  (transparent, shrink-to-fit) so the sidebar reads as one surface. Tree
+  rows use chevron/folder/file icons, search hits show title +
+  `path:line` + snippet, and the reading pane centers the document at
+  ~46rem (736 px) with padding.
+- **Editor surface**: the text editor's border is 1 px (it was a full
+  `space_xxxs`, 4 px) and the text is inset from it; the reading pane
+  has padding around the document column.
+- **Frontmatter** in the reading view is collapsible (a `▾ Frontmatter`
+  toggle, default open) and reuses the callout fold mechanism under a
+  fixed sentinel fold id that never collides with block fold ids.
+- **Status bar** under the note area shows the active tab's word and
+  character counts. Both are cached on the tab and refreshed with the
+  document — never recomputed per frame.
+- **Editor shortcuts** are editor-scoped (iced `text_editor.key_binding`,
+  falling back to the editor's own bindings for everything else; custom
+  bindings capture their events, so global shortcuts are unaffected):
+  - Undo/redo: Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y. iced's editor has no
+    history, so the app keeps a per-tab snapshot stack (text + cursor
+    before each edit, capped at 100 entries, cleared when an external
+    reload replaces the buffer). Snapshots are restored through
+    `Content::with_text` + `move_to`.
+  - Formatting: Ctrl+B `**bold**`, Ctrl+I `*italic*`, Ctrl+K `[link]()`,
+    Ctrl+` `` `code` ``, Ctrl+Shift+X `~~strike~~`, Ctrl+Shift+H
+    `==highlight==`. With a selection the markers wrap it; without one
+    the empty markers are inserted and the cursor lands between them (for
+    links, inside the parentheses).
+  - Footnotes: Ctrl+Shift+F inserts a `[^N]` reference at the cursor and
+    appends `[^N]: ` at the end of the document. N is the first number
+    without an existing `[^N]:` definition — bare references do not
+    reserve a number.
+  - Word delete: Ctrl+Backspace / Ctrl+Delete select the word next to the
+    cursor and delete it (a lone Backspace/Delete when a selection
+    already exists).
+- **Auto-pairs**: typing `(`, `[`, `{`, `"`, `'` or `` ` `` wraps the
+  current selection in the pair, or inserts the pair with the cursor
+  between the markers. Typing the closing character right before the
+  same character steps over it instead of duplicating it. Quotes only
+  pair at word boundaries, so an apostrophe inside a word stays a plain
+  character ("don't" is never "don''t"). The pair table is one function
+  (`pair_for`).
