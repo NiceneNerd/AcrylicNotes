@@ -89,6 +89,19 @@ pub struct Switcher {
 /// Id of the switcher's text input (so it can be focused on open).
 pub const SWITCHER_INPUT: &str = "switcher-input";
 
+/// Id of the find bar's text input (focused when find opens).
+pub const FIND_INPUT: &str = "find-input";
+
+/// State of the in-note find bar (Ctrl+F).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Find {
+    pub query: String,
+    pub replacement: String,
+    pub case_sensitive: bool,
+    /// Index of the selected match (clamped against the live match list).
+    pub current: usize,
+}
+
 /// Cap on vault-wide search results shown.
 pub const SEARCH_MAX_HITS: usize = 200;
 
@@ -307,6 +320,19 @@ pub enum Message {
     EditorFormat(Format),
     /// Insert a footnote reference at the cursor and append its definition.
     EditorFootnote,
+    // --- find in current note (Ctrl+F) ---
+    /// Open (or refocus) the find bar, prefilling from the selection.
+    FindOpen,
+    FindInput(String),
+    FindClose,
+    FindNext,
+    FindPrev,
+    FindToggleCase,
+    FindReplaceInput(String),
+    /// Replace the selected match.
+    FindReplace,
+    /// Replace every match in the active tab.
+    FindReplaceAll,
     /// Delete the word before (false) or after (true) the cursor.
     EditorDeleteWord(bool),
     /// A bracket/quote was typed: pair it around the selection, or insert
@@ -376,6 +402,8 @@ pub struct VaultNotes {
     pub hide_md_extension: bool,
     /// Pending inline tree edit (new note / new folder / rename), if any.
     pub tree_edit: Option<tree::TreeEdit>,
+    /// The in-note find bar state (Ctrl+F), when open.
+    pub find: Option<Find>,
     /// The node path the open context menu belongs to (`None` when closed).
     pub tree_menu_target: Option<String>,
     // --- COSMIC chrome models ---
@@ -556,6 +584,112 @@ fn count_words(text: &str) -> usize {
 /// inputs has focus: their keys are exactly what the global handler routes.
 fn global_key_allowed(status: cosmic::iced::event::Status, overlay_input_open: bool) -> bool {
     !matches!(status, cosmic::iced::event::Status::Captured) || overlay_input_open
+}
+
+// --- find in current note ---------------------------------------------------
+
+/// One query hit: a line index and byte columns within that line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TextMatch {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Every occurrence of `query` in `text`, in order. Queries are matched
+/// within single lines (a newline in the query matches nothing); columns
+/// are byte offsets, like the editor's cursor columns.
+pub(crate) fn find_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<TextMatch> {
+    if query.is_empty() || query.contains('\n') {
+        return Vec::new();
+    }
+    let query_chars: Vec<char> = query.chars().collect();
+    let mut out = Vec::new();
+    for (line_no, line) in text.split('\n').enumerate() {
+        let mut at = 0usize;
+        while at <= line.len() {
+            if !line.is_char_boundary(at) {
+                at += 1;
+                continue;
+            }
+            let mut probe = at;
+            let mut hit = true;
+            for &expected in &query_chars {
+                match line[probe..].chars().next() {
+                    Some(c) if char_matches(c, expected, case_sensitive) => {
+                        probe += c.len_utf8();
+                    }
+                    _ => {
+                        hit = false;
+                        break;
+                    }
+                }
+            }
+            if hit {
+                out.push(TextMatch {
+                    line: line_no,
+                    start: at,
+                    end: probe,
+                });
+                at = probe;
+            } else {
+                at += line[at..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+    }
+    out
+}
+
+/// Character equality under the find bar's case sensitivity. Only ASCII
+/// case folding is applied, which keeps byte offsets stable.
+fn char_matches(a: char, b: char, case_sensitive: bool) -> bool {
+    a == b || (!case_sensitive && a.eq_ignore_ascii_case(&b))
+}
+
+/// Index of the first match at or after a cursor position (0 when the
+/// cursor is past every match).
+fn first_at_or_after(matches: &[TextMatch], line: usize, column: usize) -> usize {
+    matches
+        .iter()
+        .position(|m| (m.line, m.start) >= (line, column))
+        .unwrap_or(0)
+}
+
+/// The next (or previous) match index, wrapping around.
+fn next_index(len: usize, current: usize, forward: bool) -> usize {
+    if len == 0 {
+        0
+    } else if forward {
+        (current + 1) % len
+    } else {
+        (current + len - 1) % len
+    }
+}
+
+/// Splice `replacement` over every span (all within single lines,
+/// non-overlapping, in order).
+fn replace_spans(text: &str, spans: &[TextMatch], replacement: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in lines.iter().enumerate() {
+        let mut copied = 0usize;
+        let mut touched = false;
+        for span in spans.iter().filter(|m| m.line == i) {
+            out.push_str(&line[copied..span.start]);
+            out.push_str(replacement);
+            copied = span.end;
+            touched = true;
+        }
+        if touched {
+            out.push_str(&line[copied..]);
+        } else {
+            out.push_str(line);
+        }
+        if i + 1 < lines.len() {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 // --- auto-pairs -----------------------------------------------------------
@@ -843,9 +977,9 @@ impl VaultNotes {
     }
 
     /// Whether one of the app's own text inputs (quick switcher, inline
-    /// tree rename) currently owns the keyboard.
+    /// tree rename, find bar) currently owns the keyboard.
     fn overlay_input_open(&self) -> bool {
-        self.switcher.open || self.tree_edit.is_some()
+        self.switcher.open || self.tree_edit.is_some() || self.find.is_some()
     }
 
     /// Push the current window title to the platform.
@@ -1122,6 +1256,166 @@ impl VaultNotes {
         self.last_edit = Some(std::time::Instant::now());
         if self.tabs[idx].is_dirty() != was_dirty {
             self.sync_tab_text(idx);
+        }
+    }
+
+    /// Select find match `index` in the active tab (cursor at its end, the
+    /// editor's selection highlighting it).
+    fn select_match(&mut self, index: usize) {
+        let (query, case) = match self.find.as_ref() {
+            Some(find) => (find.query.clone(), find.case_sensitive),
+            None => return,
+        };
+        let Some(idx) = self.active else {
+            return;
+        };
+        let text = self.tabs[idx].content.text();
+        let matches = find_matches(&text, &query, case);
+        let Some(found) = matches.get(index).copied() else {
+            return;
+        };
+        self.tabs[idx].content.move_to(Cursor {
+            position: Position {
+                line: found.line,
+                column: found.end,
+            },
+            selection: Some(Position {
+                line: found.line,
+                column: found.start,
+            }),
+        });
+        if let Some(find) = self.find.as_mut() {
+            find.current = index;
+        }
+    }
+
+    /// Step to the next (or previous) match, wrapping around.
+    fn find_step(&mut self, forward: bool) {
+        let (query, case, current) = match self.find.as_ref() {
+            Some(find) => (find.query.clone(), find.case_sensitive, find.current),
+            None => return,
+        };
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let text = tab.content.text();
+        let len = find_matches(&text, &query, case).len();
+        if len == 0 {
+            return;
+        }
+        self.select_match(next_index(len, current, forward));
+    }
+
+    /// Jump the find selection to the first match at or after the editor's
+    /// current selection anchor (or cursor).
+    fn find_jump_to_cursor(&mut self) {
+        let anchor = self.active_tab().map(|tab| {
+            let cursor = tab.content.cursor();
+            cursor.selection.unwrap_or(cursor.position)
+        });
+        let Some(anchor) = anchor else {
+            return;
+        };
+        let (query, case) = match self.find.as_ref() {
+            Some(find) => (find.query.clone(), find.case_sensitive),
+            None => return,
+        };
+        let index = self
+            .active_tab()
+            .map(|tab| {
+                let text = tab.content.text();
+                first_at_or_after(
+                    &find_matches(&text, &query, case),
+                    anchor.line,
+                    anchor.column,
+                )
+            })
+            .unwrap_or(0);
+        self.select_match(index);
+    }
+
+    /// Replace find match `index` in the active tab (one undoable step),
+    /// then point the selection at the following match.
+    fn find_replace_one(&mut self, index: usize) {
+        let (query, case, replacement) = match self.find.as_ref() {
+            Some(find) => (
+                find.query.clone(),
+                find.case_sensitive,
+                find.replacement.clone(),
+            ),
+            None => return,
+        };
+        let Some(idx) = self.active else {
+            return;
+        };
+        let text = self.tabs[idx].content.text();
+        let matches = find_matches(&text, &query, case);
+        let Some(found) = matches.get(index).copied() else {
+            return;
+        };
+        let was_dirty = self.tabs[idx].is_dirty();
+        {
+            let tab = &mut self.tabs[idx];
+            push_undo(tab);
+            let new_text = replace_spans(&text, &[found], &replacement);
+            tab.content = Content::with_text(&new_text);
+            tab.content.move_to(Cursor {
+                position: Position {
+                    line: found.line,
+                    column: found.start + replacement.len(),
+                },
+                selection: None,
+            });
+            tab.refresh_doc();
+        }
+        self.last_edit = Some(std::time::Instant::now());
+        if self.tabs[idx].is_dirty() != was_dirty {
+            self.sync_tab_text(idx);
+        }
+        // The next match (if any) now sits at the same index.
+        let text = self.tabs[idx].content.text();
+        let len = find_matches(&text, &query, case).len();
+        if let Some(find) = self.find.as_mut() {
+            find.current = len.min(index);
+        }
+        self.select_match(self.find.as_ref().map_or(0, |f| f.current));
+    }
+
+    /// Replace every match in the active tab (one undoable step).
+    fn find_replace_all(&mut self) {
+        let (query, case, replacement) = match self.find.as_ref() {
+            Some(find) => (
+                find.query.clone(),
+                find.case_sensitive,
+                find.replacement.clone(),
+            ),
+            None => return,
+        };
+        if query.is_empty() {
+            return;
+        }
+        let Some(idx) = self.active else {
+            return;
+        };
+        let text = self.tabs[idx].content.text();
+        let matches = find_matches(&text, &query, case);
+        if matches.is_empty() {
+            return;
+        }
+        let was_dirty = self.tabs[idx].is_dirty();
+        {
+            let tab = &mut self.tabs[idx];
+            push_undo(tab);
+            let new_text = replace_spans(&text, &matches, &replacement);
+            tab.content = Content::with_text(&new_text);
+            tab.refresh_doc();
+        }
+        self.last_edit = Some(std::time::Instant::now());
+        if self.tabs[idx].is_dirty() != was_dirty {
+            self.sync_tab_text(idx);
+        }
+        if let Some(find) = self.find.as_mut() {
+            find.current = 0;
         }
     }
     /// A tree context-menu command, applied to the node the menu was opened
@@ -1461,6 +1755,7 @@ impl cosmic::Application for VaultNotes {
             hide_md_extension: settings::load().hide_md_extension,
             tree_edit: None,
             tree_menu_target: None,
+            find: None,
             nav_model: build_nav_model(),
             pane_model: build_pane_model(),
             tab_model: segmented_button::Model::default(),
@@ -1720,6 +2015,62 @@ impl cosmic::Application for VaultNotes {
                 }
                 Task::none()
             }
+            Message::FindOpen => {
+                let mut find = self.find.take().unwrap_or_default();
+                // Prefill from a single-line selection.
+                if let Some(sel) = self.active_tab().and_then(|tab| tab.content.selection()) {
+                    if !sel.is_empty() && !sel.contains('\n') {
+                        find.query = sel;
+                    }
+                }
+                self.find = Some(find);
+                self.find_jump_to_cursor();
+                cosmic::widget::text_input::focus::<Message>(Id::new(FIND_INPUT))
+                    .map(cosmic::Action::App)
+            }
+            Message::FindInput(value) => {
+                if let Some(find) = self.find.as_mut() {
+                    find.query = value;
+                    find.current = 0;
+                }
+                self.find_jump_to_cursor();
+                Task::none()
+            }
+            Message::FindClose => {
+                self.find = None;
+                Task::none()
+            }
+            Message::FindNext => {
+                self.find_step(true);
+                Task::none()
+            }
+            Message::FindPrev => {
+                self.find_step(false);
+                Task::none()
+            }
+            Message::FindToggleCase => {
+                if let Some(find) = self.find.as_mut() {
+                    find.case_sensitive = !find.case_sensitive;
+                    find.current = 0;
+                }
+                self.find_jump_to_cursor();
+                Task::none()
+            }
+            Message::FindReplaceInput(value) => {
+                if let Some(find) = self.find.as_mut() {
+                    find.replacement = value;
+                }
+                Task::none()
+            }
+            Message::FindReplace => {
+                let current = self.find.as_ref().map_or(0, |f| f.current);
+                self.find_replace_one(current);
+                Task::none()
+            }
+            Message::FindReplaceAll => {
+                self.find_replace_all();
+                Task::none()
+            }
             Message::Save => self.save_active(),
             Message::ToggleFolder(path) => {
                 if !self.collapsed.remove(&path) {
@@ -1921,17 +2272,31 @@ impl cosmic::Application for VaultNotes {
                         Key::Named(Named::Escape) => self.update(Message::TreeEditCancel),
                         _ => Task::none(),
                     }
+                } else if self.find.is_some() {
+                    match key {
+                        Key::Named(Named::Enter) if modifiers.shift() => {
+                            self.update(Message::FindPrev)
+                        }
+                        Key::Named(Named::Enter) => self.update(Message::FindNext),
+                        Key::Named(Named::Escape) => self.update(Message::FindClose),
+                        _ => Task::none(),
+                    }
                 } else if modifiers.control() {
                     match &key {
                         Key::Character(c) if c == "p" => self.update(Message::SwitcherToggle),
                         Key::Character(c) if c == "s" => self.save_active(),
                         Key::Character(c) if c == "d" => self.update(Message::DailyNote),
-                        // Ctrl+F only: lowercase arrives on every layout
-                        // without Shift, and matching "F" here would
-                        // double-fire for Ctrl+Shift chords.
-                        Key::Character(c) if c == "f" => {
+                        // Ctrl+F = find in the current note; Ctrl+Shift+F =
+                        // the vault-wide search panel. Shifted keys arrive
+                        // as either case depending on the layout, so both
+                        // spellings route to the search panel.
+                        Key::Character(c) if c == "f" && modifiers.shift() => {
                             self.update(Message::SidePanel(SidePanel::Search))
                         }
+                        Key::Character(c) if c == "F" => {
+                            self.update(Message::SidePanel(SidePanel::Search))
+                        }
+                        Key::Character(c) if c == "f" => self.update(Message::FindOpen),
                         Key::Character(c) if c == "w" => match self.active {
                             Some(idx) => self.update(Message::TabClose(idx)),
                             None => Task::none(),
@@ -2692,5 +3057,231 @@ mod autopair_tests {
         }
         assert_eq!(tab.content.text(), "()[]");
         tab.refresh_doc();
+    }
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::*;
+
+    #[test]
+    fn find_matches_scans_lines_with_case_handling() {
+        let text = "Alpha alpha\nbeta ALPHA\n";
+        // Case-insensitive (default): every occurrence, in order.
+        assert_eq!(
+            find_matches(text, "alpha", false),
+            vec![
+                TextMatch {
+                    line: 0,
+                    start: 0,
+                    end: 5
+                },
+                TextMatch {
+                    line: 0,
+                    start: 6,
+                    end: 11
+                },
+                TextMatch {
+                    line: 1,
+                    start: 5,
+                    end: 10
+                },
+            ]
+        );
+        // Case-sensitive: only the exact ones.
+        assert_eq!(
+            find_matches(text, "alpha", true),
+            vec![TextMatch {
+                line: 0,
+                start: 6,
+                end: 11
+            }]
+        );
+    }
+
+    #[test]
+    fn find_matches_edge_cases() {
+        // Empty and multi-line queries match nothing.
+        assert!(find_matches("text", "", false).is_empty());
+        assert!(find_matches("text", "a\nb", false).is_empty());
+        // Columns are byte offsets: é is two bytes.
+        let text = "café café";
+        let hits = find_matches(text, "café", false);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[1].start, 6);
+        // Adjacent, non-overlapping occurrences.
+        assert_eq!(find_matches("aaaa", "aa", false).len(), 2);
+    }
+
+    #[test]
+    fn navigation_indices_wrap() {
+        assert_eq!(first_at_or_after(&[], 0, 0), 0);
+        let matches = vec![
+            TextMatch {
+                line: 0,
+                start: 0,
+                end: 1,
+            },
+            TextMatch {
+                line: 0,
+                start: 4,
+                end: 5,
+            },
+            TextMatch {
+                line: 2,
+                start: 0,
+                end: 1,
+            },
+        ];
+        assert_eq!(first_at_or_after(&matches, 0, 0), 0);
+        assert_eq!(first_at_or_after(&matches, 0, 4), 1);
+        assert_eq!(first_at_or_after(&matches, 1, 0), 2);
+        assert_eq!(first_at_or_after(&matches, 5, 0), 0);
+        assert_eq!(next_index(3, 0, true), 1);
+        assert_eq!(next_index(3, 2, true), 0);
+        assert_eq!(next_index(3, 0, false), 2);
+        assert_eq!(next_index(0, 5, true), 0);
+    }
+
+    #[test]
+    fn replace_splices_are_byte_exact() {
+        let text = "one two one\nthree\n";
+        let replaced = replace_spans(
+            &text,
+            &[TextMatch {
+                line: 0,
+                start: 4,
+                end: 7,
+            }],
+            "2",
+        );
+        assert_eq!(replaced, "one 2 one\nthree\n");
+        // Every occurrence at once, including the trailing newline.
+        let all = replace_spans(
+            &text,
+            &[
+                TextMatch {
+                    line: 0,
+                    start: 0,
+                    end: 3,
+                },
+                TextMatch {
+                    line: 0,
+                    start: 8,
+                    end: 11,
+                },
+            ],
+            "1",
+        );
+        assert_eq!(all, "1 two 1\nthree\n");
+    }
+
+    #[test]
+    fn find_replace_one_replaces_and_advances() {
+        let mut app = test_app_with_tab("dot dot dot\n");
+        let find = Find {
+            query: "dot".to_string(),
+            replacement: "spot".to_string(),
+            ..Find::default()
+        };
+        app.find = Some(find);
+        // First match.
+        app.select_match(0);
+        app.find_replace_one(0);
+        assert_eq!(app.tabs[0].content.text(), "spot dot dot\n");
+        // The selection advanced to the following match.
+        assert_eq!(app.find.as_ref().unwrap().current, 0);
+        // Replace remaining.
+        app.find_replace_one(0);
+        app.find_replace_one(0);
+        assert_eq!(app.tabs[0].content.text(), "spot spot spot\n");
+        // Undo rolls the last replacement back.
+        let tab = &mut app.tabs[0];
+        assert!(undo_tab(tab));
+        assert_eq!(tab.content.text(), "spot spot dot\n");
+    }
+
+    #[test]
+    fn find_replace_all_replaces_everything_in_one_step() {
+        let mut app = test_app_with_tab("aXbXc\nX\n");
+        app.find = Some(Find {
+            query: "X".to_string(),
+            replacement: "Y".to_string(),
+            ..Find::default()
+        });
+        app.find_replace_all();
+        assert_eq!(app.tabs[0].content.text(), "aYbYc\nY\n");
+        // The whole batch is one undo.
+        let tab = &mut app.tabs[0];
+        assert!(undo_tab(tab));
+        assert_eq!(tab.content.text(), "aXbXc\nX\n");
+    }
+
+    #[test]
+    fn find_step_selects_matches_in_the_editor() {
+        let mut app = test_app_with_tab("one two one\n");
+        app.find = Some(Find {
+            query: "one".to_string(),
+            ..Find::default()
+        });
+        // Opening jumps to the first match at/after the cursor: match 0.
+        app.find_jump_to_cursor();
+        let cursor = app.tabs[0].content.cursor();
+        assert_eq!(cursor.selection, Some(Position { line: 0, column: 0 }));
+        assert_eq!(cursor.position, Position { line: 0, column: 3 });
+        // Next wraps forward to the second match.
+        app.find_step(true);
+        let cursor = app.tabs[0].content.cursor();
+        assert_eq!(cursor.selection, Some(Position { line: 0, column: 8 }));
+        assert_eq!(
+            cursor.position,
+            Position {
+                line: 0,
+                column: 11
+            }
+        );
+        // Previous wraps back around to the first.
+        app.find_step(false);
+        let cursor = app.tabs[0].content.cursor();
+        assert_eq!(cursor.selection, Some(Position { line: 0, column: 0 }));
+        assert_eq!(cursor.position, Position { line: 0, column: 3 });
+    }
+
+    /// A minimal app with one open tab, for find tests.
+    fn test_app_with_tab(text: &str) -> VaultNotes {
+        let mut app = VaultNotes {
+            core: cosmic::app::Core::default(),
+            vault: None,
+            index: VaultIndex::new(Vec::<String>::new()),
+            vault_name: String::new(),
+            tree: Vec::new(),
+            collapsed: HashSet::new(),
+            tabs: Vec::new(),
+            active: None,
+            pane: PaneMode::default(),
+            banner: None,
+            error: None,
+            vault_input: String::new(),
+            strict_breaks: false,
+            images: RefCell::new(std::collections::HashMap::new()),
+            panel: SidePanel::default(),
+            search_query: String::new(),
+            search_hits: Vec::new(),
+            selected_tag: None,
+            switcher: Switcher::default(),
+            last_edit: None,
+            glass_style: vault_glass::GlassStyle::Opaque,
+            theme: settings::ThemeChoice::default(),
+            hide_md_extension: true,
+            tree_edit: None,
+            tree_menu_target: None,
+            find: None,
+            nav_model: build_nav_model(),
+            pane_model: build_pane_model(),
+            tab_model: segmented_button::Model::default(),
+        };
+        app.tabs.push(Tab::open("t.md".to_string(), text));
+        app.active = Some(0);
+        app
     }
 }

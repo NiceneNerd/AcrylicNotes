@@ -14,8 +14,8 @@ use cosmic::widget::{
 use cosmic::Element;
 
 use crate::app::{
-    editor_shortcut, parent_of, title_of, tree_note_label, Message, Palette, PaneMode, SidePanel,
-    TreeMenuAction, VaultNotes, SWITCHER_INPUT, TREE_EDIT_INPUT,
+    editor_shortcut, find_matches, parent_of, title_of, tree_note_label, Message, Palette,
+    PaneMode, SidePanel, TreeMenuAction, VaultNotes, FIND_INPUT, SWITCHER_INPUT, TREE_EDIT_INPUT,
 };
 use crate::reading;
 use crate::scroll::READING_SCROLL;
@@ -632,6 +632,9 @@ fn note_area<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
         .width(Length::Fill)
         .height(Length::Fill);
     col = col.push(tab_bar(app, palette));
+    if app.find.is_some() {
+        col = col.push(find_bar(app, palette));
+    }
     let content: Element<'_, Message> = match app.pane {
         PaneMode::Source => editor_pane(tab, palette),
         PaneMode::Reading => reading_pane(app, tab, palette),
@@ -660,6 +663,72 @@ fn tab_bar<'a>(app: &'a VaultNotes, _palette: Palette) -> Element<'a, Message> {
         .on_activate(Message::TabActivated)
         .on_close(Message::TabCloseRequested)
         .into()
+}
+
+/// The in-note find bar (Ctrl+F): query, live count, prev/next, case
+/// toggle, close — plus a replace row. Keys are routed globally while it
+/// is open (Enter next, Shift+Enter previous, Esc close).
+fn find_bar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+    let find = app.find.as_ref().expect("find bar rendered without state");
+    let buffer = app
+        .active_tab()
+        .map(|tab| tab.content.text())
+        .unwrap_or_default();
+    let matches = find_matches(&buffer, &find.query, find.case_sensitive);
+    let count = if find.query.is_empty() {
+        "—".to_string()
+    } else if matches.is_empty() {
+        "0 of 0".to_string()
+    } else {
+        format!(
+            "{} of {}",
+            find.current.min(matches.len() - 1) + 1,
+            matches.len()
+        )
+    };
+
+    let case_btn = if find.case_sensitive {
+        button::suggested("Aa")
+    } else {
+        button::text("Aa")
+    };
+
+    let mut col = column::Column::new().spacing(4);
+    col = col.push(
+        row::Row::new()
+            .spacing(6)
+            .align_y(alignment::Vertical::Center)
+            .push(
+                text_input("Find", &find.query)
+                    .id(Id::new(FIND_INPUT))
+                    .on_input(Message::FindInput)
+                    .width(Length::Fill),
+            )
+            .push(text(count).size(12).class(palette.muted))
+            .push(button::icon(icon::from_name("go-up-symbolic")).on_press(Message::FindPrev))
+            .push(button::icon(icon::from_name("go-down-symbolic")).on_press(Message::FindNext))
+            .push(
+                case_btn
+                    .on_press(Message::FindToggleCase)
+                    .height(Length::Shrink),
+            )
+            .push(
+                button::icon(icon::from_name("window-close-symbolic")).on_press(Message::FindClose),
+            ),
+    );
+    col = col.push(
+        row::Row::new()
+            .spacing(6)
+            .align_y(alignment::Vertical::Center)
+            .push(
+                text_input("Replace", &find.replacement)
+                    .on_input(Message::FindReplaceInput)
+                    .width(Length::Fill),
+            )
+            .push(button::text("Replace").on_press(Message::FindReplace))
+            .push(button::text("All").on_press(Message::FindReplaceAll)),
+    );
+    container(col).padding([6, 12]).width(Length::Fill).into()
 }
 
 // --- panes -----------------------------------------------------------------
