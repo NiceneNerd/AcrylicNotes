@@ -14,8 +14,8 @@ use cosmic::widget::{
 use cosmic::Element;
 
 use crate::app::{
-    title_of, Message, Palette, PaneMode, SidePanel, TreeMenuAction, VaultNotes, SWITCHER_INPUT,
-    TREE_EDIT_INPUT,
+    editor_shortcut, title_of, Message, Palette, PaneMode, SidePanel, TreeMenuAction, VaultNotes,
+    SWITCHER_INPUT, TREE_EDIT_INPUT,
 };
 use crate::reading;
 use crate::scroll::READING_SCROLL;
@@ -180,9 +180,24 @@ fn titles(paths: &[String]) -> String {
 
 /// Sidebar: a COSMIC nav bar (icon + label per panel) over the active
 /// panel's body — the same pattern COSMIC Files uses for its places list.
+/// The nav bar's own solid background is cleared so the whole sidebar reads
+/// as one surface (the nav bar's default style paints `primary.base`, which
+/// split the sidebar into a solid strip over a translucent body).
 fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
-    let mut col = column::Column::new().spacing(4).width(Length::Fill);
-    col = col.push(nav_bar(&app.nav_model, Message::NavSelect));
+    let mut col = column::Column::new().spacing(0).width(Length::Fill);
+    col = col.push(
+        nav_bar(&app.nav_model, Message::NavSelect)
+            .into_container()
+            // The default nav-bar container fills its parent, leaving a
+            // blank solid area under the items; shrink to the items instead.
+            .height(Length::Shrink)
+            .class(cosmic::theme::Container::custom(|_theme| {
+                cosmic::widget::container::Style {
+                    background: None,
+                    ..Default::default()
+                }
+            })),
+    );
     let body: Element<'a, Message> = match app.panel {
         SidePanel::Files => tree_view(app, palette),
         SidePanel::Search => search_panel(app, palette),
@@ -610,6 +625,7 @@ fn note_area<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
             .into(),
     };
     col = col.push(container(content).width(Length::Fill).height(Length::Fill));
+    col = col.push(status_bar(tab, palette));
     col.into()
 }
 
@@ -621,8 +637,10 @@ fn tab_bar<'a>(app: &'a VaultNotes, _palette: Palette) -> Element<'a, Message> {
             .into();
     }
     // The COSMIC tab strip: model-driven tabs with close buttons; entities
-    // carry the tab index (kept in sync by `sync_tab_model`).
+    // carry the tab index (kept in sync by `sync_tab_model`). The default
+    // `button_spacing` is 0, so the label sits against the close icon.
     tab_bar::horizontal(&app.tab_model)
+        .button_spacing(cosmic::theme::spacing().space_xxs)
         .on_activate(Message::TabActivated)
         .on_close(Message::TabCloseRequested)
         .into()
@@ -642,6 +660,8 @@ fn editor_pane<'a>(tab: &'a crate::app::Tab, palette: Palette) -> Element<'a, Me
         text_editor(&tab.content)
             .height(Length::Fill)
             .on_action(Message::EditorAction)
+            // Inset the text from the editor's border.
+            .padding(8)
             .font(cosmic::font::mono())
             .highlight_with::<cosmic::iced::highlighter::Highlighter>(
                 cosmic::iced::highlighter::Settings {
@@ -649,6 +669,15 @@ fn editor_pane<'a>(tab: &'a crate::app::Tab, palette: Palette) -> Element<'a, Me
                     token: "md".to_string(),
                 },
                 |highlight, _theme| highlight.to_format(),
+            )
+            // Editor-scoped shortcuts: undo/redo, formatting, footnotes,
+            // word delete. Anything else falls back to the editor's own
+            // bindings (copy/cut/paste/select-all, arrows, …).
+            .key_binding(
+                |press: text_editor::KeyPress| match editor_shortcut(press.clone()) {
+                    Some(message) => Some(text_editor::Binding::Custom(message)),
+                    None => text_editor::Binding::from_key_press(press),
+                },
             )
             .style(|theme: &cosmic::Theme, status: text_editor::Status| {
                 // Cosmic's default text_editor style paints an opaque
@@ -665,7 +694,7 @@ fn editor_pane<'a>(tab: &'a crate::app::Tab, palette: Palette) -> Element<'a, Me
                     background: Background::Color(cosmic::iced::Color::TRANSPARENT),
                     border: border::Border {
                         radius: cosmic.corner_radii.radius_0.into(),
-                        width: f32::from(cosmic.space_xxxs()),
+                        width: 1.0,
                         color: border_color.into(),
                     },
                     placeholder: with_alpha(cosmic.palette.neutral_9.into(), 0.7),
@@ -674,7 +703,7 @@ fn editor_pane<'a>(tab: &'a crate::app::Tab, palette: Palette) -> Element<'a, Me
                 }
             }),
     )
-    .padding(8)
+    .padding(12)
     .width(Length::Fill)
     .height(Length::Fill)
     .style(|_| cosmic::widget::container::Style {
@@ -709,7 +738,8 @@ fn reading_pane<'a>(
     };
     // The id anchors outline/search/footnote jumps (see scroll.rs). The
     // document column is centered at a readable measure (matching the web
-    // view's ~46rem) instead of stretching edge to edge.
+    // view's ~46rem) instead of stretching edge to edge, with breathing
+    // room around it.
     scrollable::scrollable(
         container(reading::render_doc(&tab.doc, &ctx))
             .max_width(736)
@@ -719,6 +749,20 @@ fn reading_pane<'a>(
     .id(Id::new(READING_SCROLL))
     .width(Length::Fill)
     .height(Length::Fill)
+    .padding(16)
+    .into()
+}
+
+/// Status bar under the note area: word/character counts for the active
+/// tab (cached on the tab, refreshed with the doc — not per frame).
+fn status_bar<'a>(tab: &'a crate::app::Tab, palette: Palette) -> Element<'a, Message> {
+    container(
+        text(format!("{} words · {} characters", tab.words, tab.chars))
+            .size(12)
+            .class(palette.muted),
+    )
+    .padding([4, 12])
+    .width(Length::Fill)
     .into()
 }
 

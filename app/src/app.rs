@@ -7,12 +7,13 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use cosmic::app::{Core, Task};
 use cosmic::iced::core::widget::Id;
 use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
 use cosmic::iced::widget::image::Handle as ImageHandle;
-use cosmic::iced::widget::text_editor::Content;
+use cosmic::iced::widget::text_editor::{self, Action, Content, Cursor, Edit, Motion};
 use cosmic::iced::Color;
 use cosmic::widget::{icon, nav_bar, segmented_button};
 
@@ -149,6 +150,13 @@ pub struct Tab {
     pub outline: Vec<crate::reading::OutlineEntry>,
     /// Callouts the user folded by hand (ids from the reading renderer).
     pub folds: HashSet<u64>,
+    /// Undo snapshots: the text and cursor before each edit, newest last.
+    undo: Vec<(String, Cursor)>,
+    /// Redo snapshots, filled by undo, consumed by redo.
+    redo: Vec<(String, Cursor)>,
+    /// Cached status-bar counts (refreshed with the doc).
+    pub words: usize,
+    pub chars: usize,
 }
 
 impl Tab {
@@ -164,6 +172,10 @@ impl Tab {
             doc_text: String::new(),
             outline: Vec::new(),
             folds: HashSet::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            words: 0,
+            chars: 0,
         };
         tab.refresh_doc();
         tab
@@ -178,6 +190,8 @@ impl Tab {
         let text = self.content.text();
         if text != self.doc_text {
             self.doc = parse_note(&text);
+            self.words = count_words(&text);
+            self.chars = text.chars().count();
             self.doc_text = text;
             self.outline = crate::reading::outline(&self.doc);
             // Ids are positional; after an edit they may point at different
@@ -198,6 +212,32 @@ pub(crate) fn title_of(path: &str) -> String {
         .unwrap_or(path)
         .trim_end_matches(".md")
         .to_string()
+}
+
+/// Inline markdown formatting a shortcut can apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Format {
+    Bold,
+    Italic,
+    Strike,
+    Code,
+    Highlight,
+    Link,
+}
+
+impl Format {
+    /// The markdown markers wrapped around the selection.
+    fn wrap(self) -> &'static str {
+        match self {
+            Format::Bold => "**",
+            Format::Italic => "*",
+            Format::Strike => "~~",
+            Format::Code => "`",
+            Format::Highlight => "==",
+            // Links are built from brackets, not symmetric markers.
+            Format::Link => "",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -238,7 +278,18 @@ pub enum Message {
     TabActivated(segmented_button::Entity),
     /// A tab-bar close button was pressed; the entity carries the tab index.
     TabCloseRequested(segmented_button::Entity),
-    EditorAction(cosmic::iced::widget::text_editor::Action),
+    EditorAction(Action),
+    /// Undo the last edit in the active tab (Ctrl+Z).
+    EditorUndo,
+    /// Redo an undone edit (Ctrl+Shift+Z / Ctrl+Y).
+    EditorRedo,
+    /// Apply inline markdown formatting around the selection (or insert
+    /// empty markers when nothing is selected).
+    EditorFormat(Format),
+    /// Insert a footnote reference at the cursor and append its definition.
+    EditorFootnote,
+    /// Delete the word before (false) or after (true) the cursor.
+    EditorDeleteWord(bool),
     Save,
     ToggleFolder(String),
     ToggleFold(u64),
@@ -338,6 +389,178 @@ impl cosmic::widget::menu::Action for TreeMenuAction {
 /// due for a save. Unit-testable without an `Instant`.
 fn autosave_due(idle_since_last_edit: Option<std::time::Duration>) -> bool {
     idle_since_last_edit.is_some_and(|d| d >= AUTOSAVE_IDLE)
+}
+
+// --- editor commands (undo, formatting, footnotes, word delete) ------------
+
+/// Undo snapshots kept per tab; older entries are dropped beyond this.
+const UNDO_LIMIT: usize = 100;
+
+/// Snapshot the tab's text and cursor for undo, discarding any redo
+/// history (a new edit after undo branches the timeline).
+fn push_undo(tab: &mut Tab) {
+    let text = tab.content.text();
+    let cursor = tab.content.cursor();
+    tab.undo.push((text, cursor));
+    if tab.undo.len() > UNDO_LIMIT {
+        tab.undo.remove(0);
+    }
+    tab.redo.clear();
+}
+
+/// Pop the last undo snapshot into the tab. Returns whether anything was
+/// restored (the caller refreshes derived state).
+fn undo_tab(tab: &mut Tab) -> bool {
+    match tab.undo.pop() {
+        Some((text, cursor)) => {
+            let current = (tab.content.text(), tab.content.cursor());
+            tab.redo.push(current);
+            tab.content = Content::with_text(&text);
+            tab.content.move_to(cursor);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Pop the last redo snapshot into the tab (the inverse of `undo_tab`).
+fn redo_tab(tab: &mut Tab) -> bool {
+    match tab.redo.pop() {
+        Some((text, cursor)) => {
+            let current = (tab.content.text(), tab.content.cursor());
+            tab.undo.push(current);
+            tab.content = Content::with_text(&text);
+            tab.content.move_to(cursor);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The editor actions that apply `format`: wrapping a non-empty selection
+/// with the markers, or inserting empty markers and stepping the cursor
+/// between them.
+fn format_actions(selection: Option<String>, format: Format) -> Vec<Action> {
+    let sel = selection.filter(|s| !s.is_empty());
+    match format {
+        Format::Link => match sel {
+            Some(s) => paste_then_left(format!("[{s}]()"), 1),
+            None => paste_then_left("[]()".to_string(), 3),
+        },
+        other => {
+            let wrap = other.wrap();
+            match sel {
+                Some(s) => vec![Action::Edit(Edit::Paste(Arc::new(format!(
+                    "{wrap}{s}{wrap}"
+                ))))],
+                None => paste_then_left(format!("{wrap}{wrap}"), wrap.chars().count()),
+            }
+        }
+    }
+}
+
+/// Paste `text`, then move the cursor `left` positions back (to land
+/// inside inserted markers).
+fn paste_then_left(text: String, left: usize) -> Vec<Action> {
+    let mut actions = vec![Action::Edit(Edit::Paste(Arc::new(text)))];
+    actions.extend((0..left).map(|_| Action::Move(Motion::Left)));
+    actions
+}
+
+/// Insert a `[^N]` reference at the cursor and a `[^N]: ` definition at
+/// the end of the document; N is the first number without a definition.
+fn footnote_actions(text: &str) -> Vec<Action> {
+    let n = next_footnote_number(text);
+    let mut actions = vec![Action::Edit(Edit::Paste(Arc::new(format!("[^{n}]"))))];
+    actions.push(Action::Move(Motion::DocumentEnd));
+    if !text.ends_with('\n') {
+        actions.push(Action::Edit(Edit::Paste(Arc::new("\n".to_string()))));
+    }
+    actions.push(Action::Edit(Edit::Paste(Arc::new(format!("[^{n}]: ")))));
+    actions
+}
+
+/// The first footnote number that has no `[^N]:` definition in `text`.
+fn next_footnote_number(text: &str) -> u32 {
+    let mut used = HashSet::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find("[^") {
+        let after = &rest[pos + 2..];
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() {
+            if let Ok(n) = digits.parse::<u32>() {
+                // Only definitions reserve a number; bare references do not.
+                if after[digits.len()..].starts_with("]:") {
+                    used.insert(n);
+                }
+            }
+        }
+        rest = after;
+    }
+    (1..).find(|n| !used.contains(n)).unwrap_or(1)
+}
+
+/// Delete one word: with a selection the edit alone removes it; without
+/// one, select back/forward a word first (Backspace/Delete then drop it).
+fn word_delete_actions(has_selection: bool, right: bool) -> Vec<Action> {
+    let edit = if right { Edit::Delete } else { Edit::Backspace };
+    if has_selection {
+        vec![Action::Edit(edit)]
+    } else {
+        vec![
+            Action::Select(if right {
+                Motion::WordRight
+            } else {
+                Motion::WordLeft
+            }),
+            Action::Edit(edit),
+        ]
+    }
+}
+
+/// Word count for the status bar: whitespace-separated runs.
+fn count_words(text: &str) -> usize {
+    text.split_whitespace().count()
+}
+
+/// Map an editor key press to a shortcut message, or `None` to fall
+/// through (the caller then defers to the editor's default bindings).
+/// Only fires while the editor is focused, so quick-switcher and global
+/// shortcuts keep working elsewhere.
+pub(crate) fn editor_shortcut(press: text_editor::KeyPress) -> Option<Message> {
+    if !matches!(press.status, text_editor::Status::Focused { .. }) {
+        return None;
+    }
+    let ctrl = press.modifiers.command();
+    let shift = press.modifiers.shift();
+    match &press.key {
+        cosmic::iced::keyboard::Key::Character(c) if ctrl => {
+            let lower = c.to_lowercase();
+            match (lower.as_str(), shift) {
+                ("z", _) => Some(if shift {
+                    Message::EditorRedo
+                } else {
+                    Message::EditorUndo
+                }),
+                ("y", false) => Some(Message::EditorRedo),
+                ("b", _) => Some(Message::EditorFormat(Format::Bold)),
+                ("i", _) => Some(Message::EditorFormat(Format::Italic)),
+                ("k", _) => Some(Message::EditorFormat(Format::Link)),
+                ("`", _) => Some(Message::EditorFormat(Format::Code)),
+                ("x", true) => Some(Message::EditorFormat(Format::Strike)),
+                ("h", true) => Some(Message::EditorFormat(Format::Highlight)),
+                ("f", true) => Some(Message::EditorFootnote),
+                _ => None,
+            }
+        }
+        cosmic::iced::keyboard::Key::Named(Named::Backspace) if ctrl => {
+            Some(Message::EditorDeleteWord(false))
+        }
+        cosmic::iced::keyboard::Key::Named(Named::Delete) if ctrl => {
+            Some(Message::EditorDeleteWord(true))
+        }
+        _ => None,
+    }
 }
 
 /// The sidebar nav bar's model: one item per `SidePanel`, in `ALL` order,
@@ -728,6 +951,24 @@ impl VaultNotes {
     fn activate_nav(&mut self, panel: SidePanel) {
         activate_entity_with(&mut self.nav_model, &panel);
     }
+
+    /// Perform a multi-action editor command (formatting, word delete) as
+    /// one undoable step, then refresh derived state.
+    fn run_editor_command(&mut self, idx: usize, actions: Vec<Action>) {
+        let was_dirty = self.tabs[idx].is_dirty();
+        {
+            let tab = &mut self.tabs[idx];
+            push_undo(tab);
+            for action in actions {
+                tab.content.perform(action);
+            }
+            tab.refresh_doc();
+        }
+        self.last_edit = Some(std::time::Instant::now());
+        if self.tabs[idx].is_dirty() != was_dirty {
+            self.sync_tab_text(idx);
+        }
+    }
     /// A tree context-menu command, applied to the node the menu was opened
     /// on (`Message::TreeMenuTarget` recorded it when the menu opened).
     fn tree_menu_command(&mut self, action: TreeMenuAction) -> Task<Message> {
@@ -1005,6 +1246,8 @@ impl VaultNotes {
                     ExternalAction::Reloaded => {
                         tab.content = Content::with_text(&disk);
                         tab.base_text = disk;
+                        tab.undo.clear();
+                        tab.redo.clear();
                         tab.refresh_doc();
                         banner.reloaded.push(tab.path.clone());
                     }
@@ -1126,6 +1369,10 @@ impl cosmic::Application for VaultNotes {
                         let source = vault.note_source(&tab.path).unwrap_or_default();
                         tab.content = Content::with_text(&source);
                         tab.base_text = source;
+                        // The buffer was replaced wholesale; undo history
+                        // against the old text is meaningless now.
+                        tab.undo.clear();
+                        tab.redo.clear();
                         tab.refresh_doc();
                     }
                 }
@@ -1232,8 +1479,12 @@ impl cosmic::Application for VaultNotes {
             Message::EditorAction(action) => {
                 if let Some(idx) = self.active {
                     let is_edit = action.is_edit();
-                    let was_dirty = self.tabs[idx].is_dirty();
                     let tab = &mut self.tabs[idx];
+                    // Snapshot before the edit so undo can restore it.
+                    if is_edit {
+                        push_undo(tab);
+                    }
+                    let was_dirty = tab.is_dirty();
                     tab.content.perform(action);
                     if is_edit {
                         tab.refresh_doc();
@@ -1245,6 +1496,58 @@ impl cosmic::Application for VaultNotes {
                     if tab.is_dirty() != was_dirty {
                         self.sync_tab_text(idx);
                     }
+                }
+                Task::none()
+            }
+            Message::EditorUndo => {
+                if let Some(idx) = self.active {
+                    let was_dirty = self.tabs[idx].is_dirty();
+                    let tab = &mut self.tabs[idx];
+                    if undo_tab(tab) {
+                        tab.refresh_doc();
+                        self.last_edit = Some(std::time::Instant::now());
+                        if tab.is_dirty() != was_dirty {
+                            self.sync_tab_text(idx);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::EditorRedo => {
+                if let Some(idx) = self.active {
+                    let was_dirty = self.tabs[idx].is_dirty();
+                    let tab = &mut self.tabs[idx];
+                    if redo_tab(tab) {
+                        tab.refresh_doc();
+                        self.last_edit = Some(std::time::Instant::now());
+                        if tab.is_dirty() != was_dirty {
+                            self.sync_tab_text(idx);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::EditorFormat(format) => {
+                if let Some(idx) = self.active {
+                    let selection = self.tabs[idx].content.selection();
+                    let actions = format_actions(selection, format);
+                    self.run_editor_command(idx, actions);
+                }
+                Task::none()
+            }
+            Message::EditorFootnote => {
+                if let Some(idx) = self.active {
+                    let text = self.tabs[idx].content.text();
+                    let actions = footnote_actions(&text);
+                    self.run_editor_command(idx, actions);
+                }
+                Task::none()
+            }
+            Message::EditorDeleteWord(right) => {
+                if let Some(idx) = self.active {
+                    let has_selection = self.tabs[idx].content.selection().is_some();
+                    let actions = word_delete_actions(has_selection, right);
+                    self.run_editor_command(idx, actions);
                 }
                 Task::none()
             }
@@ -1838,5 +2141,229 @@ mod chrome_model_tests {
         let mut model = segmented_button::Model::default();
         fill_tab_model(&mut model, &[], None);
         assert_eq!(model.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+
+    /// A focused editor key press for shortcut tests.
+    fn key_press(key: cosmic::iced::keyboard::Key, modifiers: Modifiers) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: cosmic::iced::keyboard::key::Physical::Code(
+                cosmic::iced::keyboard::key::Code::KeyB,
+            ),
+            modifiers,
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: true },
+        }
+    }
+
+    #[test]
+    fn editor_shortcuts_map_to_messages() {
+        let ctrl = Modifiers::CTRL;
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+
+        assert!(matches!(
+            editor_shortcut(key_press(Key::Character("z".into()), ctrl)),
+            Some(Message::EditorUndo)
+        ));
+        assert!(matches!(
+            editor_shortcut(key_press(Key::Character("z".into()), ctrl_shift)),
+            Some(Message::EditorRedo)
+        ));
+        assert!(matches!(
+            editor_shortcut(key_press(Key::Character("y".into()), ctrl)),
+            Some(Message::EditorRedo)
+        ));
+        assert!(matches!(
+            editor_shortcut(key_press(Key::Character("b".into()), ctrl)),
+            Some(Message::EditorFormat(Format::Bold))
+        ));
+        // A shifted layout reports the capital; both map the same.
+        assert!(matches!(
+            editor_shortcut(key_press(Key::Character("B".into()), ctrl)),
+            Some(Message::EditorFormat(Format::Bold))
+        ));
+        assert!(matches!(
+            editor_shortcut(key_press(Key::Character("i".into()), ctrl)),
+            Some(Message::EditorFormat(Format::Italic))
+        ));
+        assert!(matches!(
+            editor_shortcut(key_press(Key::Character("k".into()), ctrl)),
+            Some(Message::EditorFormat(Format::Link))
+        ));
+        assert!(matches!(
+            editor_shortcut(key_press(Key::Character("x".into()), ctrl_shift)),
+            Some(Message::EditorFormat(Format::Strike))
+        ));
+        assert!(matches!(
+            editor_shortcut(key_press(Key::Character("h".into()), ctrl_shift)),
+            Some(Message::EditorFormat(Format::Highlight))
+        ));
+        assert!(matches!(
+            editor_shortcut(key_press(Key::Character("f".into()), ctrl_shift)),
+            Some(Message::EditorFootnote)
+        ));
+        assert!(matches!(
+            editor_shortcut(key_press(Key::Named(Named::Backspace), ctrl)),
+            Some(Message::EditorDeleteWord(false))
+        ));
+        assert!(matches!(
+            editor_shortcut(key_press(Key::Named(Named::Delete), ctrl)),
+            Some(Message::EditorDeleteWord(true))
+        ));
+
+        // Unbound combos and unmodified keys fall through to the editor's
+        // default bindings (Ctrl+S is the app-wide save; Shift+B is typing).
+        assert!(editor_shortcut(key_press(Key::Character("s".into()), ctrl)).is_none());
+        assert!(editor_shortcut(key_press(Key::Character("b".into()), Modifiers::SHIFT)).is_none());
+
+        // Not focused: no editor shortcuts at all.
+        let mut unfocused = key_press(Key::Character("b".into()), ctrl);
+        unfocused.status = text_editor::Status::Active;
+        assert!(editor_shortcut(unfocused).is_none());
+    }
+
+    #[test]
+    fn undo_redo_round_trips_edits() {
+        let mut tab = Tab::open("t.md".to_string(), "hello\n");
+        // An edit: snapshot first, then the change.
+        push_undo(&mut tab);
+        tab.content
+            .perform(Action::Edit(Edit::Paste(Arc::new("X".to_string()))));
+        tab.refresh_doc();
+        assert_eq!(tab.content.text(), "Xhello\n");
+        // Undo restores the pre-edit text and cursor.
+        assert!(undo_tab(&mut tab));
+        tab.refresh_doc();
+        assert_eq!(tab.content.text(), "hello\n");
+        // Redo replays it.
+        assert!(redo_tab(&mut tab));
+        tab.refresh_doc();
+        assert_eq!(tab.content.text(), "Xhello\n");
+        // Undo again; a fresh edit then discards the redo branch.
+        assert!(undo_tab(&mut tab));
+        push_undo(&mut tab);
+        tab.content
+            .perform(Action::Edit(Edit::Paste(Arc::new("Y".to_string()))));
+        tab.refresh_doc();
+        assert_eq!(tab.content.text(), "Yhello\n");
+        assert!(!redo_tab(&mut tab));
+        // Undo with an empty stack is a no-op.
+        assert!(!undo_tab(&mut tab) == false || !tab.undo.is_empty());
+        while undo_tab(&mut tab) {}
+        assert!(!undo_tab(&mut tab));
+    }
+
+    #[test]
+    fn undo_limit_bounded() {
+        let mut tab = Tab::open("t.md".to_string(), "");
+        for i in 0..(UNDO_LIMIT + 10) {
+            push_undo(&mut tab);
+            tab.content
+                .perform(Action::Edit(Edit::Paste(Arc::new(i.to_string()))));
+        }
+        assert_eq!(tab.undo.len(), UNDO_LIMIT);
+    }
+
+    #[test]
+    fn format_actions_wrap_or_insert_markers() {
+        // With a selection: one paste wrapping it.
+        assert_eq!(
+            format_actions(Some("hi".to_string()), Format::Bold),
+            vec![Action::Edit(Edit::Paste(Arc::new("**hi**".to_string())))]
+        );
+        // Without: empty markers with the cursor stepped between them.
+        assert_eq!(
+            format_actions(None, Format::Italic),
+            vec![
+                Action::Edit(Edit::Paste(Arc::new("**".to_string()))),
+                Action::Move(Motion::Left),
+            ]
+        );
+        // Link with a selection leaves the cursor inside the parens.
+        assert_eq!(
+            format_actions(Some("label".to_string()), Format::Link),
+            vec![
+                Action::Edit(Edit::Paste(Arc::new("[label]()".to_string()))),
+                Action::Move(Motion::Left),
+            ]
+        );
+        // An empty selection behaves like no selection.
+        assert_eq!(
+            format_actions(Some(String::new()), Format::Code),
+            format_actions(None, Format::Code)
+        );
+    }
+
+    #[test]
+    fn footnote_actions_insert_reference_and_definition() {
+        let mut tab = Tab::open("t.md".to_string(), "body\n");
+        for action in footnote_actions("body\n") {
+            tab.content.perform(action);
+        }
+        // The reference lands at the cursor; the definition at the end.
+        assert_eq!(tab.content.text(), "[^1]body\n[^1]: ");
+    }
+
+    #[test]
+    fn next_footnote_number_skips_existing_definitions() {
+        assert_eq!(next_footnote_number(""), 1);
+        assert_eq!(next_footnote_number("no footnotes here"), 1);
+        // Bare references do not reserve a number.
+        assert_eq!(next_footnote_number("a[^1] ref[^1]\n"), 1);
+        assert_eq!(next_footnote_number("[^1]: one\n"), 2);
+        // Gaps are not filled: the next unused number wins.
+        assert_eq!(next_footnote_number("[^1]: a\n[^3]: b\n"), 2);
+        assert_eq!(next_footnote_number("[^1]: a\n[^2]: b\n"), 3);
+    }
+
+    #[test]
+    fn word_delete_selects_a_word_only_without_a_selection() {
+        assert_eq!(
+            word_delete_actions(false, false),
+            vec![
+                Action::Select(Motion::WordLeft),
+                Action::Edit(Edit::Backspace)
+            ]
+        );
+        assert_eq!(
+            word_delete_actions(false, true),
+            vec![
+                Action::Select(Motion::WordRight),
+                Action::Edit(Edit::Delete)
+            ]
+        );
+        // With a selection, the edit alone removes it.
+        assert_eq!(
+            word_delete_actions(true, false),
+            vec![Action::Edit(Edit::Backspace)]
+        );
+    }
+
+    #[test]
+    fn word_delete_deletes_a_word_end_to_end() {
+        let mut tab = Tab::open("t.md".to_string(), "hello world\n");
+        // Park the cursor at the end of "world" (line 0, column 11).
+        tab.content.perform(Action::Move(Motion::DocumentStart));
+        for _ in 0..11 {
+            tab.content.perform(Action::Move(Motion::Right));
+        }
+        for action in word_delete_actions(tab.content.selection().is_some(), false) {
+            tab.content.perform(action);
+        }
+        tab.refresh_doc();
+        assert_eq!(tab.content.text(), "hello \n");
+    }
+
+    #[test]
+    fn word_count_counts_whitespace_runs() {
+        assert_eq!(count_words(""), 0);
+        assert_eq!(count_words("hello"), 1);
+        assert_eq!(count_words("  two  words\nand more "), 4);
     }
 }

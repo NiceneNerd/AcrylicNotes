@@ -30,6 +30,10 @@ use crate::app::{Message, Palette};
 
 const EMBED_DEPTH_LIMIT: usize = 4;
 
+/// Fold id of the frontmatter block. Block fold ids count up from 0 during
+/// each render, so this fixed sentinel never collides with them.
+pub const FRONTMATTER_FOLD: u64 = u64::MAX;
+
 pub struct Ctx<'a> {
     pub vault: &'a Vault,
     pub index: &'a VaultIndex,
@@ -145,16 +149,25 @@ pub fn render_doc<'a>(doc: &Doc, ctx: &Ctx<'a>) -> Element<'a, Message> {
     let palette = ctx.palette;
     let mut col = column::Column::new().spacing(10).width(Length::Fill);
     if let Some(frontmatter) = &doc.frontmatter_raw {
-        col = col.push(
-            container(
+        // Frontmatter is metadata, not prose: fold it like a callout so it
+        // can be tucked away while reading. It owns a fixed fold id (block
+        // fold ids count up from 0, so this never collides).
+        let open = !ctx.folds.contains(&FRONTMATTER_FOLD);
+        let chevron = if open { "▾ " } else { "▸ " };
+        let mut fm_col = column::Column::new().spacing(6);
+        fm_col = fm_col.push(
+            button::text(format!("{chevron}Frontmatter"))
+                .on_press(Message::ToggleFold(FRONTMATTER_FOLD)),
+        );
+        if open {
+            fm_col = fm_col.push(
                 text(frontmatter.trim_end().to_string())
                     .font(cosmic::font::mono())
                     .size(12.0)
                     .class(ctx.palette.muted),
-            )
-            .padding(6)
-            .style(move |_| code_block_style(&palette)),
-        );
+            );
+        }
+        col = col.push(container(fm_col).style(move |_| code_block_style(&palette)));
     }
     // Callout fold ids are assigned sequentially during this render. The
     // traversal is deterministic, so ids are stable between renders; a single
