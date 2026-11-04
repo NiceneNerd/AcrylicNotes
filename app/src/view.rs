@@ -8,7 +8,8 @@ use cosmic::iced::core::widget::Id;
 use cosmic::iced::widget::{opaque, stack, text_editor};
 use cosmic::iced::{alignment, border, Background, Length, Padding};
 use cosmic::widget::{
-    button, column, container, context_menu, flex_row, menu, row, scrollable, text, text_input,
+    button, column, container, context_menu, icon, menu, nav_bar, row, scrollable,
+    segmented_button, tab_bar, text, text_input,
 };
 use cosmic::Element;
 
@@ -41,17 +42,13 @@ pub fn header_start(app: &VaultNotes) -> Vec<Element<'_, Message>> {
     if app.vault.is_none() {
         return Vec::new();
     }
-    let pane_button = |label: &'static str, mode: PaneMode| {
-        let btn = if app.pane == mode {
-            button::suggested(label)
-        } else {
-            button::text(label)
-        };
-        btn.on_press(Message::PaneMode(mode)).into()
-    };
     vec![
-        button::text("Save").on_press(Message::Save).into(),
-        button::text("Daily").on_press(Message::DailyNote).into(),
+        button::icon(icon::from_name("document-save-symbolic"))
+            .on_press(Message::Save)
+            .into(),
+        button::icon(icon::from_name("date-symbolic"))
+            .on_press(Message::DailyNote)
+            .into(),
         // Label shows the theme a click switches to.
         button::text(if cosmic::theme::is_dark() {
             "Light"
@@ -60,9 +57,9 @@ pub fn header_start(app: &VaultNotes) -> Vec<Element<'_, Message>> {
         })
         .on_press(Message::ToggleTheme)
         .into(),
-        pane_button("Source", PaneMode::Source),
-        pane_button("Reading", PaneMode::Reading),
-        pane_button("Split", PaneMode::Split),
+        segmented_button::horizontal(&app.pane_model)
+            .on_activate(Message::PaneActivated)
+            .into(),
     ]
 }
 
@@ -71,6 +68,7 @@ pub fn header_start(app: &VaultNotes) -> Vec<Element<'_, Message>> {
 fn empty_state(app: &VaultNotes) -> Element<'_, Message> {
     let palette = Palette::from(&cosmic::theme::active());
     let mut col = column::Column::new().spacing(16).max_width(460);
+    col = col.push(icon::from_name("folder-symbolic").size(64));
     col = col.push(text::title2("Vault Notes"));
     col = col.push(text(
         "Open an Obsidian vault folder to begin. Files stay on disk; the \
@@ -180,25 +178,11 @@ fn titles(paths: &[String]) -> String {
 
 // --- sidebar ---------------------------------------------------------------
 
-/// Sidebar: a row of panel switcher tabs over the active panel's body.
+/// Sidebar: a COSMIC nav bar (icon + label per panel) over the active
+/// panel's body — the same pattern COSMIC Files uses for its places list.
 fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
     let mut col = column::Column::new().spacing(4).width(Length::Fill);
-    // flex_row wraps the five panel buttons within the 250px sidebar; a plain
-    // row overflows and clips the last button (Outline) off the edge.
-    let switcher: Vec<Element<'a, Message>> = SidePanel::ALL
-        .iter()
-        .map(|panel| {
-            let btn = if app.panel == *panel {
-                button::suggested(panel.label())
-            } else {
-                button::text(panel.label())
-            };
-            btn.height(Length::Shrink)
-                .on_press(Message::SidePanel(*panel))
-                .into()
-        })
-        .collect();
-    col = col.push(flex_row(switcher));
+    col = col.push(nav_bar(&app.nav_model, Message::NavSelect));
     let body: Element<'a, Message> = match app.panel {
         SidePanel::Files => tree_view(app, palette),
         SidePanel::Search => search_panel(app, palette),
@@ -297,19 +281,26 @@ fn nodes_view<'a>(
                 path,
                 children,
             } => {
-                let icon = if app.collapsed.contains(path) {
-                    "▸"
+                let chevron = if app.collapsed.contains(path) {
+                    "pan-end-symbolic"
                 } else {
-                    "▾"
+                    "pan-down-symbolic"
                 };
                 let row = if app.tree_rename_target() == Some(path.as_str()) {
                     tree_edit_row(app, indent)
                 } else {
-                    button::text(format!("{icon} {name}"))
-                        .on_press(Message::ToggleFolder(path.clone()))
-                        .height(Length::Shrink)
-                        .width(Length::Fill)
-                        .into()
+                    button::custom(
+                        row::Row::new()
+                            .push(icon::from_name(chevron).size(14))
+                            .push(icon::from_name("folder-symbolic").size(16))
+                            .push(text(name))
+                            .spacing(6),
+                    )
+                    .class(cosmic::theme::Button::Text)
+                    .on_press(Message::ToggleFolder(path.clone()))
+                    .height(Length::Shrink)
+                    .width(Length::Fill)
+                    .into()
                 };
                 col = col.push(
                     container(menu_row(row, path))
@@ -337,11 +328,17 @@ fn nodes_view<'a>(
                     } else if app.is_tab_dirty(path) {
                         label = format!("• {label}");
                     }
-                    button::text(label)
-                        .on_press(Message::TabOpen(path.clone()))
-                        .height(Length::Shrink)
-                        .width(Length::Fill)
-                        .into()
+                    button::custom(
+                        row::Row::new()
+                            .push(icon::from_name("text-x-generic-symbolic").size(16))
+                            .push(text(label))
+                            .spacing(6),
+                    )
+                    .class(cosmic::theme::Button::Text)
+                    .on_press(Message::TabOpen(path.clone()))
+                    .height(Length::Shrink)
+                    .width(Length::Fill)
+                    .into()
                 };
                 col = col.push(
                     container(menu_row(row, path))
@@ -379,16 +376,17 @@ fn search_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Messag
         col = col.push(text(format!("{} matches", app.search_hits.len())).class(palette.muted));
         for (i, hit) in app.search_hits.iter().enumerate() {
             col = col.push(
-                button::text(hit.path.clone())
+                button::text(title_of(&hit.path))
                     .on_press(Message::SearchOpen(i))
                     .height(Length::Shrink)
                     .width(Length::Fill),
             );
             col = col.push(
-                text(format!("{}  {}", hit.line_no, snippet(&hit.line)))
-                    .size(12)
+                text(format!("{}:{}", hit.path, hit.line_no))
+                    .size(11)
                     .class(palette.muted),
             );
+            col = col.push(text(snippet(&hit.line)).size(12).class(palette.muted));
         }
     }
     col.into()
@@ -615,26 +613,19 @@ fn note_area<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
     col.into()
 }
 
-fn tab_bar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
-    let mut bar = row::Row::new().spacing(4);
-    for (i, tab) in app.tabs.iter().enumerate() {
-        let mut label = tab.title();
-        if tab.is_dirty() {
-            label = format!("• {label}");
-        }
-        let open_btn = if app.active == Some(i) {
-            button::suggested(label).on_press(Message::TabSelect(i))
-        } else {
-            button::text(label).on_press(Message::TabSelect(i))
-        };
-        bar = bar
-            .push(open_btn)
-            .push(button::text("×").on_press(Message::TabClose(i)));
-    }
+fn tab_bar<'a>(app: &'a VaultNotes, _palette: Palette) -> Element<'a, Message> {
     if app.tabs.is_empty() {
-        bar = bar.push(text("No open tabs").class(palette.muted));
+        return container(text("No open tabs").class(_palette.muted))
+            .padding(4)
+            .width(Length::Fill)
+            .into();
     }
-    container(bar).padding(4).width(Length::Fill).into()
+    // The COSMIC tab strip: model-driven tabs with close buttons; entities
+    // carry the tab index (kept in sync by `sync_tab_model`).
+    tab_bar::horizontal(&app.tab_model)
+        .on_activate(Message::TabActivated)
+        .on_close(Message::TabCloseRequested)
+        .into()
 }
 
 // --- panes -----------------------------------------------------------------
@@ -716,12 +707,19 @@ fn reading_pane<'a>(
         folds: &tab.folds,
         images: &app.images,
     };
-    // The id anchors outline/search/footnote jumps (see scroll.rs).
-    scrollable::scrollable(reading::render_doc(&tab.doc, &ctx))
-        .id(Id::new(READING_SCROLL))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    // The id anchors outline/search/footnote jumps (see scroll.rs). The
+    // document column is centered at a readable measure (matching the web
+    // view's ~46rem) instead of stretching edge to edge.
+    scrollable::scrollable(
+        container(reading::render_doc(&tab.doc, &ctx))
+            .max_width(736)
+            .width(Length::Fill)
+            .align_x(alignment::Horizontal::Center),
+    )
+    .id(Id::new(READING_SCROLL))
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 fn with_alpha(color: cosmic::iced::Color, alpha: f32) -> cosmic::iced::Color {

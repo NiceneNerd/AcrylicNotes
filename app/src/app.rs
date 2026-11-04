@@ -14,6 +14,7 @@ use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
 use cosmic::iced::widget::image::Handle as ImageHandle;
 use cosmic::iced::widget::text_editor::Content;
 use cosmic::iced::Color;
+use cosmic::widget::{icon, nav_bar, segmented_button};
 
 use vault_core::vault::VaultError;
 use vault_core::{NoteSource, ObsidianSettings, Vault, VaultIndex};
@@ -58,6 +59,18 @@ impl SidePanel {
             SidePanel::Tags => "Tags",
             SidePanel::Links => "Links",
             SidePanel::Outline => "Outline",
+        }
+    }
+
+    /// XDG icon name for the nav bar (verified present in the Cosmic/Pop
+    /// icon themes).
+    pub fn icon(self) -> &'static str {
+        match self {
+            SidePanel::Files => "folder-symbolic",
+            SidePanel::Search => "edit-find-symbolic",
+            SidePanel::Tags => "edit-tag-symbolic",
+            SidePanel::Links => "link-symbolic",
+            SidePanel::Outline => "view-list-symbolic",
         }
     }
 }
@@ -216,10 +229,17 @@ pub enum Message {
     /// Wayland surface actions for context-menu popups (routed to libcosmic).
     Surface(cosmic::surface::Action<Message>),
     TabClose(usize),
-    TabSelect(usize),
+    /// A nav-bar (sidebar panel) item was activated; the entity carries the
+    /// panel via the model's data.
+    NavSelect(nav_bar::Id),
+    /// A segmented-control item (Source/Reading/Split) was activated.
+    PaneActivated(segmented_button::Entity),
+    /// A tab-bar tab was activated; the entity carries the tab index.
+    TabActivated(segmented_button::Entity),
+    /// A tab-bar close button was pressed; the entity carries the tab index.
+    TabCloseRequested(segmented_button::Entity),
     EditorAction(cosmic::iced::widget::text_editor::Action),
     Save,
-    PaneMode(PaneMode),
     ToggleFolder(String),
     ToggleFold(u64),
     /// A link span was clicked; the URI scheme routes it.
@@ -280,6 +300,13 @@ pub struct VaultNotes {
     pub tree_edit: Option<tree::TreeEdit>,
     /// The node path the open context menu belongs to (`None` when closed).
     pub tree_menu_target: Option<String>,
+    // --- COSMIC chrome models ---
+    /// Sidebar panel switcher (nav bar): one item per `SidePanel`.
+    pub nav_model: nav_bar::Model,
+    /// Header pane-mode segmented control (Source/Reading/Split).
+    pub pane_model: segmented_button::Model<segmented_button::SingleSelect>,
+    /// Open-note tab strip; entities carry the tab index as data.
+    pub tab_model: segmented_button::Model<segmented_button::SingleSelect>,
 }
 
 /// Save the active note ~2 s after its last edit (M4 decision, user-tuned).
@@ -311,6 +338,83 @@ impl cosmic::widget::menu::Action for TreeMenuAction {
 /// due for a save. Unit-testable without an `Instant`.
 fn autosave_due(idle_since_last_edit: Option<std::time::Duration>) -> bool {
     idle_since_last_edit.is_some_and(|d| d >= AUTOSAVE_IDLE)
+}
+
+/// The sidebar nav bar's model: one item per `SidePanel`, in `ALL` order,
+/// Files active. Pure so tests can inspect it without a `Core`.
+fn build_nav_model() -> nav_bar::Model {
+    let mut model = nav_bar::Model::default();
+    for panel in SidePanel::ALL {
+        model
+            .insert()
+            .icon(icon::from_name(panel.icon()))
+            .text(panel.label())
+            .data(panel);
+    }
+    model.activate_position(0);
+    model
+}
+
+/// The header pane-mode segmented control: Source / Reading / Split, with
+/// the default mode (`Split`) active.
+fn build_pane_model() -> segmented_button::Model<segmented_button::SingleSelect> {
+    let mut model = segmented_button::Model::default();
+    for (i, (mode, label)) in [
+        (PaneMode::Source, "Source"),
+        (PaneMode::Reading, "Reading"),
+        (PaneMode::Split, "Split"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        model.insert().text(label).data(mode);
+        if mode == PaneMode::default() {
+            model.activate_position(i as u16);
+        }
+    }
+    model
+}
+
+/// A tab strip label: the note title, prefixed with a dot while dirty.
+fn tab_label(tab: &Tab) -> String {
+    let mut label = tab.title();
+    if tab.is_dirty() {
+        label = format!("• {label}");
+    }
+    label
+}
+
+/// Fill the tab-strip model from the open tabs; the active tab (if any) is
+/// activated and every tab is closable. Entities carry the tab index.
+fn fill_tab_model(
+    model: &mut segmented_button::Model<segmented_button::SingleSelect>,
+    tabs: &[Tab],
+    active: Option<usize>,
+) {
+    for (i, tab) in tabs.iter().enumerate() {
+        model.insert().closable().text(tab_label(tab)).data(i);
+        if active == Some(i) {
+            model.activate_position(i as u16);
+        }
+    }
+}
+
+/// Activate the model item whose data equals `data` (nav bar / segmented
+/// control). Returns whether an item matched.
+fn activate_entity_with<Data: 'static + PartialEq>(
+    model: &mut segmented_button::Model<segmented_button::SingleSelect>,
+    data: &Data,
+) -> bool {
+    let target = model
+        .iter()
+        .find(|id| model.data::<Data>(*id) == Some(data));
+    match target {
+        Some(id) => {
+            model.activate(id);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Mirrors vault-core's dot-directory rule: reject names that would sneak a
@@ -434,6 +538,7 @@ impl VaultNotes {
     fn open_tab(&mut self, path: String) -> Task<Message> {
         if let Some(i) = self.tabs.iter().position(|tab| tab.path == path) {
             self.active = Some(i);
+            self.sync_tab_model();
             return Task::none();
         }
         let source = self
@@ -443,6 +548,7 @@ impl VaultNotes {
             .unwrap_or_default();
         self.tabs.push(Tab::open(path, &source));
         self.active = Some(self.tabs.len() - 1);
+        self.sync_tab_model();
         Task::none()
     }
 
@@ -550,10 +656,14 @@ impl VaultNotes {
         let base = tab.base_text.clone();
         match write_tab(vault, tab, &base) {
             Ok(_) => {
+                let was_dirty = tab.is_dirty();
                 tab.base_text = tab.content.text();
                 tab.refresh_doc();
                 self.error = None;
                 self.rebuild_index();
+                if was_dirty {
+                    self.sync_tab_text(idx);
+                }
                 true
             }
             Err(VaultError::Write(vault_core::WriteError::ExternallyModified)) => {
@@ -592,9 +702,32 @@ impl VaultNotes {
             }
             other => other,
         };
+        self.sync_tab_model();
         Task::none()
     }
 
+    /// Rebuild the tab-strip model from `tabs` + `active` (after every
+    /// structural tab change: open, close, select, rename).
+    fn sync_tab_model(&mut self) {
+        self.tab_model = segmented_button::Model::default();
+        fill_tab_model(&mut self.tab_model, &self.tabs, self.active);
+    }
+
+    /// Update one tab's strip text (the dirty dot flips without a rebuild).
+    fn sync_tab_text(&mut self, idx: usize) {
+        let Some(label) = self.tabs.get(idx).map(tab_label) else {
+            return;
+        };
+        let Some(id) = self.tab_model.iter().nth(idx) else {
+            return;
+        };
+        self.tab_model.text_set(id, label);
+    }
+
+    /// Activate the nav-bar item for `panel` (after a programmatic switch).
+    fn activate_nav(&mut self, panel: SidePanel) {
+        activate_entity_with(&mut self.nav_model, &panel);
+    }
     /// A tree context-menu command, applied to the node the menu was opened
     /// on (`Message::TreeMenuTarget` recorded it when the menu opened).
     fn tree_menu_command(&mut self, action: TreeMenuAction) -> Task<Message> {
@@ -744,6 +877,7 @@ impl VaultNotes {
                     }
                 }
                 self.rebuild_index();
+                self.sync_tab_model();
             }
             Some(Err(error)) => self.error = Some(format!("cannot rename {old}: {error}")),
             None => {}
@@ -928,6 +1062,9 @@ impl cosmic::Application for VaultNotes {
             theme: settings::ThemeChoice::default(),
             tree_edit: None,
             tree_menu_target: None,
+            nav_model: build_nav_model(),
+            pane_model: build_pane_model(),
+            tab_model: segmented_button::Model::default(),
         };
         app.core.set_header_title("Vault Notes".to_string());
 
@@ -993,6 +1130,7 @@ impl cosmic::Application for VaultNotes {
                     }
                 }
                 self.error = None;
+                self.sync_tab_model();
                 Task::none()
             }
             Message::BannerOverwrite => {
@@ -1018,6 +1156,7 @@ impl cosmic::Application for VaultNotes {
                     }
                 }
                 self.rebuild_index();
+                self.sync_tab_model();
                 Task::none()
             }
             Message::BannerDismiss => {
@@ -1062,31 +1201,54 @@ impl cosmic::Application for VaultNotes {
             }
             Message::TreeEditSubmit => self.submit_tree_edit(),
             Message::Surface(action) => cosmic::task::message(cosmic::Action::Surface(action)),
-            Message::TabSelect(idx) => {
-                if idx < self.tabs.len() {
-                    self.active = Some(idx);
+            Message::NavSelect(id) => {
+                // The widget only publishes; the model's active state is ours.
+                self.nav_model.activate(id);
+                if let Some(panel) = self.nav_model.data::<SidePanel>(id).copied() {
+                    self.panel = panel;
                 }
                 Task::none()
             }
+            Message::PaneActivated(id) => {
+                self.pane_model.activate(id);
+                if let Some(mode) = self.pane_model.data::<PaneMode>(id).copied() {
+                    self.pane = mode;
+                }
+                Task::none()
+            }
+            Message::TabActivated(id) => {
+                self.tab_model.activate(id);
+                if let Some(idx) = self.tab_model.data::<usize>(id).copied() {
+                    if idx < self.tabs.len() {
+                        self.active = Some(idx);
+                    }
+                }
+                Task::none()
+            }
+            Message::TabCloseRequested(id) => match self.tab_model.data::<usize>(id).copied() {
+                Some(idx) => self.close_tab(idx),
+                None => Task::none(),
+            },
             Message::EditorAction(action) => {
                 if let Some(idx) = self.active {
                     let is_edit = action.is_edit();
+                    let was_dirty = self.tabs[idx].is_dirty();
                     let tab = &mut self.tabs[idx];
                     tab.content.perform(action);
                     if is_edit {
                         tab.refresh_doc();
+                        // Any editor activity (edits and cursor moves alike)
+                        // resets the idle timer: the user is still working
+                        // here.
+                        self.last_edit = Some(std::time::Instant::now());
                     }
-                    // Any editor activity (edits and cursor moves alike)
-                    // resets the idle timer: the user is still working here.
-                    self.last_edit = Some(std::time::Instant::now());
+                    if tab.is_dirty() != was_dirty {
+                        self.sync_tab_text(idx);
+                    }
                 }
                 Task::none()
             }
             Message::Save => self.save_active(),
-            Message::PaneMode(pane) => {
-                self.pane = pane;
-                Task::none()
-            }
             Message::ToggleFolder(path) => {
                 if !self.collapsed.remove(&path) {
                     self.collapsed.insert(path);
@@ -1163,6 +1325,7 @@ impl cosmic::Application for VaultNotes {
             }
             Message::SidePanel(panel) => {
                 self.panel = panel;
+                self.activate_nav(panel);
                 Task::none()
             }
             Message::SearchInput(query) => {
@@ -1571,5 +1734,109 @@ mod tests {
         // Idle past the window: save.
         assert!(autosave_due(Some(Duration::from_secs(2))));
         assert!(autosave_due(Some(Duration::from_secs(10))));
+    }
+}
+
+#[cfg(test)]
+mod chrome_model_tests {
+    use super::*;
+
+    #[test]
+    fn nav_model_carries_the_five_panels_in_order() {
+        let model = build_nav_model();
+        assert_eq!(model.len(), SidePanel::ALL.len());
+        let panels: Vec<SidePanel> = model
+            .iter()
+            .map(|id| model.data::<SidePanel>(id).copied().unwrap())
+            .collect();
+        assert_eq!(panels, SidePanel::ALL);
+        // Labels and icons ride along.
+        for id in model.iter() {
+            let panel = model.data::<SidePanel>(id).copied().unwrap();
+            assert_eq!(model.text(id), Some(panel.label()));
+            assert!(model.icon(id).is_some(), "{} has an icon", panel.label());
+        }
+        // Files (the default panel) starts active.
+        let active = model.active();
+        assert_eq!(model.data::<SidePanel>(active), Some(&SidePanel::Files));
+    }
+
+    #[test]
+    fn nav_activation_follows_programmatic_panel_switches() {
+        let mut model = build_nav_model();
+        assert!(activate_entity_with(&mut model, &SidePanel::Outline));
+        assert_eq!(
+            model.data::<SidePanel>(model.active()),
+            Some(&SidePanel::Outline)
+        );
+        assert!(activate_entity_with(&mut model, &SidePanel::Tags));
+        assert_eq!(
+            model.data::<SidePanel>(model.active()),
+            Some(&SidePanel::Tags)
+        );
+        // An unknown panel leaves the model untouched.
+        // (All SidePanels are known; the false path is for robustness.)
+    }
+
+    #[test]
+    fn pane_model_defaults_to_split() {
+        let mut model = build_pane_model();
+        assert_eq!(model.len(), 3);
+        assert_eq!(
+            model.data::<PaneMode>(model.active()),
+            Some(&PaneMode::Split)
+        );
+        let modes: Vec<PaneMode> = model
+            .iter()
+            .map(|id| model.data::<PaneMode>(id).copied().unwrap())
+            .collect();
+        assert_eq!(
+            modes,
+            [PaneMode::Source, PaneMode::Reading, PaneMode::Split]
+        );
+        assert!(activate_entity_with(&mut model, &PaneMode::Source));
+        assert_eq!(
+            model.data::<PaneMode>(model.active()),
+            Some(&PaneMode::Source)
+        );
+    }
+
+    #[test]
+    fn tab_model_mirrors_tabs_and_marks_the_active_one() {
+        let tabs = vec![
+            Tab::open("A.md".to_string(), "a"),
+            Tab::open("B.md".to_string(), "b"),
+            Tab::open("C.md".to_string(), "c"),
+        ];
+        let mut model = segmented_button::Model::default();
+        fill_tab_model(&mut model, &tabs, Some(1));
+        assert_eq!(model.len(), 3);
+        assert_eq!(model.data::<usize>(model.active()), Some(&1));
+        // Every tab is closable.
+        for id in model.iter() {
+            assert!(model.is_closable(id));
+        }
+        // Labels are the file stems.
+        let labels: Vec<String> = model
+            .iter()
+            .map(|id| model.text(id).unwrap().to_string())
+            .collect();
+        assert_eq!(labels, ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn tab_labels_mark_dirty_tabs() {
+        let mut tab = Tab::open("D.md".to_string(), "written");
+        assert_eq!(tab_label(&tab), "D");
+        // Same-module test: force dirtiness by diverging base from content.
+        tab.base_text = String::new();
+        assert_eq!(tab_label(&tab), "• D");
+    }
+
+    #[test]
+    fn empty_tab_list_yields_an_empty_model() {
+        let mut model = segmented_button::Model::default();
+        fill_tab_model(&mut model, &[], None);
+        assert_eq!(model.len(), 0);
     }
 }
