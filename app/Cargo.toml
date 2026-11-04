@@ -18,40 +18,39 @@ nucleo = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# iced is vendored inside the libcosmic checkout. Depending on it directly
-# (same path -> same crate instance as libcosmic's dependency) unlocks:
-# - the raw `text_editor` with `.highlight_with::<H>()` (libcosmic's own
-#   wrapper hardcodes the PlainText highlighter), and
-# - image codecs for attachment embeds ("image" enables the `image` crate's
-#   default decoders; libcosmic alone only asks for image-without-codecs).
-[dependencies.iced]
-path = "/cella/Git/libcosmic/iced"
-default-features = false
-features = ["highlighter", "image"]
-
-# libcosmic is used from a local checkout so the build does not depend on the
-# network. Pinned commit: 95236a944bfd51c63a2fc65fe50a592c47168d40 (2026-10-27).
-# Replace `path` with
-#   git = "https://github.com/pop-os/libcosmic.git"
-#   rev = "95236a944bfd51c63a2fc65fe50a592c47168d40"
-# to build without the checkout.
+# libcosmic (and its vendored iced submodule) come from git so the build does
+# not depend on a local checkout. Pinned libcosmic commit:
+# 95236a944bfd51c63a2fc65fe50a592c47168d40 (2026-10-27).
+# libcosmic vendors iced (pop-os/iced.git submodule commit
+# 229186b5180b6217d93866c912e6373ac378b231) via `path = "./iced"`. Because
+# that vendored iced is a path source while a direct `iced` git dependency
+# would be a separate crate instance, features no longer unify across them.
+# `app` uses `cosmic::iced::*` exclusively, so it drops its direct `iced`
+# dependency and enables the features it needs on libcosmic instead.
+#
+# NOTE: libcosmic's vendored iced is built with `image-without-codecs` and
+# libcosmic exposes no `iced/image` feature, so image *decoding* for
+# `cosmic::iced::widget::image` is not available at this pinned commit.
 [dependencies.libcosmic]
-path = "/cella/Git/libcosmic"
+git = "https://github.com/pop-os/libcosmic.git"
+rev = "95236a944bfd51c63a2fc65fe50a592c47168d40"
 default-features = false
-features = ["wgpu", "tokio", "a11y"]
+features = ["wgpu", "tokio", "a11y", "highlighter"]
 
 # Per-target feature selection (see HANDOFF.md 4.1): Wayland on Linux,
 # winit everywhere else. `cargo tree --target <triple> -e features` shows the
 # result.
 [target.'cfg(target_os = "linux")'.dependencies.libcosmic]
-path = "/cella/Git/libcosmic"
+git = "https://github.com/pop-os/libcosmic.git"
+rev = "95236a944bfd51c63a2fc65fe50a592c47168d40"
 default-features = false
-features = ["wayland", "dbus-config"]
+features = ["wayland", "dbus-config", "highlighter"]
 
 [target.'cfg(not(target_os = "linux"))'.dependencies.libcosmic]
-path = "/cella/Git/libcosmic"
+git = "https://github.com/pop-os/libcosmic.git"
+rev = "95236a944bfd51c63a2fc65fe50a592c47168d40"
 default-features = false
-features = ["winit"]
+features = ["winit", "highlighter"]
 
 [dev-dependencies]
 tempfile = "3.22"

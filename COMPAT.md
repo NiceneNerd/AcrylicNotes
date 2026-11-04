@@ -205,14 +205,12 @@ switcher, with the behaviors and limits decided for M4:
   that ignores capture status (so they work while the editor has focus):
   Ctrl+P toggles the switcher, Ctrl+S saves. Everything else is filtered
   out in `update`.
-- **Known fmt-gate note:** `cargo fmt --all` formats every non-registry
-  package in the dependency graph — including the whole pinned libcosmic
-  checkout at `/cella/Git/libcosmic` (113 files). The gate therefore uses
-  `cargo fmt -p vault-glass -p vault-core -p vault-md -p app` so our
-  formatting never rewrites the external checkout. (As of 2026-11-01 that
-  checkout also contains a broken iced example,
-  `iced/examples/sctk_subsurface_img/src/main.rs` — invalid pattern,
-  never compiled — which is what surfaced this.)
+- **Known fmt-gate note:** libcosmic + iced now come from git repos pinned in
+  `app/Cargo.toml` instead of a local checkout, so there is no external
+  checkout on disk for `cargo fmt` to rewrite. The gate uses
+  `cargo fmt -p vault-glass -p vault-core -p vault-md -p app` to keep
+  formatting limited to our own crates (`cargo fmt --all -- --check` stays
+  green).
 
 ## GUI polish + safety (M4c)
 
