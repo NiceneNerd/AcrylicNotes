@@ -443,3 +443,75 @@ chrome, readable spacing, and standard editing shortcuts.
   pair at word boundaries, so an apostrophe inside a word stays a plain
   character ("don't" is never "don''t"). The pair table is one function
   (`pair_for`).
+
+## Editor QOL rounds (M4d)
+
+Testing feedback turned into four focused phases (A–C shipped so far).
+All chord changes below supersede the M4c follow-up section above.
+
+### Phase A — shortcuts, chrome details
+
+- **Shortcut architecture**: the global key subscription now carries the
+  iced `event::Status`. Captured events are skipped in `update` so
+  editor-scoped bindings never double-fire global shortcuts — except
+  while one of the app's own text inputs (quick switcher, inline tree
+  rename, find bar) owns the keyboard: their keys are exactly what the
+  global handler routes.
+- **Chord changes**: Ctrl+F is *always* find-in-note (was vault search);
+  vault search moves to Ctrl+Shift+F (both shifted spellings `f`/`F`
+  route there); footnotes move from Ctrl+Shift+F to **Ctrl+Alt+F**.
+  Ctrl+P / Ctrl+S / Ctrl+D / Ctrl+W are unchanged.
+- **Window title**: the desktop window title (task switcher) is now
+  `note — vault`, the vault name alone, or `Vault Notes` — synced on
+  vault open and tab open/close/switch (`core.set_title` was never
+  called before, so the title showed "unknown").
+- **Reading pane padding** actually pads now: iced 0.14
+  `Scrollable::padding` only insets its scrollbar, so the padding moved
+  to the wrapping container.
+- **Pane segmented control** gained button padding (its default was
+  zero); the theme toggle is an icon button (sun/moon, showing the
+  theme a click switches to).
+- **Quick switcher** rows show the note's parent path dimmed beside the
+  title.
+- **File tree** hides the `.md` extension on note rows by default
+  (Obsidian-like); `hide_md_extension` persists in settings (default
+  true, UI toggle pending the settings drawer).
+
+### Phase B — find in current note (Ctrl+F)
+
+- An app-level find bar sits above the note area: query input, live
+  `n of m` count, go-up/go-down, `Aa` case toggle, close, plus a
+  replace row (`Replace` / `All`). It opens pre-filled from a
+  single-line selection and focuses its input.
+- iced's text editor has no find or match-painting API, so matching is
+  app-level: a pure scanner over `text.split('\n')` produces
+  (line, byte-start, byte-end) hits — byte columns, like the editor's
+  cursor columns. Navigation selects the match in the editor (so the
+  editor's own selection highlight shows it); it wraps, and opening
+  jumps to the first match at/after the current selection anchor.
+- Replace / Replace All splice the buffer byte-exactly, one undoable
+  step each (per-tab snapshot stack). Only ASCII case folding is
+  applied, which keeps byte offsets stable.
+- While the bar is open the global handler routes Enter (next),
+  Shift+Enter (previous), and Esc (close).
+
+### Phase C — wikilink autocomplete
+
+- Typing `[[` in the editor opens a suggestion dropdown (max 8 titles,
+  ranked by the same nucleo fuzzy matcher as the quick switcher). It
+  tracks the cursor: the unclosed `[[` in the cursor's line and the
+  partial link text as the query. A closed link (`]`), an alias
+  separator (`|`), or a `[[` on an earlier line closes it.
+- Tab (or clicking a row) completes the link as `[[Title]]` — the
+  partial text from `[` to the cursor is replaced in one undoable step.
+  Ctrl+Tab / Ctrl+Shift+Tab cycle the highlight (wrapping); Esc
+  dismisses.
+- Esc is intercepted in the editor's `key_binding` (custom
+  `WikiDismiss` binding before the default unfocus) because the editor
+  owns that key; Tab and Ctrl+Tab are not editor-bound and reach the
+  global handler, which routes them while the dropdown is open.
+- The dropdown floats over the editor's bottom edge (iced exposes no
+  caret pixel position), is not opaque — clicks outside it fall through
+  to the editor — and shows only in Source and Split panes. It clears
+  on pane/panel switches, tab open/close, undo/redo, find replaces, and
+  any editor action that leaves the unclosed `[[`.
