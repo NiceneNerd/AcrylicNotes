@@ -390,6 +390,19 @@ pub enum Message {
     AttachmentAdd,
     /// Remove an extension from the tree filter.
     AttachmentRemove(String),
+    // --- Unicode codepoint entry (Ctrl+Shift+U, GTK-style) ---
+    /// Begin codepoint entry in the focused editor.
+    UnicodeStart,
+    /// A character typed while entry is open (only hex digits count).
+    UnicodeHex(char),
+    /// Remove the last hex digit; exits when none remain.
+    UnicodeBackspace,
+    /// Insert the collected codepoint and return to editing.
+    UnicodeCommit,
+    /// A key that does nothing during entry (e.g. Tab).
+    UnicodeIgnore,
+    /// Abandon codepoint entry.
+    UnicodeCancel,
     /// Delete the word before (false) or after (true) the cursor.
     EditorDeleteWord(bool),
     /// A bracket/quote was typed: pair it around the selection, or insert
@@ -479,6 +492,9 @@ pub struct VaultNotes {
     pub attachment_extensions: Vec<String>,
     /// Draft text of the drawer's extension input.
     pub attachment_input: String,
+    /// Hex digits collected so far during Unicode codepoint entry
+    /// (Ctrl+Shift+U); `None` while the mode is off.
+    pub unicode_input: Option<String>,
     /// Pending inline tree edit (new note / new folder / rename), if any.
     pub tree_edit: Option<tree::TreeEdit>,
     /// The in-note find bar state (Ctrl+F), when open.
@@ -554,6 +570,17 @@ fn attachment_shown(path: &str, extensions: &[String]) -> bool {
     path.rsplit_once('.')
         .map(|(_, ext)| ext.to_ascii_lowercase())
         .is_some_and(|ext| extensions.contains(&ext))
+}
+
+// --- Unicode codepoint entry (Ctrl+Shift+U) --------------------------------
+
+/// GTK caps hex entry at 6 digits (`0x10FFFF` is the last codepoint).
+const UNICODE_MAX_DIGITS: usize = 6;
+
+/// Parse collected hex digits into a codepoint, rejecting surrogates
+/// and out-of-range values.
+pub(crate) fn unicode_char(hex: &str) -> Option<char> {
+    u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
 }
 
 // --- editor commands (undo, formatting, footnotes, word delete) ------------
@@ -944,6 +971,8 @@ pub(crate) fn editor_shortcut(press: text_editor::KeyPress) -> Option<Message> {
                 // Footnote lives on Ctrl+Alt+F: Ctrl+Shift+F belongs to the
                 // global vault search.
                 ("f", _, true) => Some(Message::EditorFootnote),
+                // GTK-style Unicode codepoint entry.
+                ("u", true, false) => Some(Message::UnicodeStart),
                 _ => None,
             }
         }
@@ -964,6 +993,41 @@ pub(crate) fn editor_shortcut(press: text_editor::KeyPress) -> Option<Message> {
             pair_for(typed)?;
             Some(Message::EditorAutoPair(typed))
         }
+        _ => None,
+    }
+}
+
+/// While Unicode codepoint entry is open, map an editor key press:
+/// typed characters feed the hex buffer (the handler keeps only hex
+/// digits), Space/Enter commit, Backspace unravels, Esc cancels, and
+/// Tab is ignored — GTK's behavior. Chords with Ctrl or Alt fall
+/// through (`None`) so shortcuts keep working, as do keys like the
+/// arrow keys (the commit inserts wherever the caret ends up).
+pub(crate) fn unicode_entry_binding(
+    press: &text_editor::KeyPress,
+) -> Option<text_editor::Binding<Message>> {
+    if press.modifiers.command() || press.modifiers.alt() {
+        return None;
+    }
+    match &press.key {
+        cosmic::iced::keyboard::Key::Character(c) => {
+            let mut chars = c.chars();
+            let first = chars.next()?;
+            // Space arrives as a character key (there is no Named::Space
+            // in this iced); like GTK, it commits the entry.
+            if first == ' ' && chars.next().is_none() {
+                return Some(text_editor::Binding::Custom(Message::UnicodeCommit));
+            }
+            (chars.next().is_none())
+                .then(|| text_editor::Binding::Custom(Message::UnicodeHex(first)))
+        }
+        cosmic::iced::keyboard::Key::Named(named) => match named {
+            Named::Enter => Some(text_editor::Binding::Custom(Message::UnicodeCommit)),
+            Named::Backspace => Some(text_editor::Binding::Custom(Message::UnicodeBackspace)),
+            Named::Escape => Some(text_editor::Binding::Custom(Message::UnicodeCancel)),
+            Named::Tab => Some(text_editor::Binding::Custom(Message::UnicodeIgnore)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -1170,6 +1234,13 @@ impl VaultNotes {
             .any(|tab| tab.path == path && tab.is_dirty())
     }
 
+    /// Close any editor-attached overlays (wikilink dropdown, Unicode
+    /// codepoint entry). Called whenever the editing context changes.
+    fn dismiss_editor_overlays(&mut self) {
+        self.wiki_complete = None;
+        self.unicode_input = None;
+    }
+
     /// Resolve a tree attachment path (vault-relative) to an absolute path
     /// for the platform handler; falls back to the raw path with no vault.
     fn attachment_path(&self, path: &str) -> PathBuf {
@@ -1207,7 +1278,7 @@ impl VaultNotes {
     }
 
     fn open_tab(&mut self, path: String) -> Task<Message> {
-        self.wiki_complete = None;
+        self.dismiss_editor_overlays();
         if let Some(i) = self.tabs.iter().position(|tab| tab.path == path) {
             self.active = Some(i);
             self.sync_tab_model();
@@ -1390,7 +1461,7 @@ impl VaultNotes {
         if self.tabs[idx].is_dirty() && !self.save_tab(idx) {
             return Task::none();
         }
-        self.wiki_complete = None;
+        self.dismiss_editor_overlays();
         self.tabs.remove(idx);
         self.active = match self.active {
             Some(active) if active >= self.tabs.len() => {
@@ -1618,17 +1689,17 @@ impl VaultNotes {
     /// cursor: open while an unclosed `[[` is being typed, gone otherwise.
     fn update_wiki_complete(&mut self) {
         if !self.wiki_autocomplete {
-            self.wiki_complete = None;
+            self.dismiss_editor_overlays();
             return;
         }
         let Some(idx) = self.active else {
-            self.wiki_complete = None;
+            self.dismiss_editor_overlays();
             return;
         };
         let text = self.tabs[idx].content.text();
         let cursor = self.tabs[idx].content.cursor().position;
         let Some((_, query)) = wiki_query_at(&text, cursor) else {
-            self.wiki_complete = None;
+            self.dismiss_editor_overlays();
             return;
         };
         let titles: Vec<String> = self
@@ -1644,7 +1715,7 @@ impl VaultNotes {
             .unwrap_or_default();
         let items = wiki_items(&query, &titles);
         if items.is_empty() {
-            self.wiki_complete = None;
+            self.dismiss_editor_overlays();
         } else {
             let selected = self
                 .wiki_complete
@@ -1670,7 +1741,7 @@ impl VaultNotes {
         let text = self.tabs[idx].content.text();
         let cursor = self.tabs[idx].content.cursor().position;
         let Some((open_col, _)) = wiki_query_at(&text, cursor) else {
-            self.wiki_complete = None;
+            self.dismiss_editor_overlays();
             return;
         };
         let was_dirty = self.tabs[idx].is_dirty();
@@ -1692,7 +1763,7 @@ impl VaultNotes {
         if self.tabs[idx].is_dirty() != was_dirty {
             self.sync_tab_text(idx);
         }
-        self.wiki_complete = None;
+        self.dismiss_editor_overlays();
     }
 
     /// Move the dropdown highlight (wrapping).
@@ -2057,6 +2128,7 @@ impl cosmic::Application for VaultNotes {
             default_pane: persisted.default_pane,
             attachment_extensions: persisted.attachment_extensions,
             attachment_input: String::new(),
+            unicode_input: None,
             tree_edit: None,
             tree_menu_target: None,
             find: None,
@@ -2212,7 +2284,7 @@ impl cosmic::Application for VaultNotes {
                 if let Some(panel) = self.nav_model.data::<SidePanel>(id).copied() {
                     self.panel = panel;
                 }
-                self.wiki_complete = None;
+                self.dismiss_editor_overlays();
                 Task::none()
             }
             Message::PaneActivated(id) => {
@@ -2220,7 +2292,7 @@ impl cosmic::Application for VaultNotes {
                 if let Some(mode) = self.pane_model.data::<PaneMode>(id).copied() {
                     self.pane = mode;
                 }
-                self.wiki_complete = None;
+                self.dismiss_editor_overlays();
                 Task::none()
             }
             Message::TabActivated(id) => {
@@ -2230,7 +2302,7 @@ impl cosmic::Application for VaultNotes {
                         self.active = Some(idx);
                     }
                 }
-                self.wiki_complete = None;
+                self.dismiss_editor_overlays();
                 let title = self.sync_window_title();
                 let scroll = self.sync_preview_scroll();
                 Task::batch([title, scroll])
@@ -2404,7 +2476,7 @@ impl cosmic::Application for VaultNotes {
                 Task::none()
             }
             Message::WikiDismiss => {
-                self.wiki_complete = None;
+                self.dismiss_editor_overlays();
                 Task::none()
             }
             Message::EditorCopy => {
@@ -2479,7 +2551,7 @@ impl cosmic::Application for VaultNotes {
                 self.wiki_autocomplete = on;
                 persist_setting(|s| s.wiki_autocomplete = on);
                 if !on {
-                    self.wiki_complete = None;
+                    self.dismiss_editor_overlays();
                 }
                 Task::none()
             }
@@ -2552,6 +2624,50 @@ impl cosmic::Application for VaultNotes {
                 let extensions = self.attachment_extensions.clone();
                 persist_setting(move |s| s.attachment_extensions = extensions);
                 self.rebuild_index();
+                Task::none()
+            }
+            Message::UnicodeStart => {
+                if self.active.is_some() {
+                    self.dismiss_editor_overlays();
+                    self.unicode_input = Some(String::new());
+                }
+                Task::none()
+            }
+            Message::UnicodeHex(typed) => {
+                if let Some(hex) = self.unicode_input.as_mut() {
+                    if typed.is_ascii_hexdigit() && hex.chars().count() < UNICODE_MAX_DIGITS {
+                        hex.push(typed.to_ascii_lowercase());
+                    }
+                }
+                Task::none()
+            }
+            Message::UnicodeBackspace => {
+                let mut emptied = false;
+                if let Some(hex) = self.unicode_input.as_mut() {
+                    hex.pop();
+                    emptied = hex.is_empty();
+                }
+                // Backspacing the empty "u" exits the mode, like GTK.
+                if emptied {
+                    self.unicode_input = None;
+                }
+                Task::none()
+            }
+            Message::UnicodeCommit => {
+                let hex = self.unicode_input.take();
+                if let (Some(idx), Some(hex)) = (self.active, hex) {
+                    if let Some(ch) = unicode_char(&hex) {
+                        self.run_editor_command(idx, vec![Action::Edit(Edit::Insert(ch))]);
+                        return self.sync_preview_scroll();
+                    }
+                    // Invalid codepoint (surrogate, > U+10FFFF): the
+                    // mode simply ends, leaving the buffer untouched.
+                }
+                Task::none()
+            }
+            Message::UnicodeIgnore => Task::none(),
+            Message::UnicodeCancel => {
+                self.unicode_input = None;
                 Task::none()
             }
             Message::Save => self.save_active(),
@@ -3801,6 +3917,7 @@ mod find_tests {
             default_pane: PaneMode::default(),
             attachment_extensions: Vec::new(),
             attachment_input: String::new(),
+            unicode_input: None,
             tree_edit: None,
             tree_menu_target: None,
             find: None,
@@ -4208,5 +4325,169 @@ mod attachment_filter_tests {
         let mut leaves = Vec::new();
         collect(&app.tree, &mut leaves);
         assert!(leaves.contains(&"assets/scan.pdf".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod unicode_entry_tests {
+    use super::*;
+    use cosmic::app::Application as _;
+    use cosmic::iced::keyboard::key::Named;
+    use cosmic::iced::keyboard::{Key, Modifiers};
+    use cosmic::iced::widget::text_editor::{self, Status};
+
+    fn press(key: Key, modifiers: Modifiers) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: cosmic::iced::keyboard::key::Physical::Code(
+                cosmic::iced::keyboard::key::Code::KeyU,
+            ),
+            modifiers,
+            text: None,
+            status: Status::Focused { is_hovered: false },
+        }
+    }
+
+    #[test]
+    fn codepoint_parsing_rejects_surrogates_and_overflow() {
+        assert_eq!(unicode_char("1f600"), Some('😀'));
+        assert_eq!(unicode_char("41"), Some('A'));
+        // Surrogates are not valid characters.
+        assert_eq!(unicode_char("d800"), None);
+        // Beyond U+10FFFF.
+        assert_eq!(unicode_char("110000"), None);
+        assert_eq!(unicode_char("zz"), None);
+    }
+
+    #[test]
+    fn start_chord_maps_to_unicode_entry() {
+        let ctrl_shift_u = press(
+            Key::Character("U".into()),
+            Modifiers::CTRL | Modifiers::SHIFT,
+        );
+        assert!(matches!(
+            editor_shortcut(ctrl_shift_u),
+            Some(Message::UnicodeStart)
+        ));
+        // Without shift it stays unmapped (Ctrl+U is nothing today).
+        let ctrl_u = press(Key::Character("u".into()), Modifiers::CTRL);
+        assert!(matches!(editor_shortcut(ctrl_u), None));
+    }
+
+    #[test]
+    fn entry_keys_feed_the_hex_buffer() {
+        // Hex digits accumulate (lowercased), in any case.
+        assert!(matches!(
+            unicode_entry_binding(&press(Key::Character("F".into()), Modifiers::empty())),
+            Some(text_editor::Binding::Custom(Message::UnicodeHex('F')))
+        ));
+        // Space commits (it arrives as a character key).
+        assert!(matches!(
+            unicode_entry_binding(&press(Key::Character(" ".into()), Modifiers::empty())),
+            Some(text_editor::Binding::Custom(Message::UnicodeCommit))
+        ));
+        // Enter commits, Backspace unravels, Esc cancels, Tab is ignored.
+        assert!(matches!(
+            unicode_entry_binding(&press(Key::Named(Named::Enter), Modifiers::empty())),
+            Some(text_editor::Binding::Custom(Message::UnicodeCommit))
+        ));
+        assert!(matches!(
+            unicode_entry_binding(&press(Key::Named(Named::Backspace), Modifiers::empty())),
+            Some(text_editor::Binding::Custom(Message::UnicodeBackspace))
+        ));
+        assert!(matches!(
+            unicode_entry_binding(&press(Key::Named(Named::Escape), Modifiers::empty())),
+            Some(text_editor::Binding::Custom(Message::UnicodeCancel))
+        ));
+        assert!(matches!(
+            unicode_entry_binding(&press(Key::Named(Named::Tab), Modifiers::empty())),
+            Some(text_editor::Binding::Custom(Message::UnicodeIgnore))
+        ));
+        // Chords with Ctrl or Alt fall through so shortcuts keep working.
+        assert!(matches!(
+            unicode_entry_binding(&press(Key::Character("s".into()), Modifiers::CTRL)),
+            None
+        ));
+        // Arrow keys fall through: the caret may move, entry continues.
+        assert!(matches!(
+            unicode_entry_binding(&press(Key::Named(Named::ArrowLeft), Modifiers::empty())),
+            None
+        ));
+    }
+
+    #[test]
+    fn entry_collects_commits_and_unravels() {
+        let mut app = find_tests::test_app_with_tab("x\n");
+        // Not started: hex input is ignored.
+        let _ = app.update(Message::UnicodeHex('4'));
+        assert_eq!(app.unicode_input, None);
+
+        let _ = app.update(Message::UnicodeStart);
+        assert_eq!(app.unicode_input, Some(String::new()));
+        // Starting again dismisses any wikilink dropdown.
+        app.wiki_complete = Some(crate::app::WikiComplete {
+            items: vec!["n".into()],
+            selected: 0,
+        });
+        let _ = app.update(Message::UnicodeStart);
+        assert_eq!(app.wiki_complete, None);
+
+        // Digits accumulate; non-hex is ignored; cap at 6 digits.
+        for ch in ['2', 'g', '6', 'A'] {
+            let _ = app.update(Message::UnicodeHex(ch));
+        }
+        assert_eq!(app.unicode_input.as_deref(), Some("26a"));
+        let filler = "123";
+        for ch in filler.chars() {
+            let _ = app.update(Message::UnicodeHex(ch));
+        }
+        assert_eq!(app.unicode_input.as_deref(), Some("26a123"));
+        let _ = app.update(Message::UnicodeHex('4'));
+        assert_eq!(app.unicode_input.as_deref(), Some("26a123"));
+
+        // Backspace unravels; emptying exits the mode.
+        let _ = app.update(Message::UnicodeBackspace);
+        assert_eq!(app.unicode_input.as_deref(), Some("26a12"));
+        for _ in 0..6 {
+            let _ = app.update(Message::UnicodeBackspace);
+        }
+        assert_eq!(app.unicode_input, None);
+    }
+
+    #[test]
+    fn commit_inserts_the_codepoint_and_ends_the_mode() {
+        let mut app = find_tests::test_app_with_tab("end\n");
+        let _ = app.update(Message::UnicodeStart);
+        for ch in "1F600".chars() {
+            let _ = app.update(Message::UnicodeHex(ch));
+        }
+        let _ = app.update(Message::UnicodeCommit);
+        assert_eq!(app.unicode_input, None);
+        assert!(app.tabs[0].content.text().starts_with('\u{1F600}'));
+
+        // An invalid codepoint ends the mode without touching the text.
+        let before = app.tabs[0].content.text();
+        let _ = app.update(Message::UnicodeStart);
+        for ch in "D800".chars() {
+            let _ = app.update(Message::UnicodeHex(ch));
+        }
+        let _ = app.update(Message::UnicodeCommit);
+        assert_eq!(app.unicode_input, None);
+        assert_eq!(app.tabs[0].content.text(), before);
+
+        // Esc cancels.
+        let _ = app.update(Message::UnicodeStart);
+        let _ = app.update(Message::UnicodeCancel);
+        assert_eq!(app.unicode_input, None);
+    }
+
+    #[test]
+    fn context_changes_dismiss_the_entry() {
+        let mut app = find_tests::test_app_with_tab("x\n");
+        let _ = app.update(Message::UnicodeStart);
+        // Opening another tab dismisses it (via the shared overlay dismiss).
+        app.open_tab("other.md".to_string());
+        assert_eq!(app.unicode_input, None);
     }
 }

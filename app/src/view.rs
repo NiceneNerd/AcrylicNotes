@@ -14,9 +14,9 @@ use cosmic::widget::{
 use cosmic::Element;
 
 use crate::app::{
-    editor_shortcut, find_matches, parent_of, title_of, tree_note_label, Message, Palette,
-    PaneMode, SidePanel, TreeMenuAction, VaultNotes, ATTACHMENT_INPUT, FIND_INPUT, SWITCHER_INPUT,
-    TREE_EDIT_INPUT,
+    editor_shortcut, find_matches, parent_of, title_of, tree_note_label, unicode_char,
+    unicode_entry_binding, Message, Palette, PaneMode, SidePanel, TreeMenuAction, VaultNotes,
+    ATTACHMENT_INPUT, FIND_INPUT, SWITCHER_INPUT, TREE_EDIT_INPUT,
 };
 use crate::reading;
 use crate::scroll::READING_SCROLL;
@@ -864,6 +864,13 @@ fn editor_pane<'a>(
         // word delete. Anything else falls back to the editor's own
         // bindings (copy/cut/paste/select-all, arrows, …).
         .key_binding(move |press: text_editor::KeyPress| {
+            // While Unicode codepoint entry (Ctrl+Shift+U) is open, the
+            // editor swallows typing and feeds the hex buffer instead.
+            if app.unicode_input.is_some() {
+                if let Some(binding) = unicode_entry_binding(&press) {
+                    return Some(binding);
+                }
+            }
             // While the wikilink dropdown is open, Esc dismisses it
             // instead of the editor's default unfocus. (Tab and
             // Ctrl+Tab are not editor-bound; they reach the global
@@ -919,12 +926,16 @@ fn editor_pane<'a>(
             ..Default::default()
         })
         .into();
-    let pane: cosmic::Element<'a, Message> = match wiki {
+    let pane: cosmic::Element<'a, Message> = match (&app.unicode_input, wiki) {
+        // The Unicode entry indicator floats over the editor's bottom
+        // edge, same slot as the wikilink dropdown (they never coexist:
+        // starting one dismisses the other).
+        (Some(_), _) => stack([surface, unicode_entry_overlay(app, palette)]).into(),
         // The suggestion list floats over the editor's bottom edge. The
         // layer is deliberately not `opaque`: clicks outside the list
         // fall through to the editor, so typing and clicking keep working.
-        Some(wiki) => stack([surface, wiki_dropdown(wiki, palette)]).into(),
-        None => surface,
+        (None, Some(wiki)) => stack([surface, wiki_dropdown(wiki, palette)]).into(),
+        (None, None) => surface,
     };
     // Right-click anywhere on the pane opens the editor menu.
     context_menu(pane, Some(editor_menu()))
@@ -955,15 +966,7 @@ fn wiki_dropdown<'a>(wiki: &'a crate::app::WikiComplete, palette: Palette) -> El
         container(col)
             .width(Length::Shrink)
             .max_width(280)
-            .style(move |_| cosmic::widget::container::Style {
-                background: Some(Background::Color(with_alpha(palette.surface, 0.94))),
-                border: border::Border {
-                    radius: 8.0.into(),
-                    width: 1.0,
-                    color: with_alpha(palette.muted, 0.5),
-                },
-                ..Default::default()
-            }),
+            .style(popup_style(palette)),
     )
     .width(Length::Fill)
     .height(Length::Fill)
@@ -1199,4 +1202,45 @@ pub fn settings_view<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
+}
+
+/// Shared style for the editor's floating popups (wikilink dropdown,
+/// Unicode entry indicator).
+fn popup_style(palette: Palette) -> impl Fn(&cosmic::Theme) -> cosmic::widget::container::Style {
+    move |_| cosmic::widget::container::Style {
+        background: Some(Background::Color(with_alpha(palette.surface, 0.94))),
+        border: border::Border {
+            radius: 8.0.into(),
+            width: 1.0,
+            color: with_alpha(palette.muted, 0.5),
+        },
+        ..Default::default()
+    }
+}
+
+/// The Unicode codepoint entry indicator (Ctrl+Shift+U): GTK shows the
+/// underlined hex at the caret, but iced exposes no caret pixel
+/// position, so this anchors to the editor's bottom edge like the
+/// wikilink dropdown. Shows `u` plus the digits so far, the resolved
+/// character once the codepoint is valid, and the key hints.
+fn unicode_entry_overlay<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+    let hex = app.unicode_input.as_deref().unwrap_or("");
+    let mut col = column::Column::new()
+        .spacing(2)
+        .push(text(format!("u{hex}")).size(16));
+    if let Some(ch) = unicode_char(hex) {
+        col = col.push(text(format!("= {ch}")).size(16));
+    }
+    col = col.push(
+        text("Enter insert · Backspace · Esc cancel")
+            .size(11)
+            .class(palette.muted),
+    );
+    container(container(col).padding(6).style(popup_style(palette)))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(alignment::Horizontal::Left)
+        .align_y(alignment::Vertical::Bottom)
+        .padding([0, 12, 4, 12])
+        .into()
 }
