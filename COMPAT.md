@@ -190,6 +190,18 @@ switcher, with the behaviors and limits decided for M4:
   over note paths, smart case + smart normalization, top 20. Enter
   activates, arrows move, Esc closes; clicking a row opens it directly.
   Inert when no vault is open.
+  - **Ranking rules** (paths get their own ranker, not the plain title
+    ranker): the query is split into words and every word must match
+    somewhere in the path, in any order — so "projects note" finds
+    `Projects/notes.md` (one word in the folder, one in the title),
+    which a single conjunctive pattern could not match. Words matched
+    in the file title outrank words matched only in the folder path, so
+    typing a note's name doesn't surface unrelated files whose folder
+    happens to contain those letters. Ties go to the shorter title,
+    then to a case-insensitive path comparison (byte order would rank
+    "Projects/…" before "glass.md").
+  - **Empty query** lists the most recently modified notes first (ties
+    alphabetical) rather than a flat path dump.
 - **Outline panel** lists top-level headings with their block index;
   clicking scrolls the reading view there. **Tags panel** lists all tags
   (frontmatter + inline) with note counts, then the notes of the selected

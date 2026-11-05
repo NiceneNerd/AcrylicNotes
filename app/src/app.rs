@@ -84,6 +84,9 @@ pub struct Switcher {
 /// Id of the switcher's text input (so it can be focused on open).
 pub const SWITCHER_INPUT: &str = "switcher-input";
 
+/// How many notes the quick switcher shows at most.
+pub const SWITCHER_MAX_ITEMS: usize = 20;
+
 /// Id of the find bar's text input (focused when find opens).
 pub const FIND_INPUT: &str = "find-input";
 
@@ -1345,15 +1348,24 @@ impl VaultNotes {
     fn rerank_switcher(&mut self) {
         let query = self.switcher.query.clone();
         if let Some(vault) = self.vault.as_ref() {
-            let paths: Vec<String> = vault
-                .notes_sorted()
-                .iter()
-                .map(|note| note.path.clone())
-                .collect();
-            self.switcher.items = crate::fuzzy::rank(&query, &paths, 20)
-                .into_iter()
-                .map(|ranked| paths[ranked.index].clone())
-                .collect();
+            let mut notes = vault.notes_sorted();
+            if query.trim().is_empty() {
+                // No query: the most recently touched notes first (the
+                // ones you are working on), ties alphabetical. A plain
+                // path dump buries them under whatever sorts first.
+                notes.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.path.cmp(&b.path)));
+                self.switcher.items = notes
+                    .iter()
+                    .take(SWITCHER_MAX_ITEMS)
+                    .map(|note| note.path.clone())
+                    .collect();
+            } else {
+                let paths: Vec<String> = notes.iter().map(|note| note.path.clone()).collect();
+                self.switcher.items = crate::fuzzy::rank_paths(&query, &paths, SWITCHER_MAX_ITEMS)
+                    .into_iter()
+                    .map(|ranked| paths[ranked.index].clone())
+                    .collect();
+            }
         } else {
             self.switcher.items.clear();
         }
@@ -4489,5 +4501,56 @@ mod unicode_entry_tests {
         // Opening another tab dismisses it (via the shared overlay dismiss).
         app.open_tab("other.md".to_string());
         assert_eq!(app.unicode_input, None);
+    }
+}
+
+#[cfg(test)]
+mod switcher_ranking_tests {
+    use super::*;
+
+    /// Write a note with an explicit modification time.
+    fn write_note(dir: &std::path::Path, name: &str, modified: std::time::SystemTime) {
+        let path = dir.join(name);
+        std::fs::write(&path, "body\n").unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+
+    #[test]
+    fn empty_query_lists_the_most_recently_touched_notes_first() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let now = std::time::SystemTime::now();
+        // Alphabetically "alpha" comes first, but "zulu" is newer: the
+        // recent one leads.
+        write_note(
+            tmp.path(),
+            "alpha.md",
+            now - std::time::Duration::from_secs(3600),
+        );
+        write_note(tmp.path(), "zulu.md", now);
+
+        let mut app = find_tests::test_app_with_tab("");
+        app.vault = Some(Vault::open(tmp.path()).unwrap());
+        app.rerank_switcher();
+        assert_eq!(app.switcher.items, vec!["zulu.md", "alpha.md"]);
+
+        // A query switches back to match ranking: the title match
+        // ("alpha.md") outranks the folder-only match
+        // ("alpha/older.md"), which still shows up below it.
+        std::fs::create_dir_all(tmp.path().join("alpha")).unwrap();
+        write_note(tmp.path(), "alpha/older.md", now);
+        app.vault = Some(Vault::open(tmp.path()).unwrap());
+        app.switcher.query = "alpha".to_string();
+        app.rerank_switcher();
+        assert_eq!(
+            app.switcher.items.first().map(String::as_str),
+            Some("alpha.md")
+        );
+        assert!(
+            app.switcher.items.contains(&"alpha/older.md".to_string()),
+            "{:?}",
+            app.switcher.items
+        );
     }
 }
