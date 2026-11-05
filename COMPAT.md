@@ -527,6 +527,12 @@ All chord changes below supersede the M4c follow-up section above.
   to the editor — and shows only in Source and Split panes. It clears
   on pane/panel switches, tab open/close, undo/redo, find replaces, and
   any editor action that leaves the unclosed `[[`.
+- The editor keeps focus while the dropdown is open: the popup layer is
+  always mounted as the pane's second stack child, so the widget tree
+  never restructures when it appears (a restructure would discard the
+  editor's focus state and leave typing dead until the next click),
+  and the editor carries a stable widget id that preserves its focus
+  across pane-mode switches and the quick-switcher overlay too.
 
 ### Phase D — editor context menu
 
