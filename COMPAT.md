@@ -518,6 +518,13 @@ All chord changes below supersede the M4c follow-up section above.
   partial text from `[` to the cursor is replaced in one undoable step.
   Ctrl+Tab / Ctrl+Shift+Tab cycle the highlight (wrapping); Esc
   dismisses.
+- How the completed link spells its target follows the drawer's "Link
+  path" choice (Obsidian's "new link format"): **Shortest** (default)
+  is the bare title, upgraded to the full vault path when several
+  notes share the title; **Relative** is the path from the current
+  note's folder (`../folder/note`); **Absolute** is the full vault
+  path. All forms omit `.md` and resolve through the existing link
+  resolution rules.
 - Esc is intercepted in the editor's `key_binding` (custom
   `WikiDismiss` binding before the default unfocus) because the editor
   owns that key; Tab and Ctrl+Tab are not editor-bound and reach the
