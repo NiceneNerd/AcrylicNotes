@@ -569,3 +569,8 @@ All chord changes below supersede the M4c follow-up section above.
   it with the platform handler (`xdg-open`). They deliberately get no
   rename row, dirty dots, or context menu — renaming wouldn't rewrite
   links to them — and they stay out of search and the switcher.
+- Which file types appear is configurable in the settings drawer
+  ("File types in tree"): an extension whitelist (lowercase, stored
+  without the dot) with add/remove rows. An empty list — the default —
+  shows every attachment; a non-empty list shows only matching files
+  (case-insensitive). Notes are never filtered.
