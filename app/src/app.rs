@@ -181,6 +181,9 @@ pub struct Tab {
     /// Cached status-bar counts (refreshed with the doc).
     pub words: usize,
     pub chars: usize,
+    /// The editor cursor's file line when preview scroll sync last ran, so
+    /// sync only fires when the caret changes line.
+    synced_line: Option<usize>,
 }
 
 impl Tab {
@@ -201,6 +204,7 @@ impl Tab {
             redo: Vec::new(),
             words: 0,
             chars: 0,
+            synced_line: None,
         };
         tab.refresh_doc();
         tab
@@ -433,6 +437,8 @@ pub struct VaultNotes {
     pub theme: settings::ThemeChoice,
     /// Hide the `.md` extension on note rows in the file tree.
     pub hide_md_extension: bool,
+    /// Follow the editor caret in the visible reading pane.
+    pub scroll_sync: bool,
     /// Pending inline tree edit (new note / new folder / rename), if any.
     pub tree_edit: Option<tree::TreeEdit>,
     /// The in-note find bar state (Ctrl+F), when open.
@@ -1211,6 +1217,33 @@ impl VaultNotes {
         crate::scroll::to_block::<Message>(idx, 12.0)
     }
 
+    /// Scroll-sync (Phase F): in Split mode, follow the editor caret — the
+    /// reading pane scrolls to the top-level block containing the caret's
+    /// line. Fires only when the caret changes line, and never in Source
+    /// mode (no preview) or when the setting is off. The reverse direction
+    /// (preview click → caret) is not possible: iced's editor has no
+    /// programmatic scroll API.
+    fn sync_preview_scroll(&mut self) -> Task<Message> {
+        if !self.scroll_sync || self.pane != PaneMode::Split {
+            return Task::none();
+        }
+        let Some(idx) = self.active else {
+            return Task::none();
+        };
+        // The editor buffer is the whole file; its 0-based cursor line + 1
+        // is the 1-based FILE line the spans use.
+        let line = self.tabs[idx].content.cursor().position.line + 1;
+        if self.tabs[idx].synced_line == Some(line) {
+            return Task::none();
+        }
+        let block = self.tabs[idx].doc.block_at_line(line);
+        self.tabs[idx].synced_line = Some(line);
+        match block {
+            Some(block) => crate::scroll::to_block::<Message>(block, 12.0),
+            None => Task::none(),
+        }
+    }
+
     /// Save the active tab through the safe write path: body-only edits
     /// reuse the original frontmatter bytes verbatim; frontmatter edits go
     /// through `save_note_full` with the full text.
@@ -1917,6 +1950,7 @@ impl cosmic::Application for VaultNotes {
             glass_style: vault_glass::GlassStyle::Opaque,
             theme: settings::ThemeChoice::default(),
             hide_md_extension: settings::load().hide_md_extension,
+            scroll_sync: settings::load().scroll_sync,
             tree_edit: None,
             tree_menu_target: None,
             find: None,
@@ -2091,7 +2125,10 @@ impl cosmic::Application for VaultNotes {
                         self.active = Some(idx);
                     }
                 }
-                self.sync_window_title()
+                self.wiki_complete = None;
+                let title = self.sync_window_title();
+                let scroll = self.sync_preview_scroll();
+                Task::batch([title, scroll])
             }
             Message::TabCloseRequested(id) => match self.tab_model.data::<usize>(id).copied() {
                 Some(idx) => self.close_tab(idx),
@@ -2121,7 +2158,7 @@ impl cosmic::Application for VaultNotes {
                 // Every editor interaction may open, move through, or close
                 // an unclosed `[[`.
                 self.update_wiki_complete();
-                Task::none()
+                self.sync_preview_scroll()
             }
             Message::EditorUndo => {
                 if let Some(idx) = self.active {
@@ -2136,7 +2173,7 @@ impl cosmic::Application for VaultNotes {
                     }
                 }
                 self.update_wiki_complete();
-                Task::none()
+                self.sync_preview_scroll()
             }
             Message::EditorRedo => {
                 if let Some(idx) = self.active {
@@ -2151,7 +2188,7 @@ impl cosmic::Application for VaultNotes {
                     }
                 }
                 self.update_wiki_complete();
-                Task::none()
+                self.sync_preview_scroll()
             }
             Message::EditorFormat(format) => {
                 if let Some(idx) = self.active {
@@ -2159,7 +2196,7 @@ impl cosmic::Application for VaultNotes {
                     let actions = format_actions(selection, format);
                     self.run_editor_command(idx, actions);
                 }
-                Task::none()
+                self.sync_preview_scroll()
             }
             Message::EditorFootnote => {
                 if let Some(idx) = self.active {
@@ -2167,7 +2204,7 @@ impl cosmic::Application for VaultNotes {
                     let actions = footnote_actions(&text);
                     self.run_editor_command(idx, actions);
                 }
-                Task::none()
+                self.sync_preview_scroll()
             }
             Message::EditorDeleteWord(right) => {
                 if let Some(idx) = self.active {
@@ -2175,7 +2212,7 @@ impl cosmic::Application for VaultNotes {
                     let actions = word_delete_actions(has_selection, right);
                     self.run_editor_command(idx, actions);
                 }
-                Task::none()
+                self.sync_preview_scroll()
             }
             Message::EditorAutoPair(typed) => {
                 if let Some(idx) = self.active {
@@ -2185,7 +2222,7 @@ impl cosmic::Application for VaultNotes {
                     let actions = autopair_actions(&text, cursor, typed, selection);
                     self.run_editor_command(idx, actions);
                 }
-                Task::none()
+                self.sync_preview_scroll()
             }
             Message::FindOpen => {
                 let mut find = self.find.take().unwrap_or_default();
@@ -2214,11 +2251,11 @@ impl cosmic::Application for VaultNotes {
             }
             Message::FindNext => {
                 self.find_step(true);
-                Task::none()
+                self.sync_preview_scroll()
             }
             Message::FindPrev => {
                 self.find_step(false);
-                Task::none()
+                self.sync_preview_scroll()
             }
             Message::FindToggleCase => {
                 if let Some(find) = self.find.as_mut() {
@@ -2237,7 +2274,7 @@ impl cosmic::Application for VaultNotes {
             Message::FindReplace => {
                 let current = self.find.as_ref().map_or(0, |f| f.current);
                 self.find_replace_one(current);
-                Task::none()
+                self.sync_preview_scroll()
             }
             Message::FindReplaceAll => {
                 self.find_replace_all();
@@ -2245,14 +2282,14 @@ impl cosmic::Application for VaultNotes {
             }
             Message::WikiAccept => {
                 self.wiki_accept();
-                Task::none()
+                self.sync_preview_scroll()
             }
             Message::WikiSelect(index) => {
                 if let Some(wiki) = self.wiki_complete.as_mut() {
                     wiki.selected = index;
                 }
                 self.wiki_accept();
-                Task::none()
+                self.sync_preview_scroll()
             }
             Message::WikiCycle(delta) => {
                 self.wiki_cycle(delta);
@@ -2284,7 +2321,9 @@ impl cosmic::Application for VaultNotes {
                             self.sync_tab_text(idx);
                         }
                         self.update_wiki_complete();
-                        cosmic::iced::clipboard::write(selection)
+                        let copied = cosmic::iced::clipboard::write(selection);
+                        let scroll = self.sync_preview_scroll();
+                        Task::batch([copied, scroll])
                     }
                     _ => Task::none(),
                 }
@@ -2310,13 +2349,13 @@ impl cosmic::Application for VaultNotes {
                         self.update_wiki_complete();
                     }
                 }
-                Task::none()
+                self.sync_preview_scroll()
             }
             Message::EditorSelectAll => {
                 if let Some(idx) = self.active {
                     self.tabs[idx].content.perform(Action::SelectAll);
                 }
-                Task::none()
+                self.sync_preview_scroll()
             }
             Message::Save => self.save_active(),
             Message::ToggleFolder(path) => {
@@ -3533,6 +3572,7 @@ mod find_tests {
             glass_style: vault_glass::GlassStyle::Opaque,
             theme: settings::ThemeChoice::default(),
             hide_md_extension: true,
+            scroll_sync: true,
             tree_edit: None,
             tree_menu_target: None,
             find: None,
@@ -3752,5 +3792,58 @@ mod editor_menu_tests {
             app.tabs[0].content.selection(),
             Some("hello world".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod scroll_sync_tests {
+    use super::*;
+
+    #[test]
+    fn sync_records_the_caret_line_and_targets_its_block() {
+        let mut app = find_tests::test_app_with_tab("# Head\n\nPara one.\ncontinues\n\n- item\n");
+        // Spans: heading 1-2, paragraph 3-5, list 6-6.
+        app.pane = PaneMode::Split;
+        app.scroll_sync = true;
+        // Cursor on "continues" (0-based line 3 = file line 4) → block 1.
+        app.tabs[0].content.move_to(Cursor {
+            position: Position { line: 3, column: 2 },
+            selection: None,
+        });
+        app.sync_preview_scroll();
+        assert_eq!(app.tabs[0].synced_line, Some(4));
+        // No cursor movement: no re-sync (the line is unchanged).
+        app.sync_preview_scroll();
+        assert_eq!(app.tabs[0].synced_line, Some(4));
+        // A line change re-arms sync.
+        app.tabs[0].content.move_to(Cursor {
+            position: Position { line: 0, column: 0 },
+            selection: None,
+        });
+        app.sync_preview_scroll();
+        assert_eq!(app.tabs[0].synced_line, Some(1));
+    }
+
+    #[test]
+    fn sync_is_gated_by_pane_mode_and_setting() {
+        let mut app = find_tests::test_app_with_tab("# Head\n\ntext\n");
+        // Source mode: no preview to follow.
+        app.pane = PaneMode::Source;
+        app.scroll_sync = true;
+        app.sync_preview_scroll();
+        assert_eq!(app.tabs[0].synced_line, None);
+        // Reading mode: the editor is not visible, nothing to follow.
+        app.pane = PaneMode::Reading;
+        app.sync_preview_scroll();
+        assert_eq!(app.tabs[0].synced_line, None);
+        // Setting off: no sync even in Split.
+        app.pane = PaneMode::Split;
+        app.scroll_sync = false;
+        app.sync_preview_scroll();
+        assert_eq!(app.tabs[0].synced_line, None);
+        // Back on: it syncs.
+        app.scroll_sync = true;
+        app.sync_preview_scroll();
+        assert_eq!(app.tabs[0].synced_line, Some(1));
     }
 }

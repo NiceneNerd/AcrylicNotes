@@ -34,6 +34,11 @@ pub struct AppSettings {
     /// default presentation).
     #[serde(default = "default_true")]
     pub hide_md_extension: bool,
+    /// Follow the editor caret in the reading pane while it is visible
+    /// (Split mode): the preview scrolls to the block containing the
+    /// caret's line.
+    #[serde(default = "default_true")]
+    pub scroll_sync: bool,
 }
 
 fn default_true() -> bool {
@@ -47,6 +52,7 @@ impl Default for AppSettings {
             theme: ThemeChoice::default(),
             glass_enabled: true,
             hide_md_extension: true,
+            scroll_sync: true,
         }
     }
 }
@@ -104,6 +110,7 @@ mod tests {
             theme: ThemeChoice::Dark,
             glass_enabled: true,
             hide_md_extension: true,
+            scroll_sync: false,
         };
         store_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -126,6 +133,8 @@ mod tests {
         assert!(loaded.glass_enabled);
         // The `.md`-hiding default applies to files that predate the field.
         assert!(loaded.hide_md_extension);
+        // Scroll sync defaults on for files that predate the field.
+        assert!(loaded.scroll_sync);
 
         // A glass_enabled=false must survive the roundtrip.
         let path2 = tmp.path().join("settings2.json");
