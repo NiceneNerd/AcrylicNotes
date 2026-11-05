@@ -64,6 +64,10 @@ pub struct AppSettings {
     /// The pane layout a fresh session starts in.
     #[serde(default)]
     pub default_pane: PaneMode,
+    /// Non-markdown file extensions shown in the file tree (lowercase,
+    /// without the dot); empty means every attachment shows.
+    #[serde(default)]
+    pub attachment_extensions: Vec<String>,
 }
 
 /// How the note area is laid out. Lives here (not app.rs) because it
@@ -107,6 +111,7 @@ impl Default for AppSettings {
             sidebar_solid: false,
             autosave_secs: default_autosave_secs(),
             default_pane: PaneMode::default(),
+            attachment_extensions: Vec::new(),
         }
     }
 }
@@ -173,6 +178,7 @@ mod tests {
             sidebar_solid: true,
             autosave_secs: 5,
             default_pane: PaneMode::Reading,
+            attachment_extensions: vec!["png".into(), "pdf".into()],
         };
         store_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));

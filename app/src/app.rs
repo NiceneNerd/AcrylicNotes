@@ -383,6 +383,13 @@ pub enum Message {
     /// Nudge the autosave delay in seconds (clamped 1..=60).
     SettingsAutosaveDelta(i32),
     SettingsScrollSync(bool),
+    // --- attachment file-type filter ---
+    /// Typed into the drawer's extension input.
+    AttachmentInput(String),
+    /// Add the normalized extension from the input to the tree filter.
+    AttachmentAdd,
+    /// Remove an extension from the tree filter.
+    AttachmentRemove(String),
     /// Delete the word before (false) or after (true) the cursor.
     EditorDeleteWord(bool),
     /// A bracket/quote was typed: pair it around the selection, or insert
@@ -468,6 +475,10 @@ pub struct VaultNotes {
     pub autosave_secs: u64,
     /// The pane layout a fresh session starts in.
     pub default_pane: PaneMode,
+    /// Non-markdown file extensions shown in the file tree; empty = all.
+    pub attachment_extensions: Vec<String>,
+    /// Draft text of the drawer's extension input.
+    pub attachment_input: String,
     /// Pending inline tree edit (new note / new folder / rename), if any.
     pub tree_edit: Option<tree::TreeEdit>,
     /// The in-note find bar state (Ctrl+F), when open.
@@ -487,6 +498,9 @@ pub struct VaultNotes {
 
 /// Id of the inline tree-edit text input (focused when the edit starts).
 pub const TREE_EDIT_INPUT: &str = "tree-edit-input";
+
+/// Id of the settings drawer's file-extension input.
+pub const ATTACHMENT_INPUT: &str = "attachment-ext-input";
 
 /// Commands of the sidebar tree's right-click menu. `Copy` because cosmic's
 /// `menu::Action` requires it; the target node rides separately via
@@ -521,6 +535,25 @@ fn persist_setting(mutate: impl FnOnce(&mut settings::AppSettings)) {
     let mut persisted = settings::load();
     mutate(&mut persisted);
     settings::store(&persisted);
+}
+
+/// Normalize a user-typed file extension: trim, drop leading dots,
+/// lowercase. `None` when nothing remains.
+fn normalize_extension(raw: &str) -> Option<String> {
+    let ext = raw.trim().trim_start_matches('.').to_ascii_lowercase();
+    (!ext.is_empty()).then_some(ext)
+}
+
+/// Whether an attachment path passes the tree's extension filter. An
+/// empty list shows everything (the default); otherwise the file's
+/// extension (case-insensitive) must be listed.
+fn attachment_shown(path: &str, extensions: &[String]) -> bool {
+    if extensions.is_empty() {
+        return true;
+    }
+    path.rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .is_some_and(|ext| extensions.contains(&ext))
 }
 
 // --- editor commands (undo, formatting, footnotes, word delete) ------------
@@ -1161,12 +1194,16 @@ impl VaultNotes {
         let folders: Vec<String> = vault.folders();
         let folder_refs: Vec<&str> = folders.iter().map(String::as_str).collect();
         // Attachments show in the tree as well (click opens them with the
-        // platform handler); the switcher and search stay note-only.
-        let attachments = vault.attachments_sorted();
-        self.tree = tree::build_with_folders(
-            &[refs.as_slice(), attachments.as_slice()].concat(),
-            &folder_refs,
-        );
+        // platform handler), filtered by the user's extension list; the
+        // switcher and search stay note-only.
+        let extensions = self.attachment_extensions.clone();
+        let attachments: Vec<&str> = vault
+            .attachments_sorted()
+            .into_iter()
+            .filter(|path| attachment_shown(path, &extensions))
+            .collect();
+        let entries: Vec<&str> = refs.iter().copied().chain(attachments).collect();
+        self.tree = tree::build_with_folders(&entries, &folder_refs);
     }
 
     fn open_tab(&mut self, path: String) -> Task<Message> {
@@ -2018,6 +2055,8 @@ impl cosmic::Application for VaultNotes {
             sidebar_solid: persisted.sidebar_solid,
             autosave_secs: persisted.autosave_secs,
             default_pane: persisted.default_pane,
+            attachment_extensions: persisted.attachment_extensions,
+            attachment_input: String::new(),
             tree_edit: None,
             tree_menu_target: None,
             find: None,
@@ -2489,6 +2528,30 @@ impl cosmic::Application for VaultNotes {
             Message::SettingsScrollSync(on) => {
                 self.scroll_sync = on;
                 persist_setting(|s| s.scroll_sync = on);
+                Task::none()
+            }
+            Message::AttachmentInput(value) => {
+                self.attachment_input = value;
+                Task::none()
+            }
+            Message::AttachmentAdd => {
+                if let Some(ext) = normalize_extension(&self.attachment_input) {
+                    if !self.attachment_extensions.contains(&ext) {
+                        self.attachment_extensions.push(ext);
+                        self.attachment_extensions.sort();
+                        let extensions = self.attachment_extensions.clone();
+                        persist_setting(move |s| s.attachment_extensions = extensions);
+                        self.rebuild_index();
+                    }
+                }
+                self.attachment_input.clear();
+                Task::none()
+            }
+            Message::AttachmentRemove(ext) => {
+                self.attachment_extensions.retain(|e| *e != ext);
+                let extensions = self.attachment_extensions.clone();
+                persist_setting(move |s| s.attachment_extensions = extensions);
+                self.rebuild_index();
                 Task::none()
             }
             Message::Save => self.save_active(),
@@ -3736,6 +3799,8 @@ mod find_tests {
             sidebar_solid: false,
             autosave_secs: 2,
             default_pane: PaneMode::default(),
+            attachment_extensions: Vec::new(),
+            attachment_input: String::new(),
             tree_edit: None,
             tree_menu_target: None,
             find: None,
@@ -4079,5 +4144,69 @@ mod context_drawer_tests {
         assert!(app.core.window.show_context);
         let _ = app.update(Message::SettingsToggle);
         assert!(!app.core.window.show_context);
+    }
+}
+
+#[cfg(test)]
+mod attachment_filter_tests {
+    use super::*;
+
+    #[test]
+    fn extension_input_normalizes_and_rejects_junk() {
+        assert_eq!(normalize_extension(" PNG "), Some("png".to_string()));
+        assert_eq!(normalize_extension(".Pdf"), Some("pdf".to_string()));
+        assert_eq!(normalize_extension("..webm"), Some("webm".to_string()));
+        assert_eq!(normalize_extension("   "), None);
+        assert_eq!(normalize_extension("."), None);
+    }
+
+    #[test]
+    fn attachment_filter_is_a_case_insensitive_whitelist() {
+        let exts = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Empty list: everything shows (the default).
+        assert!(attachment_shown("assets/cat.png", &exts(&[])));
+        assert!(attachment_shown("file.without-ext", &exts(&[])));
+        // Whitelist: matching extension (any case) shows.
+        assert!(attachment_shown("assets/cat.PNG", &exts(&["png"])));
+        assert!(attachment_shown("a/b.Pdf", &exts(&["png", "pdf"])));
+        // Non-matching extension or extensionless files are hidden.
+        assert!(!attachment_shown("assets/cat.png", &exts(&["pdf"])));
+        assert!(!attachment_shown("file.without-ext", &exts(&["png"])));
+    }
+
+    #[test]
+    fn tree_filter_hides_unlisted_attachments_but_keeps_notes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("assets")).unwrap();
+        std::fs::write(tmp.path().join("n.md"), "note\n").unwrap();
+        std::fs::write(tmp.path().join("assets/cat.png"), "png").unwrap();
+        std::fs::write(tmp.path().join("assets/scan.pdf"), "pdf").unwrap();
+
+        let mut app = find_tests::test_app_with_tab("");
+        app.vault = Some(Vault::open(tmp.path()).unwrap());
+
+        // Whitelist of png only: the pdf disappears, the note stays.
+        app.attachment_extensions = vec!["png".to_string()];
+        app.rebuild_index();
+        fn collect(nodes: &[TreeNode], out: &mut Vec<String>) {
+            for node in nodes {
+                match node {
+                    TreeNode::Folder { children, .. } => collect(children, out),
+                    TreeNode::Note { path, .. } => out.push(path.clone()),
+                }
+            }
+        }
+        let mut leaves = Vec::new();
+        collect(&app.tree, &mut leaves);
+        assert!(leaves.contains(&"n.md".to_string()));
+        assert!(leaves.contains(&"assets/cat.png".to_string()));
+        assert!(!leaves.contains(&"assets/scan.pdf".to_string()));
+
+        // Empty list: everything is back.
+        app.attachment_extensions.clear();
+        app.rebuild_index();
+        let mut leaves = Vec::new();
+        collect(&app.tree, &mut leaves);
+        assert!(leaves.contains(&"assets/scan.pdf".to_string()));
     }
 }

@@ -15,7 +15,8 @@ use cosmic::Element;
 
 use crate::app::{
     editor_shortcut, find_matches, parent_of, title_of, tree_note_label, Message, Palette,
-    PaneMode, SidePanel, TreeMenuAction, VaultNotes, FIND_INPUT, SWITCHER_INPUT, TREE_EDIT_INPUT,
+    PaneMode, SidePanel, TreeMenuAction, VaultNotes, ATTACHMENT_INPUT, FIND_INPUT, SWITCHER_INPUT,
+    TREE_EDIT_INPUT,
 };
 use crate::reading;
 use crate::scroll::READING_SCROLL;
@@ -1146,7 +1147,7 @@ pub fn settings_view<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
         ));
 
     let files = settings::section().title("Files & saving");
-    let files = files
+    let mut files = files
         .add(stepper(
             "Autosave delay",
             format!("{} s", app.autosave_secs),
@@ -1157,7 +1158,32 @@ pub fn settings_view<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
             "Follow caret in preview",
             app.scroll_sync,
             Message::SettingsScrollSync(!app.scroll_sync),
+        ))
+        .add(settings::item(
+            "File types in tree",
+            row::Row::new()
+                .spacing(4)
+                .push(
+                    text_input("e.g. png", &app.attachment_input)
+                        .id(Id::new(ATTACHMENT_INPUT))
+                        .on_input(Message::AttachmentInput)
+                        .on_submit(|_| Message::AttachmentAdd)
+                        .width(Length::Fixed(120.0)),
+                )
+                .push(button::text("Add").on_press(Message::AttachmentAdd)),
         ));
+    // The filter list itself: empty shows every attachment; each entry is
+    // a removable row.
+    if app.attachment_extensions.is_empty() {
+        files = files.add(text("All file types are shown.").size(12));
+    } else {
+        for ext in app.attachment_extensions.clone() {
+            files = files.add(settings::item(
+                format!(".{ext}"),
+                button::text("Remove").on_press(Message::AttachmentRemove(ext)),
+            ));
+        }
+    }
 
     scrollable::scrollable(
         container(
