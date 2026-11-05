@@ -28,6 +28,10 @@ use crate::tree::{self, TreeNode};
 /// re-exported here.
 pub use crate::settings::PaneMode;
 
+/// How generated wikilinks spell their target. Defined in settings (it
+/// persists) and re-exported here.
+pub use crate::settings::LinkPathFormat;
+
 /// Which panel the sidebar shows (M4b).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SidePanel {
@@ -103,7 +107,7 @@ pub struct Find {
 /// Wikilink suggestions for the `[[` currently being typed in the editor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WikiComplete {
-    /// Ranked note titles.
+    /// Ranked note paths (the rows show titles, dimmed parents).
     pub items: Vec<String>,
     pub selected: usize,
 }
@@ -393,6 +397,8 @@ pub enum Message {
     AttachmentAdd,
     /// Remove an extension from the tree filter.
     AttachmentRemove(String),
+    /// How generated wikilinks spell their target.
+    SettingsLinkFormat(LinkPathFormat),
     // --- Unicode codepoint entry (Ctrl+Shift+U, GTK-style) ---
     /// Begin codepoint entry in the focused editor.
     UnicodeStart,
@@ -493,6 +499,8 @@ pub struct VaultNotes {
     pub default_pane: PaneMode,
     /// Non-markdown file extensions shown in the file tree; empty = all.
     pub attachment_extensions: Vec<String>,
+    /// How generated wikilinks spell their target.
+    pub link_path_format: LinkPathFormat,
     /// Draft text of the drawer's extension input.
     pub attachment_input: String,
     /// Hex digits collected so far during Unicode codepoint entry
@@ -860,13 +868,78 @@ pub(crate) fn wiki_query_at(text: &str, cursor: Position) -> Option<(usize, Stri
     Some((open, query.to_string()))
 }
 
-/// Rank note titles against a partial wikilink query (empty queries pass
-/// everything through, like the quick switcher).
-pub(crate) fn wiki_items(query: &str, titles: &[String]) -> Vec<String> {
-    crate::fuzzy::rank(query, titles, WIKI_MAX_ITEMS)
+/// Rank note paths against a partial wikilink query by title (empty
+/// queries pass everything through, like the quick switcher). Items are
+/// paths so duplicate-titled notes stay distinguishable.
+pub(crate) fn wiki_paths(query: &str, paths: &[String]) -> Vec<String> {
+    let titles: Vec<String> = paths.iter().map(|p| title_of(p)).collect();
+    crate::fuzzy::rank(query, &titles, WIKI_MAX_ITEMS)
         .into_iter()
-        .map(|ranked| titles[ranked.index].clone())
+        .map(|ranked| paths[ranked.index].clone())
         .collect()
+}
+
+// --- generated link targets (Obsidian's "new link format") -----------------
+
+/// The wikilink text that refers to the note at `target`, as seen from
+/// the note at `from`, given every note path (for duplicate titles).
+/// All forms omit `.md` (wikilink convention) and resolve through
+/// `VaultIndex`:
+///
+/// * `Shortest`: the bare title, unless several notes share it — then
+///   the full vault path disambiguates.
+/// * `Relative`: the path from `from`'s folder (`../folder/note`).
+/// * `Absolute`: the full vault path.
+pub(crate) fn link_target(
+    from: &str,
+    target: &str,
+    notes: &[String],
+    format: LinkPathFormat,
+) -> String {
+    fn stem(p: &str) -> &str {
+        p.strip_suffix(".md").unwrap_or(p)
+    }
+    match format {
+        LinkPathFormat::Absolute => stem(target).to_string(),
+        LinkPathFormat::Shortest => {
+            let title = title_of(target);
+            let shared = notes.iter().filter(|note| title_of(note) == title).count();
+            if shared <= 1 {
+                title
+            } else {
+                stem(target).to_string()
+            }
+        }
+        LinkPathFormat::Relative => relative_link_target(from, target),
+    }
+}
+
+/// The folder-relative wikilink target from the note `from` to `target`
+/// (both vault-relative): `..` steps out of the source folder, then the
+/// path down to the target. A target in the source's own folder is just
+/// its stem, and a root note linking into the vault spells the full
+/// (relative) path.
+fn relative_link_target(from: &str, target: &str) -> String {
+    fn stem(p: &str) -> &str {
+        p.strip_suffix(".md").unwrap_or(p)
+    }
+    let from_dir: Vec<&str> = from
+        .rsplit_once('/')
+        .map_or(Vec::new(), |(dir, _)| dir.split('/').collect());
+    let to_parts: Vec<&str> = stem(target).split('/').collect();
+    let (to_dirs, file) = to_parts.split_at(to_parts.len() - 1);
+    let file = file[0];
+    let mut common = 0;
+    while common < from_dir.len() && common < to_dirs.len() && from_dir[common] == to_dirs[common] {
+        common += 1;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for _ in common..from_dir.len() {
+        parts.push("..".to_string());
+    }
+    parts.extend(to_dirs[common..].iter().map(|part| part.to_string()));
+    parts.push(file.to_string());
+    parts.join("/")
 }
 
 // --- auto-pairs -----------------------------------------------------------
@@ -1721,18 +1794,18 @@ impl VaultNotes {
             self.dismiss_editor_overlays();
             return;
         };
-        let titles: Vec<String> = self
+        let paths: Vec<String> = self
             .vault
             .as_ref()
             .map(|vault| {
                 vault
                     .notes_sorted()
                     .iter()
-                    .map(|note| title_of(&note.path))
+                    .map(|note| note.path.clone())
                     .collect()
             })
             .unwrap_or_default();
-        let items = wiki_items(&query, &titles);
+        let items = wiki_paths(&query, &paths);
         if items.is_empty() {
             self.dismiss_editor_overlays();
         } else {
@@ -1745,9 +1818,10 @@ impl VaultNotes {
     }
 
     /// Accept the highlighted wikilink suggestion: replace the partial
-    /// `[[query` up to the cursor with `[[Title]]` (one undoable step).
+    /// `[[query` up to the cursor with the target link (one undoable
+    /// step). The link text follows the link-path-format preference.
     fn wiki_accept(&mut self) {
-        let Some(title) = self
+        let Some(target) = self
             .wiki_complete
             .as_ref()
             .and_then(|wiki| wiki.items.get(wiki.selected).cloned())
@@ -1763,6 +1837,25 @@ impl VaultNotes {
             self.dismiss_editor_overlays();
             return;
         };
+        // The link text follows the link-path-format preference.
+        let link = {
+            let from = self.tabs[idx].path.clone();
+            let notes: Vec<String> = self
+                .vault
+                .as_ref()
+                .map(|vault| {
+                    vault
+                        .notes_sorted()
+                        .iter()
+                        .map(|note| note.path.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!(
+                "[[{}]]",
+                link_target(&from, &target, &notes, self.link_path_format)
+            )
+        };
         let was_dirty = self.tabs[idx].is_dirty();
         {
             let tab = &mut self.tabs[idx];
@@ -1775,7 +1868,7 @@ impl VaultNotes {
                 }),
             });
             tab.content
-                .perform(Action::Edit(Edit::Paste(Arc::new(format!("[[{title}]]")))));
+                .perform(Action::Edit(Edit::Paste(Arc::new(link))));
             tab.refresh_doc();
         }
         self.last_edit = Some(std::time::Instant::now());
@@ -2146,6 +2239,7 @@ impl cosmic::Application for VaultNotes {
             autosave_secs: persisted.autosave_secs,
             default_pane: persisted.default_pane,
             attachment_extensions: persisted.attachment_extensions,
+            link_path_format: persisted.link_path_format,
             attachment_input: String::new(),
             unicode_input: None,
             tree_edit: None,
@@ -2643,6 +2737,11 @@ impl cosmic::Application for VaultNotes {
                 let extensions = self.attachment_extensions.clone();
                 persist_setting(move |s| s.attachment_extensions = extensions);
                 self.rebuild_index();
+                Task::none()
+            }
+            Message::SettingsLinkFormat(format) => {
+                self.link_path_format = format;
+                persist_setting(move |s| s.link_path_format = format);
                 Task::none()
             }
             Message::UnicodeStart => {
@@ -3935,6 +4034,7 @@ mod find_tests {
             autosave_secs: 2,
             default_pane: PaneMode::default(),
             attachment_extensions: Vec::new(),
+            link_path_format: LinkPathFormat::default(),
             attachment_input: String::new(),
             unicode_input: None,
             tree_edit: None,
@@ -4018,19 +4118,19 @@ mod wiki_tests {
     }
 
     #[test]
-    fn wiki_items_rank_titles_like_the_switcher() {
-        let titles: Vec<String> = ["Alpha", "Alphabet", "Beta"]
+    fn wiki_paths_rank_by_title_but_carry_paths() {
+        let paths: Vec<String> = ["Notes/Alpha.md", "Deep/Alphabet.md", "Beta.md"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         // Empty query passes everything through, in order.
-        assert_eq!(wiki_items("", &titles).len(), 3);
-        let ranked = wiki_items("alp", &titles);
-        assert!(ranked.contains(&"Alpha".to_string()));
-        assert!(ranked.contains(&"Alphabet".to_string()));
-        assert!(!ranked.contains(&"Beta".to_string()));
+        assert_eq!(wiki_paths("", &paths).len(), 3);
+        let ranked = wiki_paths("alp", &paths);
+        assert!(ranked.contains(&"Notes/Alpha.md".to_string()));
+        assert!(ranked.contains(&"Deep/Alphabet.md".to_string()));
+        assert!(!ranked.contains(&"Beta.md".to_string()));
         // No matches -> empty (which closes the dropdown).
-        assert!(wiki_items("zzz", &titles).is_empty());
+        assert!(wiki_paths("zzz", &paths).is_empty());
     }
 
     #[test]
@@ -4042,10 +4142,11 @@ mod wiki_tests {
             selection: None,
         });
         app.wiki_complete = Some(WikiComplete {
-            items: vec!["Note Title".to_string()],
+            items: vec!["Note Title.md".to_string()],
             selected: 0,
         });
         app.wiki_accept();
+        // Shortest format with a unique title: the bare title.
         assert_eq!(app.tabs[0].content.text(), "see [[Note Title]]\n");
         // The dropdown closed.
         assert!(app.wiki_complete.is_none());
@@ -4600,5 +4701,160 @@ mod editor_focus_tests {
             app.pane = mode;
             let _ = crate::view::view(&app);
         }
+    }
+}
+
+#[cfg(test)]
+mod link_target_tests {
+    use super::*;
+    use cosmic::Application as _;
+
+    fn notes() -> Vec<String> {
+        [
+            "Glass.md",
+            "Notes/Glass.md",
+            "Projects/Obsidian/Glass.md",
+            "Notes/Rust.md",
+            "Journal/2026/11/05.md",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    }
+
+    #[test]
+    fn shortest_is_the_bare_title_unless_titles_collide() {
+        let notes = notes();
+        // "05" is a unique title: bare stem even deep in folders.
+        assert_eq!(
+            link_target(
+                "Notes/Rust.md",
+                "Journal/2026/11/05.md",
+                &notes,
+                LinkPathFormat::Shortest
+            ),
+            "05"
+        );
+    }
+
+    #[test]
+    fn shortest_disambiguates_with_the_full_path() {
+        let notes = notes();
+        // "Glass" exists three times: the full path disambiguates.
+        assert_eq!(
+            link_target(
+                "Notes/Rust.md",
+                "Projects/Obsidian/Glass.md",
+                &notes,
+                LinkPathFormat::Shortest
+            ),
+            "Projects/Obsidian/Glass"
+        );
+        // A unique title stays short even when the note lives deep.
+        assert_eq!(
+            link_target(
+                "Glass.md",
+                "Notes/Rust.md",
+                &notes,
+                LinkPathFormat::Shortest
+            ),
+            "Rust"
+        );
+    }
+
+    #[test]
+    fn relative_paths_step_out_and_down() {
+        let notes = notes();
+        // From Notes/ to a sibling folder: one step out.
+        assert_eq!(
+            link_target(
+                "Notes/Rust.md",
+                "Projects/Obsidian/Glass.md",
+                &notes,
+                LinkPathFormat::Relative
+            ),
+            "../Projects/Obsidian/Glass"
+        );
+        // Same folder: just the stem.
+        assert_eq!(
+            link_target(
+                "Notes/Rust.md",
+                "Notes/Glass.md",
+                &notes,
+                LinkPathFormat::Relative
+            ),
+            "Glass"
+        );
+        // From a subfolder up to the root: two steps out.
+        assert_eq!(
+            link_target(
+                "Journal/2026/11/05.md",
+                "Glass.md",
+                &notes,
+                LinkPathFormat::Relative
+            ),
+            "../../../Glass"
+        );
+        // From the root down into folders: the plain relative path.
+        assert_eq!(
+            link_target(
+                "Glass.md",
+                "Projects/Obsidian/Glass.md",
+                &notes,
+                LinkPathFormat::Relative
+            ),
+            "Projects/Obsidian/Glass"
+        );
+    }
+
+    #[test]
+    fn absolute_is_the_full_vault_path() {
+        let notes = notes();
+        assert_eq!(
+            link_target(
+                "Notes/Rust.md",
+                "Journal/2026/11/05.md",
+                &notes,
+                LinkPathFormat::Absolute
+            ),
+            "Journal/2026/11/05"
+        );
+    }
+
+    #[test]
+    fn relative_targets_resolve_back_through_the_vault_index() {
+        // Every generated relative link must resolve to the target again.
+        let index = VaultIndex::new(notes().iter().cloned());
+        let cases = [
+            ("Notes/Rust.md", "Projects/Obsidian/Glass.md"),
+            ("Notes/Rust.md", "Notes/Glass.md"),
+            ("Journal/2026/11/05.md", "Glass.md"),
+            ("Glass.md", "Journal/2026/11/05.md"),
+        ];
+        for (from, target) in cases {
+            let link = link_target(from, target, &notes(), LinkPathFormat::Relative);
+            assert_eq!(
+                index.resolve(&link, from),
+                Some(target),
+                "link {link:?} from {from:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_choice_updates_the_format() {
+        let mut app = find_tests::test_app_with_tab("");
+        let _ = app.update(Message::SettingsLinkFormat(LinkPathFormat::Relative));
+        assert_eq!(app.link_path_format, LinkPathFormat::Relative);
+        // Persisted through load-modify-store.
+        assert_eq!(
+            crate::settings::load().link_path_format,
+            LinkPathFormat::Relative
+        );
+        let _ = app.update(Message::SettingsLinkFormat(LinkPathFormat::Absolute));
+        assert_eq!(
+            crate::settings::load().link_path_format,
+            LinkPathFormat::Absolute
+        );
     }
 }

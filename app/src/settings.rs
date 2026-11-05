@@ -68,6 +68,27 @@ pub struct AppSettings {
     /// without the dot); empty means every attachment shows.
     #[serde(default)]
     pub attachment_extensions: Vec<String>,
+    /// How generated wikilinks spell their target (Obsidian's "new
+    /// link format" setting).
+    #[serde(default)]
+    pub link_path_format: LinkPathFormat,
+}
+
+/// How generated wikilinks refer to their target, mirroring Obsidian's
+/// "new link format" preference.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkPathFormat {
+    /// The bare title; the full vault path only when several notes
+    /// share the title (Obsidian's default).
+    #[default]
+    #[serde(rename = "shortest")]
+    Shortest,
+    /// The path from the current note's folder (`../folder/note`).
+    #[serde(rename = "relative")]
+    Relative,
+    /// The full vault path.
+    #[serde(rename = "absolute")]
+    Absolute,
 }
 
 /// How the note area is laid out. Lives here (not app.rs) because it
@@ -112,6 +133,7 @@ impl Default for AppSettings {
             autosave_secs: default_autosave_secs(),
             default_pane: PaneMode::default(),
             attachment_extensions: Vec::new(),
+            link_path_format: LinkPathFormat::default(),
         }
     }
 }
@@ -179,6 +201,7 @@ mod tests {
             autosave_secs: 5,
             default_pane: PaneMode::Reading,
             attachment_extensions: vec!["png".into(), "pdf".into()],
+            link_path_format: LinkPathFormat::Relative,
         };
         store_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));

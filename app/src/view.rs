@@ -15,8 +15,8 @@ use cosmic::Element;
 
 use crate::app::{
     editor_shortcut, find_matches, parent_of, title_of, tree_note_label, unicode_char,
-    unicode_entry_binding, Message, Palette, PaneMode, SidePanel, TreeMenuAction, VaultNotes,
-    ATTACHMENT_INPUT, EDITOR_INPUT, FIND_INPUT, SWITCHER_INPUT, TREE_EDIT_INPUT,
+    unicode_entry_binding, LinkPathFormat, Message, Palette, PaneMode, SidePanel, TreeMenuAction,
+    VaultNotes, ATTACHMENT_INPUT, EDITOR_INPUT, FIND_INPUT, SWITCHER_INPUT, TREE_EDIT_INPUT,
 };
 use crate::reading;
 use crate::scroll::READING_SCROLL;
@@ -952,17 +952,24 @@ fn editor_pane<'a>(
 /// click; keyboard handling (Tab / Ctrl+Tab / Esc) is routed globally.
 fn wiki_dropdown<'a>(wiki: &'a crate::app::WikiComplete, palette: Palette) -> Element<'a, Message> {
     let mut col = column::Column::new().spacing(2).padding(6);
-    for (i, title) in wiki.items.iter().enumerate() {
+    for (i, path) in wiki.items.iter().enumerate() {
+        // Items are note paths; the row shows the title, with the note's
+        // folder dimmed so duplicate titles are distinguishable.
+        let label = title_of(path);
         let btn = if i == wiki.selected {
-            button::suggested(title.clone())
+            button::suggested(label)
         } else {
-            button::text(title.clone())
-        };
-        col = col.push(
-            btn.on_press(Message::WikiSelect(i))
-                .width(Length::Fill)
-                .height(Length::Shrink),
-        );
+            button::text(label)
+        }
+        .on_press(Message::WikiSelect(i));
+        let mut row = row::Row::new()
+            .push(btn.width(Length::Shrink).height(Length::Shrink))
+            .align_y(alignment::Vertical::Center);
+        let parent = parent_of(path);
+        if !parent.is_empty() {
+            row = row.push(text(parent).size(12).class(palette.muted));
+        }
+        col = col.push(row.width(Length::Fill).height(Length::Shrink));
     }
     // The outer container fills the editor area so the popup can anchor to
     // its bottom edge; the inner one is the popup itself.
@@ -1178,6 +1185,30 @@ pub fn settings_view<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
                         .width(Length::Fixed(120.0)),
                 )
                 .push(button::text("Add").on_press(Message::AttachmentAdd)),
+        ))
+        .add(settings::item(
+            "Link path",
+            choice(
+                match app.link_path_format {
+                    LinkPathFormat::Shortest => "Shortest",
+                    LinkPathFormat::Relative => "Relative",
+                    LinkPathFormat::Absolute => "Absolute",
+                },
+                &[
+                    (
+                        "Shortest",
+                        Message::SettingsLinkFormat(LinkPathFormat::Shortest),
+                    ),
+                    (
+                        "Relative",
+                        Message::SettingsLinkFormat(LinkPathFormat::Relative),
+                    ),
+                    (
+                        "Absolute",
+                        Message::SettingsLinkFormat(LinkPathFormat::Absolute),
+                    ),
+                ],
+            ),
         ));
     // The filter list itself: empty shows every attachment; each entry is
     // a removable row.
