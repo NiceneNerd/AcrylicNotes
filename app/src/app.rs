@@ -2768,11 +2768,15 @@ impl cosmic::Application for VaultNotes {
 
     /// The settings drawer (Phase G): shown while `show_context` is set,
     /// toggled by the header's settings button.
+    ///
+    /// This MUST gate on `show_context`: libcosmic's view renders the
+    /// drawer inline whenever this returns `Some`, even with the drawer
+    /// nominally closed, so an unconditional `Some` makes the drawer
+    /// flicker between overlay and inline rendering instead of closing.
     fn context_drawer(&self) -> Option<cosmic::app::ContextDrawer<'_, Self::Message>> {
-        Some(cosmic::app::context_drawer(
-            crate::view::settings_view(self),
-            Message::SettingsToggle,
-        ))
+        self.core.window.show_context.then(|| {
+            cosmic::app::context_drawer(crate::view::settings_view(self), Message::SettingsToggle)
+        })
     }
 
     fn header_start(&self) -> Vec<cosmic::Element<'_, Self::Message>> {
@@ -4046,5 +4050,34 @@ mod attachment_tree_tests {
         // Without a vault, the raw path passes through.
         let bare = find_tests::test_app_with_tab("");
         assert_eq!(bare.attachment_path("x.png"), PathBuf::from("x.png"));
+    }
+}
+
+#[cfg(test)]
+mod context_drawer_tests {
+    use super::*;
+    use cosmic::app::Application as _;
+
+    #[test]
+    fn settings_drawer_exists_only_while_shown() {
+        let mut app = find_tests::test_app_with_tab("");
+        // Closed: no drawer element at all. libcosmic renders the drawer
+        // inline whenever `context_drawer()` returns Some, even with the
+        // drawer nominally closed — so this gate is what makes closing
+        // actually work.
+        assert!(app.context_drawer().is_none());
+        app.core.set_show_context(true);
+        assert!(app.context_drawer().is_some());
+        app.core.set_show_context(false);
+        assert!(app.context_drawer().is_none());
+    }
+
+    #[test]
+    fn settings_toggle_flips_show_context() {
+        let mut app = find_tests::test_app_with_tab("");
+        let _ = app.update(Message::SettingsToggle);
+        assert!(app.core.window.show_context);
+        let _ = app.update(Message::SettingsToggle);
+        assert!(!app.core.window.show_context);
     }
 }
