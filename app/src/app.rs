@@ -353,6 +353,18 @@ pub enum Message {
     WikiCycle(i32),
     /// Dismiss the dropdown (Esc).
     WikiDismiss,
+    // --- editor context menu ---
+    /// Copy the selection to the clipboard.
+    EditorCopy,
+    /// Cut: copy the selection, then delete it.
+    EditorCut,
+    /// Read the clipboard (the paste entry point; result is
+    /// `EditorPasteText`).
+    EditorPasteAsk,
+    /// Insert the clipboard text at the cursor (replacing a selection).
+    EditorPasteText(Option<String>),
+    /// Select the entire buffer.
+    EditorSelectAll,
     /// Delete the word before (false) or after (true) the cursor.
     EditorDeleteWord(bool),
     /// A bracket/quote was typed: pair it around the selection, or insert
@@ -2249,6 +2261,62 @@ impl cosmic::Application for VaultNotes {
                 self.wiki_complete = None;
                 Task::none()
             }
+            Message::EditorCopy => {
+                match self.active_tab().and_then(|tab| tab.content.selection()) {
+                    Some(selection) => cosmic::iced::clipboard::write(selection),
+                    None => Task::none(),
+                }
+            }
+            Message::EditorCut => {
+                let selection = self.active_tab().and_then(|tab| tab.content.selection());
+                match (self.active, selection) {
+                    (Some(idx), Some(selection)) => {
+                        let was_dirty = self.tabs[idx].is_dirty();
+                        {
+                            let tab = &mut self.tabs[idx];
+                            push_undo(tab);
+                            tab.content.perform(Action::Edit(Edit::Delete));
+                            tab.refresh_doc();
+                        }
+                        self.last_edit = Some(std::time::Instant::now());
+                        if self.tabs[idx].is_dirty() != was_dirty {
+                            self.sync_tab_text(idx);
+                        }
+                        self.update_wiki_complete();
+                        cosmic::iced::clipboard::write(selection)
+                    }
+                    _ => Task::none(),
+                }
+            }
+            Message::EditorPasteAsk => cosmic::iced::clipboard::read()
+                .map(Message::EditorPasteText)
+                .map(cosmic::Action::App),
+            Message::EditorPasteText(maybe_text) => {
+                if let Some(text) = maybe_text {
+                    if let Some(idx) = self.active {
+                        let was_dirty = self.tabs[idx].is_dirty();
+                        {
+                            let tab = &mut self.tabs[idx];
+                            push_undo(tab);
+                            tab.content
+                                .perform(Action::Edit(Edit::Paste(Arc::new(text))));
+                            tab.refresh_doc();
+                        }
+                        self.last_edit = Some(std::time::Instant::now());
+                        if self.tabs[idx].is_dirty() != was_dirty {
+                            self.sync_tab_text(idx);
+                        }
+                        self.update_wiki_complete();
+                    }
+                }
+                Task::none()
+            }
+            Message::EditorSelectAll => {
+                if let Some(idx) = self.active {
+                    self.tabs[idx].content.perform(Action::SelectAll);
+                }
+                Task::none()
+            }
             Message::Save => self.save_active(),
             Message::ToggleFolder(path) => {
                 if !self.collapsed.remove(&path) {
@@ -3616,5 +3684,72 @@ mod wiki_tests {
         // The cursor sits past the closed link: no query, dropdown closes.
         app.update_wiki_complete();
         assert!(app.wiki_complete.is_none());
+    }
+}
+
+#[cfg(test)]
+mod editor_menu_tests {
+    use super::*;
+    use cosmic::Application as _;
+
+    #[test]
+    fn editor_paste_replaces_selection_and_is_undoable() {
+        let mut app = find_tests::test_app_with_tab("hello world\n");
+        // Select "hello".
+        app.tabs[0].content.move_to(Cursor {
+            position: Position { line: 0, column: 5 },
+            selection: Some(Position { line: 0, column: 0 }),
+        });
+        app.update(Message::EditorPasteText(Some("goodbye".to_string())));
+        assert_eq!(app.tabs[0].content.text(), "goodbye world\n");
+        // One undo step restores the selection era.
+        let tab = &mut app.tabs[0];
+        assert!(undo_tab(tab));
+        assert_eq!(tab.content.text(), "hello world\n");
+    }
+
+    #[test]
+    fn editor_paste_without_clipboard_text_is_a_no_op() {
+        let mut app = find_tests::test_app_with_tab("intact\n");
+        app.update(Message::EditorPasteText(None));
+        assert_eq!(app.tabs[0].content.text(), "intact\n");
+    }
+
+    #[test]
+    fn editor_cut_deletes_the_selection() {
+        let mut app = find_tests::test_app_with_tab("hello world\n");
+        app.tabs[0].content.move_to(Cursor {
+            position: Position { line: 0, column: 5 },
+            selection: Some(Position { line: 0, column: 0 }),
+        });
+        app.update(Message::EditorCut);
+        assert_eq!(app.tabs[0].content.text(), " world\n");
+        // The deletion is undoable.
+        let tab = &mut app.tabs[0];
+        assert!(undo_tab(tab));
+        assert_eq!(tab.content.text(), "hello world\n");
+    }
+
+    #[test]
+    fn editor_copy_leaves_the_buffer_untouched() {
+        let mut app = find_tests::test_app_with_tab("hello world\n");
+        app.tabs[0].content.move_to(Cursor {
+            position: Position { line: 0, column: 5 },
+            selection: Some(Position { line: 0, column: 0 }),
+        });
+        app.update(Message::EditorCopy);
+        assert_eq!(app.tabs[0].content.text(), "hello world\n");
+        // A copy is not an edit: no undo snapshot was pushed.
+        assert!(!undo_tab(&mut app.tabs[0]));
+    }
+
+    #[test]
+    fn editor_select_all_selects_everything() {
+        let mut app = find_tests::test_app_with_tab("hello world");
+        app.update(Message::EditorSelectAll);
+        assert_eq!(
+            app.tabs[0].content.selection(),
+            Some("hello world".to_string())
+        );
     }
 }

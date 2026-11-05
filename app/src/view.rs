@@ -258,6 +258,53 @@ fn node_menu() -> Vec<menu::Tree<Message>> {
     )
 }
 
+/// The editor context menu's items as a `MenuAction` enum (cosmic menus
+/// need a Copy action type; `Message` itself is neither Copy nor Eq).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorMenuAction {
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
+impl menu::action::MenuAction for EditorMenuAction {
+    type Message = Message;
+
+    fn message(&self) -> Message {
+        match self {
+            Self::Undo => Message::EditorUndo,
+            Self::Redo => Message::EditorRedo,
+            Self::Cut => Message::EditorCut,
+            Self::Copy => Message::EditorCopy,
+            Self::Paste => Message::EditorPasteAsk,
+            Self::SelectAll => Message::EditorSelectAll,
+        }
+    }
+}
+
+/// The right-click menu for the editor pane: undo/redo, then clipboard
+/// operations and select-all. Copy/Cut/Paste go through app messages
+/// (`iced::clipboard` read is async; write is an effect task), so they
+/// route through the same undo/dirty bookkeeping as typed edits.
+fn editor_menu() -> Vec<menu::Tree<Message>> {
+    menu::items(
+        &std::collections::HashMap::new(),
+        vec![
+            menu::Item::Button("Undo", None, EditorMenuAction::Undo),
+            menu::Item::Button("Redo", None, EditorMenuAction::Redo),
+            menu::Item::Divider,
+            menu::Item::Button("Cut", None, EditorMenuAction::Cut),
+            menu::Item::Button("Copy", None, EditorMenuAction::Copy),
+            menu::Item::Button("Paste", None, EditorMenuAction::Paste),
+            menu::Item::Divider,
+            menu::Item::Button("Select All", None, EditorMenuAction::SelectAll),
+        ],
+    )
+}
+
 /// Wrap a tree row in the right-click menu; the opened menu records its
 /// target so a later `TreeMenu` command knows what to act on.
 fn menu_row<'a>(
@@ -820,13 +867,17 @@ fn editor_pane<'a>(
             ..Default::default()
         })
         .into();
-    match wiki {
+    let pane: cosmic::Element<'a, Message> = match wiki {
         // The suggestion list floats over the editor's bottom edge. The
         // layer is deliberately not `opaque`: clicks outside the list
         // fall through to the editor, so typing and clicking keep working.
         Some(wiki) => stack([surface, wiki_dropdown(wiki, palette)]).into(),
         None => surface,
-    }
+    };
+    // Right-click anywhere on the pane opens the editor menu.
+    context_menu(pane, Some(editor_menu()))
+        .on_surface_action(Message::Surface)
+        .into()
 }
 
 /// The wikilink suggestion dropdown: a small popup anchored to the editor's
