@@ -16,7 +16,7 @@ use cosmic::Element;
 use crate::app::{
     editor_shortcut, find_matches, parent_of, title_of, tree_note_label, unicode_char,
     unicode_entry_binding, Message, Palette, PaneMode, SidePanel, TreeMenuAction, VaultNotes,
-    ATTACHMENT_INPUT, FIND_INPUT, SWITCHER_INPUT, TREE_EDIT_INPUT,
+    ATTACHMENT_INPUT, EDITOR_INPUT, FIND_INPUT, SWITCHER_INPUT, TREE_EDIT_INPUT,
 };
 use crate::reading;
 use crate::scroll::READING_SCROLL;
@@ -837,6 +837,7 @@ fn editor_pane<'a>(
         cosmic::iced::highlighter::Theme::InspiredGitHub
     };
     let editor = text_editor(&tab.content)
+        .id(Id::new(EDITOR_INPUT))
         .height(Length::Fill)
         .on_action(Message::EditorAction)
         // Inset the text from the editor's border.
@@ -926,17 +927,20 @@ fn editor_pane<'a>(
             ..Default::default()
         })
         .into();
-    let pane: cosmic::Element<'a, Message> = match (&app.unicode_input, wiki) {
-        // The Unicode entry indicator floats over the editor's bottom
-        // edge, same slot as the wikilink dropdown (they never coexist:
-        // starting one dismisses the other).
-        (Some(_), _) => stack([surface, unicode_entry_overlay(app, palette)]).into(),
-        // The suggestion list floats over the editor's bottom edge. The
-        // layer is deliberately not `opaque`: clicks outside the list
-        // fall through to the editor, so typing and clicking keep working.
-        (None, Some(wiki)) => stack([surface, wiki_dropdown(wiki, palette)]).into(),
-        (None, None) => surface,
+    // The popup layer is ALWAYS the stack's second child, even when no
+    // popup is open (an empty placeholder takes its slot). If the pane
+    // instead switched between a bare container and a stack, iced would
+    // see a widget-type change, rebuild the subtree, and drop the
+    // editor's focus state — leaving it deaf to the keyboard until it
+    // is clicked again (the "can't type while the dropdown is open"
+    // bug). The EDITOR_INPUT id additionally protects focus across the
+    // structural changes outside this pane.
+    let overlay: cosmic::Element<'a, Message> = match (&app.unicode_input, wiki) {
+        (Some(_), _) => unicode_entry_overlay(app, palette),
+        (None, Some(wiki)) => wiki_dropdown(wiki, palette),
+        (None, None) => container(column::Column::new()).into(),
     };
+    let pane: cosmic::Element<'a, Message> = stack([surface, overlay]).into();
     // Right-click anywhere on the pane opens the editor menu.
     context_menu(pane, Some(editor_menu()))
         .on_surface_action(Message::Surface)

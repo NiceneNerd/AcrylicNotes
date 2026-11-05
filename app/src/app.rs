@@ -521,6 +521,13 @@ pub const TREE_EDIT_INPUT: &str = "tree-edit-input";
 /// Id of the settings drawer's file-extension input.
 pub const ATTACHMENT_INPUT: &str = "attachment-ext-input";
 
+/// Id of the note editor itself. A *custom* id makes iced persist the
+/// editor's widget state (its focus) in the UI cache and restore it by
+/// name, so structural view changes — pane-mode switches, the quick
+/// switcher overlay, popups — cannot strip the editor's focus and leave
+/// it deaf to the keyboard.
+pub const EDITOR_INPUT: &str = "note-editor";
+
 /// Commands of the sidebar tree's right-click menu. `Copy` because cosmic's
 /// `menu::Action` requires it; the target node rides separately via
 /// `Message::TreeMenuTarget`, recorded when the menu opens.
@@ -4552,5 +4559,46 @@ mod switcher_ranking_tests {
             "{:?}",
             app.switcher.items
         );
+    }
+}
+
+#[cfg(test)]
+mod editor_focus_tests {
+    use super::*;
+
+    /// The editor pane must build with each popup state — and, critically,
+    /// the popup layer is always mounted: if the pane switched between a
+    /// bare container and a stack when a popup opened, iced would rebuild
+    /// the subtree, drop the editor's focus state, and leave it unable to
+    /// type until it was clicked again.
+    #[test]
+    fn view_builds_with_popups_open_and_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("n.md"), "[[no\n").unwrap();
+        let mut app = find_tests::test_app_with_tab("[[no\n");
+        app.vault = Some(Vault::open(tmp.path()).unwrap());
+
+        // No popup.
+        let _ = crate::view::view(&app);
+        // Wikilink dropdown open.
+        app.wiki_complete = Some(WikiComplete {
+            items: vec!["n.md".into()],
+            selected: 0,
+        });
+        let _ = crate::view::view(&app);
+        // Unicode entry open (dismisses the dropdown).
+        app.wiki_complete = None;
+        app.unicode_input = Some("1f600".to_string());
+        let _ = crate::view::view(&app);
+        // Both closed again.
+        app.unicode_input = None;
+        let _ = crate::view::view(&app);
+
+        // Pane modes all build too (each mode restructures the note area,
+        // which is why the editor's focus rides on its custom id).
+        for mode in [PaneMode::Source, PaneMode::Reading, PaneMode::Split] {
+            app.pane = mode;
+            let _ = crate::view::view(&app);
+        }
     }
 }
