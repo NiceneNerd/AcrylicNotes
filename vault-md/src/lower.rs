@@ -25,27 +25,70 @@ use crate::ir::{Alignment, Block, Doc, Fold, Inline, ListItem};
 /// and kept verbatim; it is never parsed as markdown.
 pub fn parse_note(src: &str) -> Doc {
     let split = vault_core::split_frontmatter(src);
+    // The body passed to comrak starts after the frontmatter: shift
+    // comrak's 1-based body lines down onto FILE lines. `raw` ends with the
+    // closing delimiter's own newline (or EOF), so its line count is exactly
+    // the number of file lines before the body.
+    let offset = split.raw.as_ref().map_or(0, |raw| raw.lines().count());
+    let (blocks, body_spans) = lower_source_spanned(&split.body);
+    let spans = body_spans
+        .into_iter()
+        .map(|span| crate::ir::SourceSpan {
+            start: span.start + offset,
+            end: span.end + offset,
+        })
+        .collect();
     Doc {
         frontmatter_raw: split.raw,
-        blocks: lower_source(&split.body),
+        blocks,
+        spans,
     }
 }
 
 /// Lower a source fragment (no frontmatter expected) into blocks.
 pub fn lower_source(src: &str) -> Vec<Block> {
-    let extracted = crate::inline::extract(src);
-    lower_comrak(&extracted)
+    lower_source_spanned(src).0
 }
 
-fn lower_comrak(extracted: &Extracted) -> Vec<Block> {
+/// Lower a source fragment into blocks plus each top-level block's source
+/// line span (1-based, inclusive, relative to `src`).
+pub fn lower_source_spanned(src: &str) -> (Vec<Block>, Vec<crate::ir::SourceSpan>) {
+    let extracted = crate::inline::extract(src);
+    lower_comrak_spanned(&extracted)
+}
+
+fn lower_comrak_spanned(extracted: &Extracted) -> (Vec<Block>, Vec<crate::ir::SourceSpan>) {
     let arena = Arena::new();
     let root = parse_document(&arena, &extracted.text, &comrak_options());
-    let mut blocks = Vec::new();
+    // Each AST node lowers to 0..=1 top-level blocks; carry the node's
+    // start line with each emitted block so spans survive the lone-id
+    // attach pass (which removes blocks).
+    let mut paired: Vec<(Block, usize)> = Vec::new();
     for child in root.children() {
-        lower_block(child, &extracted.tokens, &mut blocks);
+        let start = child.data().sourcepos.start.line;
+        let mut out = Vec::new();
+        lower_block(child, &extracted.tokens, &mut out);
+        for block in out {
+            paired.push((block, start));
+        }
     }
-    attach_lone_block_ids(&mut blocks);
-    blocks
+    attach_top_lone_block_ids(&mut paired);
+    // A block spans from its first line to the line before the next
+    // block: blank lines and interleaved comments attach to the block
+    // above, which is what editor→preview scrolling wants. The last block
+    // owns through the end of the text.
+    let body_lines = extracted.text.lines().count().max(1);
+    let mut blocks = Vec::with_capacity(paired.len());
+    let mut spans = Vec::with_capacity(paired.len());
+    for (i, (block, start)) in paired.iter().enumerate() {
+        let end = match paired.get(i + 1) {
+            Some(&(_, next)) => next.saturating_sub(1).max(*start),
+            None => body_lines.max(*start),
+        };
+        blocks.push(block.clone());
+        spans.push(crate::ir::SourceSpan { start: *start, end });
+    }
+    (blocks, spans)
 }
 
 /// The extension set: everything Obsidian's reading view does that comrak
@@ -311,6 +354,34 @@ fn attach_lone_block_ids(blocks: &mut Vec<Block>) {
             continue;
         }
         match &mut blocks[i] {
+            Block::List { items, .. } => {
+                for item in items {
+                    attach_lone_block_ids(&mut item.body);
+                }
+            }
+            Block::Quote(body) => attach_lone_block_ids(body),
+            Block::Callout { body, .. } => attach_lone_block_ids(body),
+            Block::FootnoteDef { body, .. } => attach_lone_block_ids(body),
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// The top-level lone-id pass, keeping each block's body start line in
+/// lockstep: a removed `^id` paragraph drops its line entry too, and the
+/// id attaches to the block above (whose span now covers those lines).
+fn attach_top_lone_block_ids(paired: &mut Vec<(Block, usize)>) {
+    let mut i = 0;
+    while i < paired.len() {
+        if let Some(id) = lone_block_id(&paired[i].0) {
+            paired.remove(i);
+            if i > 0 {
+                attach_block_id(&mut paired[i - 1].0, &id);
+            }
+            continue;
+        }
+        match &mut paired[i].0 {
             Block::List { items, .. } => {
                 for item in items {
                     attach_lone_block_ids(&mut item.body);
@@ -693,5 +764,74 @@ mod tests {
             .blocks
             .iter()
             .all(|b| !paragraph_text(b).contains("title: T")));
+    }
+
+    #[test]
+    fn spans_are_body_lines_without_frontmatter() {
+        let src = "# Title\n\nFirst paragraph.\n\n- one\n- two\n";
+        let doc = parsed(src);
+        // Head: line 1. Paragraph: line 3. List: lines 5-6.
+        let spans: Vec<(usize, usize)> = doc.spans.iter().map(|s| (s.start, s.end)).collect();
+        assert_eq!(spans, vec![(1, 2), (3, 4), (5, 6)]);
+    }
+
+    #[test]
+    fn spans_shift_to_file_lines_with_frontmatter() {
+        let src = "---\ntags: [a]\n---\n\n# Head\n\nBody text.\n";
+        let doc = parsed(src);
+        // Frontmatter is 3 file lines; the body starts on file line 4.
+        assert_eq!(doc.frontmatter_line_count(), 3);
+        let spans: Vec<(usize, usize)> = doc.spans.iter().map(|s| (s.start, s.end)).collect();
+        // The heading owns the blank file line 6 too.
+        assert_eq!(spans, vec![(5, 6), (7, 7)]);
+    }
+
+    #[test]
+    fn blank_lines_and_comments_attach_to_the_block_above() {
+        let src = "one\n\n%% secret %%\n\ntwo\n";
+        let doc = parsed(src);
+        // The comment-only paragraph is dropped; its line joins "one"'s span.
+        let spans: Vec<(usize, usize)> = doc.spans.iter().map(|s| (s.start, s.end)).collect();
+        assert_eq!(spans, vec![(1, 4), (5, 5)]);
+        assert_eq!(doc.blocks.len(), 2);
+    }
+
+    #[test]
+    fn lone_block_id_lines_join_the_previous_block_span() {
+        let src = "text\n\n^my-id\n\nnext\n";
+        let doc = parsed(src);
+        // The `^my-id` paragraph is removed; the first block keeps lines
+        // 1-4 (blank line 2, the id line 3, blank line 4 all attach above).
+        let spans: Vec<(usize, usize)> = doc.spans.iter().map(|s| (s.start, s.end)).collect();
+        assert_eq!(spans, vec![(1, 4), (5, 5)]);
+        assert_eq!(doc.blocks.len(), 2);
+        assert!(
+            matches!(&doc.blocks[0], Block::Paragraph { block_id: Some(id), .. } if id == "my-id")
+        );
+    }
+
+    #[test]
+    fn block_at_line_maps_editor_lines_to_blocks() {
+        let src = "# Head\n\nPara one.\ncontinues\n\n- item\n";
+        let doc = parsed(src);
+        // Spans: heading 1-2, paragraph 3-5, list 6-6.
+        assert_eq!(doc.block_at_line(1), Some(0));
+        assert_eq!(doc.block_at_line(2), Some(0)); // blank line under the head
+        assert_eq!(doc.block_at_line(4), Some(1));
+        assert_eq!(doc.block_at_line(5), Some(1)); // blank line
+        assert_eq!(doc.block_at_line(6), Some(2));
+        // Beyond the document: no block.
+        assert_eq!(doc.block_at_line(9), None);
+        // 0 is before every span: no block claims it.
+        assert_eq!(doc.block_at_line(0), None);
+    }
+
+    #[test]
+    fn container_blocks_carry_one_span() {
+        let src = "> quote line\n> more\n\n```rust\nlet x = 1;\n```\n";
+        let doc = parsed(src);
+        let spans: Vec<(usize, usize)> = doc.spans.iter().map(|s| (s.start, s.end)).collect();
+        // The quote owns the blank line 3 (blocks stretch to the next one).
+        assert_eq!(spans, vec![(1, 3), (4, 6)]);
     }
 }

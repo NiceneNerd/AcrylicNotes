@@ -7,6 +7,41 @@
 pub struct Doc {
     pub frontmatter_raw: Option<String>,
     pub blocks: Vec<Block>,
+    /// Source line span of each top-level block (parallel to `blocks`),
+    /// in FILE lines — frontmatter included. Drives editor↔preview
+    /// scroll sync.
+    pub spans: Vec<SourceSpan>,
+}
+
+impl Doc {
+    /// How many lines the frontmatter occupies (0 without one).
+    pub fn frontmatter_line_count(&self) -> usize {
+        self.frontmatter_raw
+            .as_ref()
+            .map_or(0, |raw| raw.lines().count())
+    }
+
+    /// The top-level block whose source span contains `line` (FILE line,
+    /// 1-based) — the anchor for editor→preview scroll sync. Spans stretch
+    /// to the next block's first line, so blank lines and interleaved
+    /// comments belong to the preceding block.
+    pub fn block_at_line(&self, line: usize) -> Option<usize> {
+        self.spans.iter().position(|span| span.contains(line))
+    }
+}
+
+/// A top-level block's source lines: 1-based, inclusive, FILE-relative
+/// (frontmatter lines count).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl SourceSpan {
+    pub fn contains(&self, line: usize) -> bool {
+        self.start <= line && line <= self.end
+    }
 }
 
 /// Table column alignment, from `|:-:|` delimiter rows.

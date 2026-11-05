@@ -634,4 +634,32 @@ mod tests {
         assert_eq!(tags(&lower("#a-b_c")), ["a-b_c"]);
         assert_eq!(tags(&lower("#tag/")), ["tag"]);
     }
+
+    #[test]
+    fn extract_preserves_line_structure() {
+        // comrak's sourcepos (block spans) is only meaningful if extraction
+        // never adds or removes lines. Sentinels replace same-line spans;
+        // multi-line `[[...]]` is rejected by wiki_inner and copied
+        // verbatim, so every path keeps the line count and boundaries.
+        let cases = [
+            "plain text\n",
+            "[[Note]] and ![[Embed.png|300]]\n",
+            "[[Note\nspanning lines]] stays literal\n",
+            "\\# not a tag\n",
+            "%% a comment %%\n\nsecond para\n",
+            "```rust\n[[in fence]]\n```\n",
+            "\t[[indented code]]\n",
+            "<div>\n[[in html]]\n</div>\n",
+            "$x [[in math]] y$\n\n$$\n[[display]]\n$$\n",
+            "- list with [[link]]\n- [ ] task\n",
+        ];
+        for src in cases {
+            let extracted = extract(src);
+            assert_eq!(
+                extracted.text.lines().count(),
+                src.lines().count(),
+                "line count changed for {src:?}"
+            );
+        }
+    }
 }

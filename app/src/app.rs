@@ -192,6 +192,7 @@ impl Tab {
             doc: Doc {
                 frontmatter_raw: None,
                 blocks: Vec::new(),
+                spans: Vec::new(),
             },
             doc_text: String::new(),
             outline: Vec::new(),
