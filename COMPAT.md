@@ -515,3 +515,57 @@ All chord changes below supersede the M4c follow-up section above.
   to the editor — and shows only in Source and Split panes. It clears
   on pane/panel switches, tab open/close, undo/redo, find replaces, and
   any editor action that leaves the unclosed `[[`.
+
+### Phase D — editor context menu
+
+- Right-clicking the editor pane opens a COSMIC context menu with
+  Copy, Cut, Paste, and Select All. Copy writes the selection to the
+  clipboard; cut is copy + delete (one undo step); paste reads the
+  clipboard and inserts at the cursor (one undo step); select-all uses
+  the editor's own action.
+- Paste is asynchronous (clipboard read returns a task), so it arrives
+  as a follow-up message; a second paste request while one is in
+  flight is ignored rather than double-inserting.
+
+### Phase E — source spans (scroll-sync foundation)
+
+- `Doc` now carries one `SourceSpan` (1-based inclusive file lines) per
+  top-level block, parallel to the blocks. Front-matter lines shift
+  spans; blank lines, comment-only paragraphs, and removed `^id`
+  paragraphs attribute to the block above (spans stretch to the next
+  block's start). `Doc::block_at_line` maps a file line to its block.
+- The parser stays line-preserving: `extract` never consumes newline
+  characters (locked in with a test), so spans computed from raw line
+  counts stay valid through lowering.
+
+### Phase F — scroll sync (editor → preview)
+
+- In Split mode the reading pane follows the editor caret: when the
+  caret changes line, the preview scrolls so the block containing that
+  line is near the top (12 px margin). It also re-syncs on tab switch.
+- Gated by the `scroll_sync` setting (default on) and fires only on a
+  line change, so typing within a line never rescrolls.
+- The reverse direction (preview click → caret) is not implementable:
+  iced's editor exposes no programmatic scroll API.
+
+### Phase G — settings drawer + attachments in the tree
+
+- A gear button in the header opens the right-side COSMIC context
+  drawer with every persisted preference: auto-pairs, wikilink
+  suggestions, word wrap, monospace editor font, editor font size
+  (10–28 px stepper), theme (System/Dark/Light), solid sidebar, default
+  pane layout (Split/Source/Reading), hide `.md` in the tree, autosave
+  delay (1–60 s stepper), and scroll sync.
+- Each change applies immediately and persists through
+  load-modify-store, so settings never clobber each other. The editor
+  honors font family, size, and wrapping live; disabling auto-pairs or
+  wikilink autocomplete short-circuits those features; autosave uses
+  the configured delay; a fresh session starts in the saved layout.
+- The "solid sidebar" toggle paints the sidebar with the theme surface
+  instead of the translucent one (for compositors/window rules where
+  the frosted-window blur is unwanted).
+- Non-markdown vault files (attachments) now appear in the file tree
+  with an attachment icon, sorted among the notes. Clicking one opens
+  it with the platform handler (`xdg-open`). They deliberately get no
+  rename row, dirty dots, or context menu — renaming wouldn't rewrite
+  links to them — and they stay out of search and the switcher.
