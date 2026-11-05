@@ -39,10 +39,56 @@ pub struct AppSettings {
     /// caret's line.
     #[serde(default = "default_true")]
     pub scroll_sync: bool,
+    /// Insert closing brackets/quotes and type over them (M4d).
+    #[serde(default = "default_true")]
+    pub auto_pair: bool,
+    /// Suggest note titles while typing `[[` (M4d).
+    #[serde(default = "default_true")]
+    pub wiki_autocomplete: bool,
+    /// Soft-wrap long lines in the editor.
+    #[serde(default = "default_true")]
+    pub word_wrap: bool,
+    /// Edit in the monospace font (off = the system UI font).
+    #[serde(default = "default_true")]
+    pub editor_font_mono: bool,
+    /// Editor font size in pixels.
+    #[serde(default = "default_editor_font_size")]
+    pub editor_font_size: u16,
+    /// Paint the sidebar with a solid surface instead of the translucent
+    /// (glass) one.
+    #[serde(default)]
+    pub sidebar_solid: bool,
+    /// Seconds of editor idle before autosave fires.
+    #[serde(default = "default_autosave_secs")]
+    pub autosave_secs: u64,
+    /// The pane layout a fresh session starts in.
+    #[serde(default)]
+    pub default_pane: PaneMode,
+}
+
+/// How the note area is laid out. Lives here (not app.rs) because it
+/// persists; app.rs re-exports it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneMode {
+    #[default]
+    #[serde(rename = "split")]
+    Split,
+    #[serde(rename = "source")]
+    Source,
+    #[serde(rename = "reading")]
+    Reading,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_editor_font_size() -> u16 {
+    14
+}
+
+fn default_autosave_secs() -> u64 {
+    2
 }
 
 impl Default for AppSettings {
@@ -53,6 +99,14 @@ impl Default for AppSettings {
             glass_enabled: true,
             hide_md_extension: true,
             scroll_sync: true,
+            auto_pair: true,
+            wiki_autocomplete: true,
+            word_wrap: true,
+            editor_font_mono: true,
+            editor_font_size: default_editor_font_size(),
+            sidebar_solid: false,
+            autosave_secs: default_autosave_secs(),
+            default_pane: PaneMode::default(),
         }
     }
 }
@@ -111,6 +165,14 @@ mod tests {
             glass_enabled: true,
             hide_md_extension: true,
             scroll_sync: false,
+            auto_pair: false,
+            wiki_autocomplete: true,
+            word_wrap: false,
+            editor_font_mono: true,
+            editor_font_size: 18,
+            sidebar_solid: true,
+            autosave_secs: 5,
+            default_pane: PaneMode::Reading,
         };
         store_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -135,6 +197,15 @@ mod tests {
         assert!(loaded.hide_md_extension);
         // Scroll sync defaults on for files that predate the field.
         assert!(loaded.scroll_sync);
+        // Phase G fields all default sensibly.
+        assert!(loaded.auto_pair);
+        assert!(loaded.wiki_autocomplete);
+        assert!(loaded.word_wrap);
+        assert!(loaded.editor_font_mono);
+        assert_eq!(loaded.editor_font_size, 14);
+        assert!(!loaded.sidebar_solid);
+        assert_eq!(loaded.autosave_secs, 2);
+        assert_eq!(loaded.default_pane, PaneMode::Split);
 
         // A glass_enabled=false must survive the roundtrip.
         let path2 = tmp.path().join("settings2.json");

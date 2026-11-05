@@ -24,14 +24,9 @@ use vault_md::{parse_note, Doc};
 use crate::settings;
 use crate::tree::{self, TreeNode};
 
-/// How the note area is laid out.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PaneMode {
-    #[default]
-    Split,
-    Source,
-    Reading,
-}
+/// How the note area is laid out. Defined in settings (it persists) and
+/// re-exported here.
+pub use crate::settings::PaneMode;
 
 /// Which panel the sidebar shows (M4b).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -370,6 +365,24 @@ pub enum Message {
     EditorPasteText(Option<String>),
     /// Select the entire buffer.
     EditorSelectAll,
+    /// Open a non-markdown vault file with the platform handler.
+    OpenAttachment(String),
+    // --- settings drawer ---
+    /// Open or close the settings context drawer.
+    SettingsToggle,
+    SettingsAutoPair(bool),
+    SettingsWikiComplete(bool),
+    SettingsWordWrap(bool),
+    SettingsFontMono(bool),
+    /// Nudge the editor font size (clamped).
+    SettingsFontSize(i32),
+    SettingsTheme(settings::ThemeChoice),
+    SettingsSidebarSolid(bool),
+    SettingsDefaultPane(PaneMode),
+    SettingsHideMdExt(bool),
+    /// Nudge the autosave delay in seconds (clamped 1..=60).
+    SettingsAutosaveDelta(i32),
+    SettingsScrollSync(bool),
     /// Delete the word before (false) or after (true) the cursor.
     EditorDeleteWord(bool),
     /// A bracket/quote was typed: pair it around the selection, or insert
@@ -439,6 +452,22 @@ pub struct VaultNotes {
     pub hide_md_extension: bool,
     /// Follow the editor caret in the visible reading pane.
     pub scroll_sync: bool,
+    /// Insert closing brackets/quotes and type over them.
+    pub auto_pair: bool,
+    /// Suggest note titles while typing `[[`.
+    pub wiki_autocomplete: bool,
+    /// Soft-wrap long lines in the editor.
+    pub word_wrap: bool,
+    /// Edit in the monospace font (off = the system UI font).
+    pub editor_font_mono: bool,
+    /// Editor font size in pixels.
+    pub editor_font_size: u16,
+    /// Paint the sidebar with a solid surface.
+    pub sidebar_solid: bool,
+    /// Seconds of editor idle before autosave fires.
+    pub autosave_secs: u64,
+    /// The pane layout a fresh session starts in.
+    pub default_pane: PaneMode,
     /// Pending inline tree edit (new note / new folder / rename), if any.
     pub tree_edit: Option<tree::TreeEdit>,
     /// The in-note find bar state (Ctrl+F), when open.
@@ -455,9 +484,6 @@ pub struct VaultNotes {
     /// Open-note tab strip; entities carry the tab index as data.
     pub tab_model: segmented_button::Model<segmented_button::SingleSelect>,
 }
-
-/// Save the active note ~2 s after its last edit (M4 decision, user-tuned).
-const AUTOSAVE_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Id of the inline tree-edit text input (focused when the edit starts).
 pub const TREE_EDIT_INPUT: &str = "tree-edit-input";
@@ -483,8 +509,18 @@ impl cosmic::widget::menu::Action for TreeMenuAction {
 
 /// Pure autosave decision: an idle period measured since the last edit is
 /// due for a save. Unit-testable without an `Instant`.
-fn autosave_due(idle_since_last_edit: Option<std::time::Duration>) -> bool {
-    idle_since_last_edit.is_some_and(|d| d >= AUTOSAVE_IDLE)
+/// Pure autosave decision: an idle period measured since the last edit is
+/// at least the configured delay.
+fn autosave_due(idle_since_last_edit: Option<std::time::Duration>, delay_secs: u64) -> bool {
+    idle_since_last_edit.is_some_and(|d| d >= std::time::Duration::from_secs(delay_secs))
+}
+
+/// Persist one settings change: load-modify-store so every other field
+/// survives.
+fn persist_setting(mutate: impl FnOnce(&mut settings::AppSettings)) {
+    let mut persisted = settings::load();
+    mutate(&mut persisted);
+    settings::store(&persisted);
 }
 
 // --- editor commands (undo, formatting, footnotes, word delete) ------------
@@ -1101,6 +1137,15 @@ impl VaultNotes {
             .any(|tab| tab.path == path && tab.is_dirty())
     }
 
+    /// Resolve a tree attachment path (vault-relative) to an absolute path
+    /// for the platform handler; falls back to the raw path with no vault.
+    fn attachment_path(&self, path: &str) -> PathBuf {
+        self.vault
+            .as_ref()
+            .map(|vault| vault.root().join(path))
+            .unwrap_or_else(|| PathBuf::from(path))
+    }
+
     fn rebuild_index(&mut self) {
         let Some(vault) = self.vault.as_ref() else {
             return;
@@ -1115,7 +1160,13 @@ impl VaultNotes {
         // Empty folders materialize too, so they can receive new notes.
         let folders: Vec<String> = vault.folders();
         let folder_refs: Vec<&str> = folders.iter().map(String::as_str).collect();
-        self.tree = tree::build_with_folders(&refs, &folder_refs);
+        // Attachments show in the tree as well (click opens them with the
+        // platform handler); the switcher and search stay note-only.
+        let attachments = vault.attachments_sorted();
+        self.tree = tree::build_with_folders(
+            &[refs.as_slice(), attachments.as_slice()].concat(),
+            &folder_refs,
+        );
     }
 
     fn open_tab(&mut self, path: String) -> Task<Message> {
@@ -1529,6 +1580,10 @@ impl VaultNotes {
     /// Re-evaluate the wikilink dropdown against the active tab's text and
     /// cursor: open while an unclosed `[[` is being typed, gone otherwise.
     fn update_wiki_complete(&mut self) {
+        if !self.wiki_autocomplete {
+            self.wiki_complete = None;
+            return;
+        }
         let Some(idx) = self.active else {
             self.wiki_complete = None;
             return;
@@ -1854,13 +1909,15 @@ impl VaultNotes {
 
     /// Poll the watcher: re-index externally changed paths, auto-refresh
     /// clean tabs, and flag dirty ones in the banner (M4 decision 7).
-    /// Save the active tab if it was edited and has been idle for
-    /// `AUTOSAVE_IDLE`. Goes through the guarded save path, so an external
+    /// Save the active tab if it was edited and has been idle for the
+    /// configured delay. Goes through the guarded save path, so an external
     /// change refuses the write and raises the conflict banner instead of
     /// silently clobbering.
     fn autosave_tick(&mut self) -> Task<Message> {
         let idle = self.last_edit.map(|t| t.elapsed());
-        if autosave_due(idle) && self.active.is_some_and(|idx| self.tabs[idx].is_dirty()) {
+        if autosave_due(idle, self.autosave_secs)
+            && self.active.is_some_and(|idx| self.tabs[idx].is_dirty())
+        {
             return self.save_active();
         }
         Task::none()
@@ -1926,6 +1983,8 @@ impl cosmic::Application for VaultNotes {
     }
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
+        // One settings read feeds every persisted field.
+        let persisted = settings::load();
         let mut app = Self {
             core,
             vault: None,
@@ -1935,7 +1994,7 @@ impl cosmic::Application for VaultNotes {
             collapsed: HashSet::new(),
             tabs: Vec::new(),
             active: None,
-            pane: PaneMode::default(),
+            pane: persisted.default_pane,
             banner: None,
             error: None,
             vault_input: String::new(),
@@ -1949,8 +2008,16 @@ impl cosmic::Application for VaultNotes {
             last_edit: None,
             glass_style: vault_glass::GlassStyle::Opaque,
             theme: settings::ThemeChoice::default(),
-            hide_md_extension: settings::load().hide_md_extension,
-            scroll_sync: settings::load().scroll_sync,
+            hide_md_extension: persisted.hide_md_extension,
+            scroll_sync: persisted.scroll_sync,
+            auto_pair: persisted.auto_pair,
+            wiki_autocomplete: persisted.wiki_autocomplete,
+            word_wrap: persisted.word_wrap,
+            editor_font_mono: persisted.editor_font_mono,
+            editor_font_size: persisted.editor_font_size,
+            sidebar_solid: persisted.sidebar_solid,
+            autosave_secs: persisted.autosave_secs,
+            default_pane: persisted.default_pane,
             tree_edit: None,
             tree_menu_target: None,
             find: None,
@@ -1963,12 +2030,11 @@ impl cosmic::Application for VaultNotes {
 
         // Restore preferences (M4c): theme choice, then the glass request,
         // then the last-used vault (M4 decision 1) when it still exists.
-        let settings = settings::load();
-        app.theme = settings.theme;
-        app.glass_style = crate::glass::plan(settings.glass_enabled);
+        app.theme = persisted.theme;
+        app.glass_style = crate::glass::plan(persisted.glass_enabled);
 
         let mut tasks = Vec::new();
-        tasks.push(theme_task(settings.theme));
+        tasks.push(theme_task(persisted.theme));
         if app.glass_style == vault_glass::GlassStyle::Blur {
             // Ask the compositor for the frosted window; visibility still
             // depends on the theme's frosted-windows setting.
@@ -1977,7 +2043,7 @@ impl cosmic::Application for VaultNotes {
             )));
         }
         tasks.push(
-            settings
+            persisted
                 .last_vault
                 .filter(|path| path.is_dir())
                 .map(|path| app.open_vault(path))
@@ -2215,6 +2281,9 @@ impl cosmic::Application for VaultNotes {
                 self.sync_preview_scroll()
             }
             Message::EditorAutoPair(typed) => {
+                if !self.auto_pair {
+                    return Task::none();
+                }
                 if let Some(idx) = self.active {
                     let text = self.tabs[idx].content.text();
                     let cursor = self.tabs[idx].content.cursor();
@@ -2356,6 +2425,71 @@ impl cosmic::Application for VaultNotes {
                     self.tabs[idx].content.perform(Action::SelectAll);
                 }
                 self.sync_preview_scroll()
+            }
+            Message::SettingsToggle => {
+                let open = self.core.window.show_context;
+                self.core.set_show_context(!open);
+                Task::none()
+            }
+            Message::SettingsAutoPair(on) => {
+                self.auto_pair = on;
+                persist_setting(|s| s.auto_pair = on);
+                Task::none()
+            }
+            Message::SettingsWikiComplete(on) => {
+                self.wiki_autocomplete = on;
+                persist_setting(|s| s.wiki_autocomplete = on);
+                if !on {
+                    self.wiki_complete = None;
+                }
+                Task::none()
+            }
+            Message::SettingsWordWrap(on) => {
+                self.word_wrap = on;
+                persist_setting(|s| s.word_wrap = on);
+                Task::none()
+            }
+            Message::SettingsFontMono(on) => {
+                self.editor_font_mono = on;
+                persist_setting(|s| s.editor_font_mono = on);
+                Task::none()
+            }
+            Message::SettingsFontSize(delta) => {
+                let size = (self.editor_font_size as i32 + delta).clamp(10, 28) as u16;
+                self.editor_font_size = size;
+                persist_setting(|s| s.editor_font_size = size);
+                Task::none()
+            }
+            Message::SettingsTheme(choice) => {
+                self.theme = choice;
+                persist_setting(|s| s.theme = choice);
+                theme_task(choice)
+            }
+            Message::SettingsSidebarSolid(on) => {
+                self.sidebar_solid = on;
+                persist_setting(|s| s.sidebar_solid = on);
+                Task::none()
+            }
+            Message::SettingsDefaultPane(mode) => {
+                self.default_pane = mode;
+                persist_setting(|s| s.default_pane = mode);
+                Task::none()
+            }
+            Message::SettingsHideMdExt(on) => {
+                self.hide_md_extension = on;
+                persist_setting(|s| s.hide_md_extension = on);
+                Task::none()
+            }
+            Message::SettingsAutosaveDelta(delta) => {
+                let secs = (self.autosave_secs as i64 + delta as i64).clamp(1, 60) as u64;
+                self.autosave_secs = secs;
+                persist_setting(|s| s.autosave_secs = secs);
+                Task::none()
+            }
+            Message::SettingsScrollSync(on) => {
+                self.scroll_sync = on;
+                persist_setting(|s| s.scroll_sync = on);
+                Task::none()
             }
             Message::Save => self.save_active(),
             Message::ToggleFolder(path) => {
@@ -2620,11 +2754,25 @@ impl cosmic::Application for VaultNotes {
                 let _ = url;
                 Task::none()
             }
+            Message::OpenAttachment(path) => {
+                // Vault-relative → absolute, then the platform handler.
+                let absolute = self.attachment_path(&path);
+                self.update(Message::OpenExternal(absolute.display().to_string()))
+            }
         }
     }
 
     fn view(&self) -> cosmic::Element<'_, Self::Message> {
         crate::view::view(self)
+    }
+
+    /// The settings drawer (Phase G): shown while `show_context` is set,
+    /// toggled by the header's settings button.
+    fn context_drawer(&self) -> Option<cosmic::app::ContextDrawer<'_, Self::Message>> {
+        Some(cosmic::app::context_drawer(
+            crate::view::settings_view(self),
+            Message::SettingsToggle,
+        ))
     }
 
     fn header_start(&self) -> Vec<cosmic::Element<'_, Self::Message>> {
@@ -2874,12 +3022,15 @@ mod tests {
     fn autosave_fires_only_after_the_idle_window() {
         use std::time::Duration;
         // No edit recorded: never save.
-        assert!(!autosave_due(None));
+        assert!(!autosave_due(None, 2));
         // Recent edit: not yet.
-        assert!(!autosave_due(Some(Duration::from_millis(500))));
+        assert!(!autosave_due(Some(Duration::from_millis(500)), 2));
         // Idle past the window: save.
-        assert!(autosave_due(Some(Duration::from_secs(2))));
-        assert!(autosave_due(Some(Duration::from_secs(10))));
+        assert!(autosave_due(Some(Duration::from_secs(2)), 2));
+        assert!(autosave_due(Some(Duration::from_secs(10)), 2));
+        // A longer configured delay pushes the window out.
+        assert!(!autosave_due(Some(Duration::from_secs(2)), 5));
+        assert!(autosave_due(Some(Duration::from_secs(5)), 5));
     }
 }
 
@@ -3573,6 +3724,14 @@ mod find_tests {
             theme: settings::ThemeChoice::default(),
             hide_md_extension: true,
             scroll_sync: true,
+            auto_pair: true,
+            wiki_autocomplete: true,
+            word_wrap: true,
+            editor_font_mono: true,
+            editor_font_size: 14,
+            sidebar_solid: false,
+            autosave_secs: 2,
+            default_pane: PaneMode::default(),
             tree_edit: None,
             tree_menu_target: None,
             find: None,
@@ -3845,5 +4004,47 @@ mod scroll_sync_tests {
         app.scroll_sync = true;
         app.sync_preview_scroll();
         assert_eq!(app.tabs[0].synced_line, Some(1));
+    }
+}
+
+#[cfg(test)]
+mod attachment_tree_tests {
+    use super::*;
+
+    #[test]
+    fn attachments_appear_in_the_tree_and_open_vault_absolutely() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("assets")).unwrap();
+        std::fs::write(tmp.path().join("n.md"), "note\n").unwrap();
+        std::fs::write(tmp.path().join("assets/cat.png"), "png").unwrap();
+
+        let mut app = find_tests::test_app_with_tab("");
+        app.vault = Some(Vault::open(tmp.path()).unwrap());
+        app.rebuild_index();
+
+        // The attachment is a tree leaf beside the notes.
+        let leaves = tree::folder_paths(&app.tree); // sanity: helper runs
+        let _ = leaves;
+        fn collect(nodes: &[TreeNode], out: &mut Vec<(String, String)>) {
+            for node in nodes {
+                match node {
+                    TreeNode::Folder { children, .. } => collect(children, out),
+                    TreeNode::Note { name, path } => out.push((name.clone(), path.clone())),
+                }
+            }
+        }
+        let mut leaves = Vec::new();
+        collect(&app.tree, &mut leaves);
+        assert!(leaves.contains(&("n.md".to_string(), "n.md".to_string())));
+        assert!(leaves.contains(&("cat.png".to_string(), "assets/cat.png".to_string())));
+
+        // OpenAttachment resolves vault-relative to absolute for the handler.
+        assert_eq!(
+            app.attachment_path("assets/cat.png"),
+            tmp.path().join("assets/cat.png")
+        );
+        // Without a vault, the raw path passes through.
+        let bare = find_tests::test_app_with_tab("");
+        assert_eq!(bare.attachment_path("x.png"), PathBuf::from("x.png"));
     }
 }

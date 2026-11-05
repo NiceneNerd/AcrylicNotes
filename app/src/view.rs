@@ -9,7 +9,7 @@ use cosmic::iced::widget::{opaque, stack, text_editor};
 use cosmic::iced::{alignment, border, Background, Length, Padding};
 use cosmic::widget::{
     button, column, container, context_menu, icon, menu, nav_bar, row, scrollable,
-    segmented_button, tab_bar, text, text_input,
+    segmented_button, settings, tab_bar, text, text_input, toggler,
 };
 use cosmic::Element;
 
@@ -72,6 +72,10 @@ pub fn header_start(app: &VaultNotes) -> Vec<Element<'_, Message>> {
         )
         .padding([2, 4])
         .into(),
+        // Settings live in the right-side context drawer (Phase G).
+        button::icon(icon::from_name("emblem-system-symbolic"))
+            .on_press(Message::SettingsToggle)
+            .into(),
     ]
 }
 
@@ -225,6 +229,25 @@ fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
     container(col)
         .width(Length::Fixed(250.0))
         .height(Length::Fill)
+        .style(move |_| {
+            // Default: translucent, so the compositor's frosted-window blur
+            // shows through (COSMIC transparency setting). "Solid sidebar"
+            // paints the theme surface instead.
+            let background = if app.sidebar_solid {
+                Some(Background::Color(cosmic::iced::Color::from(
+                    cosmic::theme::active()
+                        .cosmic()
+                        .background(palette.is_dark)
+                        .base,
+                )))
+            } else {
+                None
+            };
+            cosmic::widget::container::Style {
+                background,
+                ..Default::default()
+            }
+        })
         .into()
 }
 
@@ -393,8 +416,24 @@ fn nodes_view<'a>(
                 }
             }
             TreeNode::Note { name, path } => {
-                let row = if app.tree_rename_target() == Some(path.as_str()) {
+                // Non-markdown files (attachments) open with the platform
+                // handler: no rename row, dirty dots, or context menu —
+                // renaming wouldn't rewrite links to them anyway.
+                let is_note = path.ends_with(".md");
+                let row = if is_note && app.tree_rename_target() == Some(path.as_str()) {
                     tree_edit_row(app, indent + 10.0)
+                } else if !is_note {
+                    button::custom(
+                        row::Row::new()
+                            .push(icon::from_name("mail-attachment-symbolic").size(16))
+                            .push(text(name.to_owned()))
+                            .spacing(6),
+                    )
+                    .class(cosmic::theme::Button::Text)
+                    .on_press(Message::OpenAttachment(path.clone()))
+                    .height(Length::Shrink)
+                    .width(Length::Fill)
+                    .into()
                 } else {
                     let mut label = tree_note_label(name, app.hide_md_extension);
                     if app.active_tab_path() == Some(path.as_str()) {
@@ -415,7 +454,7 @@ fn nodes_view<'a>(
                     .into()
                 };
                 col = col.push(
-                    container(menu_row(row, path))
+                    container(if is_note { menu_row(row, path) } else { row })
                         .padding(Padding {
                             left: indent + 10.0,
                             ..Padding::ZERO
@@ -683,11 +722,11 @@ fn note_area<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
         col = col.push(find_bar(app, palette));
     }
     let content: Element<'_, Message> = match app.pane {
-        PaneMode::Source => editor_pane(tab, palette, app.wiki_complete.as_ref()),
+        PaneMode::Source => editor_pane(app, tab, palette, app.wiki_complete.as_ref()),
         PaneMode::Reading => reading_pane(app, tab, palette),
         PaneMode::Split => row::Row::new()
             .push(
-                container(editor_pane(tab, palette, app.wiki_complete.as_ref()))
+                container(editor_pane(app, tab, palette, app.wiki_complete.as_ref()))
                     .width(Length::FillPortion(1)),
             )
             .push(container(reading_pane(app, tab, palette)).width(Length::FillPortion(1)))
@@ -784,6 +823,7 @@ fn find_bar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
 // --- panes -----------------------------------------------------------------
 
 fn editor_pane<'a>(
+    app: &'a VaultNotes,
     tab: &'a crate::app::Tab,
     palette: Palette,
     wiki: Option<&'a crate::app::WikiComplete>,
@@ -800,7 +840,18 @@ fn editor_pane<'a>(
         .on_action(Message::EditorAction)
         // Inset the text from the editor's border.
         .padding(8)
-        .font(cosmic::font::mono())
+        // Font family, size, and wrapping are user preferences (Phase G).
+        .font(if app.editor_font_mono {
+            cosmic::font::mono()
+        } else {
+            cosmic::font::default()
+        })
+        .size(f32::from(app.editor_font_size))
+        .wrapping(if app.word_wrap {
+            cosmic::iced::core::text::Wrapping::Word
+        } else {
+            cosmic::iced::core::text::Wrapping::None
+        })
         .highlight_with::<cosmic::iced::highlighter::Highlighter>(
             cosmic::iced::highlighter::Settings {
                 theme: highlighter_theme,
@@ -975,4 +1026,151 @@ fn status_bar<'a>(tab: &'a crate::app::Tab, palette: Palette) -> Element<'a, Mes
 
 fn with_alpha(color: cosmic::iced::Color, alpha: f32) -> cosmic::iced::Color {
     cosmic::iced::Color { a: alpha, ..color }
+}
+
+/// The settings context drawer (Phase G): toggles and steppers for every
+/// persisted preference. Each change updates the app field immediately and
+/// persists through load-modify-store.
+pub fn settings_view<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
+    let toggle = |label: &'a str, on: bool, msg: Message| {
+        settings::item(
+            label,
+            toggler(on).on_toggle(move |_| msg.clone()).spacing(8),
+        )
+    };
+    let stepper = |label: &'a str, value: String, minus: Message, plus: Message| {
+        settings::item(
+            label,
+            row::Row::new()
+                .spacing(8)
+                .align_y(alignment::Vertical::Center)
+                .push(button::text("−").on_press(minus))
+                .push(text(value).size(14))
+                .push(button::text("+").on_press(plus)),
+        )
+    };
+    // A three-way choice rendered as small buttons; the active one is
+    // suggested-classed.
+    let choice = |current: &str, options: &[(&'static str, Message)]| {
+        let mut row = row::Row::new().spacing(4);
+        for (label, msg) in options {
+            let btn = if *label == current {
+                button::suggested(*label)
+            } else {
+                button::text(*label)
+            };
+            row = row.push(btn.on_press(msg.clone()));
+        }
+        row
+    };
+
+    let editor = settings::section().title("Editor");
+    let editor = editor
+        .add(toggle(
+            "Auto-pairs",
+            app.auto_pair,
+            Message::SettingsAutoPair(!app.auto_pair),
+        ))
+        .add(toggle(
+            "Wikilink suggestions",
+            app.wiki_autocomplete,
+            Message::SettingsWikiComplete(!app.wiki_autocomplete),
+        ))
+        .add(toggle(
+            "Word wrap",
+            app.word_wrap,
+            Message::SettingsWordWrap(!app.word_wrap),
+        ))
+        .add(toggle(
+            "Monospace font",
+            app.editor_font_mono,
+            Message::SettingsFontMono(!app.editor_font_mono),
+        ))
+        .add(stepper(
+            "Font size",
+            format!("{} px", app.editor_font_size),
+            Message::SettingsFontSize(-2),
+            Message::SettingsFontSize(2),
+        ));
+
+    let view = settings::section().title("View");
+    let view = view
+        .add(settings::item(
+            "Theme",
+            choice(
+                match app.theme {
+                    crate::settings::ThemeChoice::System => "System",
+                    crate::settings::ThemeChoice::Dark => "Dark",
+                    crate::settings::ThemeChoice::Light => "Light",
+                },
+                &[
+                    (
+                        "System",
+                        Message::SettingsTheme(crate::settings::ThemeChoice::System),
+                    ),
+                    (
+                        "Dark",
+                        Message::SettingsTheme(crate::settings::ThemeChoice::Dark),
+                    ),
+                    (
+                        "Light",
+                        Message::SettingsTheme(crate::settings::ThemeChoice::Light),
+                    ),
+                ],
+            ),
+        ))
+        .add(toggle(
+            "Solid sidebar",
+            app.sidebar_solid,
+            Message::SettingsSidebarSolid(!app.sidebar_solid),
+        ))
+        .add(settings::item(
+            "Default layout",
+            choice(
+                match app.default_pane {
+                    PaneMode::Split => "Split",
+                    PaneMode::Source => "Source",
+                    PaneMode::Reading => "Reading",
+                },
+                &[
+                    ("Split", Message::SettingsDefaultPane(PaneMode::Split)),
+                    ("Source", Message::SettingsDefaultPane(PaneMode::Source)),
+                    ("Reading", Message::SettingsDefaultPane(PaneMode::Reading)),
+                ],
+            ),
+        ))
+        .add(toggle(
+            "Hide .md in file tree",
+            app.hide_md_extension,
+            Message::SettingsHideMdExt(!app.hide_md_extension),
+        ));
+
+    let files = settings::section().title("Files & saving");
+    let files = files
+        .add(stepper(
+            "Autosave delay",
+            format!("{} s", app.autosave_secs),
+            Message::SettingsAutosaveDelta(-1),
+            Message::SettingsAutosaveDelta(1),
+        ))
+        .add(toggle(
+            "Follow caret in preview",
+            app.scroll_sync,
+            Message::SettingsScrollSync(!app.scroll_sync),
+        ));
+
+    scrollable::scrollable(
+        container(
+            column::Column::new()
+                .spacing(16)
+                .push(editor)
+                .push(view)
+                .push(files),
+        )
+        .padding(12)
+        .width(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
