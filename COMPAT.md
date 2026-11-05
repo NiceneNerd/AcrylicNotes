@@ -574,3 +574,24 @@ All chord changes below supersede the M4c follow-up section above.
   without the dot) with add/remove rows. An empty list — the default —
   shows every attachment; a non-empty list shows only matching files
   (case-insensitive). Notes are never filtered.
+
+### Phase H — Unicode codepoint entry (Ctrl+Shift+U)
+
+- GTK's Ctrl+Shift+U hex entry lives in its input module, which iced
+  apps don't use, so the same interaction is implemented at the app
+  level: pressing Ctrl+Shift+U in the focused editor opens codepoint
+  entry, shown as a small popup at the editor's bottom edge with "u" +
+  the digits typed so far, the resolved character once the codepoint
+  is valid, and key hints.
+- While entry is open the editor swallows plain keys: hex digits
+  accumulate (any case, lowercased, capped at 6 digits), Space/Enter
+  commit, Backspace unravels a digit (exiting when empty), Esc
+  cancels, Tab is ignored. Chords with Ctrl/Alt still reach the
+  normal shortcuts, and arrow keys move the caret; commit inserts at
+  wherever the caret then sits.
+- Commit inserts the codepoint as one undoable step. Invalid
+  codepoints (surrogates, > U+10FFFF) end the mode without changing
+  the buffer.
+- The mode is dismissed by tab open/close/switch, pane switches, and
+  sidebar navigation, and starting it dismisses the wikilink dropdown
+  (the two editor popups never coexist).
