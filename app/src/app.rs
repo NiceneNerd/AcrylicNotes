@@ -3011,6 +3011,14 @@ impl cosmic::Application for VaultNotes {
                         Key::Named(Named::Escape) => self.update(Message::WikiDismiss),
                         _ => Task::none(),
                     }
+                } else if self.core.window.show_context {
+                    // Nothing else claimed Esc, so it closes the settings
+                    // drawer. (Keys captured by the drawer's own text
+                    // inputs never reach this global handler.)
+                    match key {
+                        Key::Named(Named::Escape) => self.update(Message::SettingsToggle),
+                        _ => Task::none(),
+                    }
                 } else if modifiers.control() {
                     match &key {
                         Key::Character(c) if c == "p" => self.update(Message::SwitcherToggle),
@@ -4381,6 +4389,35 @@ mod context_drawer_tests {
         assert!(app.core.window.show_context);
         let _ = app.update(Message::SettingsToggle);
         assert!(!app.core.window.show_context);
+    }
+
+    #[test]
+    fn escape_closes_the_settings_drawer_when_nothing_else_is_open() {
+        let mut app = find_tests::test_app_with_tab("");
+        app.core.set_show_context(true);
+        // Plain Esc (uncaptured, no modifiers) closes the drawer.
+        let _ = app.update(Message::KeyPressed(
+            cosmic::iced::event::Status::Ignored,
+            Modifiers::empty(),
+            Key::Named(Named::Escape),
+        ));
+        assert!(!app.core.window.show_context);
+        // With the drawer closed, Esc is a no-op (no re-toggle).
+        let _ = app.update(Message::KeyPressed(
+            cosmic::iced::event::Status::Ignored,
+            Modifiers::empty(),
+            Key::Named(Named::Escape),
+        ));
+        assert!(!app.core.window.show_context);
+        // A captured Esc (e.g. a drawer text input holds focus) must NOT
+        // leak to the global handler.
+        app.core.set_show_context(true);
+        let _ = app.update(Message::KeyPressed(
+            cosmic::iced::event::Status::Captured,
+            Modifiers::empty(),
+            Key::Named(Named::Escape),
+        ));
+        assert!(app.core.window.show_context);
     }
 }
 
