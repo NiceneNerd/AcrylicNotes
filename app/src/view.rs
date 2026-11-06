@@ -951,7 +951,15 @@ fn editor_pane<'a>(
 /// bottom edge (iced exposes no caret pixel position). Rows accept with a
 /// click; keyboard handling (Tab / Ctrl+Tab / Esc) is routed globally.
 fn wiki_dropdown<'a>(wiki: &'a crate::app::WikiComplete, palette: Palette) -> Element<'a, Message> {
-    let mut col = column::Column::new().spacing(2).padding(6);
+    // The column is Fill-width so the popup container inherits a fluid
+    // (uncompressed) width: a Shrink popup container puts the flex
+    // resolver into cross-compression, which lays every Fill-width row
+    // out at accumulated width 0 — a thin, tall, unreadable sliver.
+    // (The quick switcher avoids this the same way.)
+    let mut col = column::Column::new()
+        .spacing(2)
+        .padding(6)
+        .width(Length::Fill);
     for (i, path) in wiki.items.iter().enumerate() {
         // Items are note paths; the row shows the title, with the note's
         // folder dimmed so duplicate titles are distinguishable.
@@ -972,19 +980,14 @@ fn wiki_dropdown<'a>(wiki: &'a crate::app::WikiComplete, palette: Palette) -> El
         col = col.push(row.width(Length::Fill).height(Length::Shrink));
     }
     // The outer container fills the editor area so the popup can anchor to
-    // its bottom edge; the inner one is the popup itself.
-    container(
-        container(col)
-            .width(Length::Shrink)
-            .max_width(280)
-            .style(popup_style(palette)),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .align_x(alignment::Horizontal::Left)
-    .align_y(alignment::Vertical::Bottom)
-    .padding([0, 12, 4, 12])
-    .into()
+    // its bottom edge; the inner one is the popup itself (capped wide).
+    container(container(col).max_width(280).style(popup_style(palette)))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(alignment::Horizontal::Left)
+        .align_y(alignment::Vertical::Bottom)
+        .padding([0, 12, 4, 12])
+        .into()
 }
 
 fn reading_pane<'a>(
@@ -1278,4 +1281,113 @@ fn unicode_entry_overlay<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'
         .align_y(alignment::Vertical::Bottom)
         .padding([0, 12, 4, 12])
         .into()
+}
+
+#[cfg(test)]
+mod popup_layout_tests {
+    //! Headless layout proofs for the editor popup structure, run through
+    //! iced's real layout engine with the null renderer.
+    //!
+    //! The wikilink dropdown once rendered as a thin, tall, almost
+    //! invisible sliver: its popup container was explicitly
+    //! `Shrink`-width, which turns on iced's flex *cross-compression* —
+    //! and cross-fluid (Fill-width) children are then laid out at the
+    //! accumulated cross width, which is 0 for a Shrink parent. Text
+    //! wrapped at zero width: a tall, unreadable strip. The quick
+    //! switcher never had the problem because its popup container
+    //! inherits a fluid (Fill) width from its Fill-width column.
+    //! `popup_layout` pins the working structure;
+    //! `shrink_popup_container_crushes` pins the trap itself, so a future
+    //! "tidy up" back to a Shrink popup fails loudly instead of silently
+    //! regressing.
+
+    use cosmic::iced::core::layout::{Limits, Node};
+    use cosmic::iced::core::widget::Tree;
+    use cosmic::iced::widget::{container, Column, Row};
+    use cosmic::iced::{Element, Length, Size, Theme};
+
+    /// A fixed-size leaf standing in for a dropdown row's button.
+    fn leaf<'a>() -> Element<'a, (), Theme, ()> {
+        Column::new()
+            .width(Length::Fixed(90.0))
+            .height(Length::Fixed(24.0))
+            .into()
+    }
+
+    /// A dropdown column: Fill-width, padded, filled with Fill-width rows
+    /// of one fixed-size child each.
+    fn dropdown_col() -> Column<'static, (), Theme, ()> {
+        let mut col = Column::new().spacing(2).padding(6).width(Length::Fill);
+        for _ in 0..3 {
+            col = col.push(
+                Row::new()
+                    .push(leaf())
+                    .width(Length::Fill)
+                    .height(Length::Shrink),
+            );
+        }
+        col
+    }
+
+    /// The editor popup's structure: an anchoring Fill×Fill container
+    /// holding the popup container (fluid width, capped) over the column.
+    fn popup() -> Element<'static, (), Theme, ()> {
+        container(container(dropdown_col()).max_width(280.0))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// Lay out like the runtime does: the widget tree must be built
+    /// recursively (`Tree::new`), since flex zips items with tree
+    /// children — an empty tree lays out nothing.
+    fn layout(elem: &mut Element<'static, (), Theme, ()>) -> Node {
+        let mut tree = Tree::new(elem.as_widget());
+        elem.as_widget_mut().layout(
+            &mut tree,
+            &(),
+            &Limits::new(Size::ZERO, Size::new(800.0, 600.0)),
+        )
+    }
+
+    #[test]
+    fn popup_rows_keep_their_width_inside_the_popup() {
+        let mut elem = popup();
+        let node = layout(&mut elem);
+        // The outer anchoring container fills the pane.
+        assert_eq!(node.size(), Size::new(800.0, 600.0));
+        // The popup itself: fluid width capped at 280.
+        let popup = &node.children()[0];
+        assert_eq!(popup.size().width, 280.0);
+        // Rows fill the column's padded width (280 - 2 * 6 padding)...
+        let col = &popup.children()[0];
+        for row in col.children() {
+            assert_eq!(row.size().width, 268.0);
+            // ...and their contents are NOT crushed to zero width (the
+            // "thin, tall, invisible" regression).
+            assert_eq!(row.children()[0].size().width, 90.0);
+            assert_eq!(row.children()[0].size().height, 24.0);
+        }
+    }
+
+    #[test]
+    fn shrink_popup_container_crushes_fill_children() {
+        // The old structure, kept as a canary: an explicitly Shrink popup
+        // container collapses to its padding (12px wide) and lays every
+        // Fill-width row out at width 0.
+        let mut elem: Element<'static, (), Theme, ()> = container(
+            container(dropdown_col())
+                .width(Length::Shrink)
+                .max_width(280.0),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
+        let node = layout(&mut elem);
+        let popup = &node.children()[0];
+        assert_eq!(popup.size().width, 12.0);
+        for row in popup.children()[0].children() {
+            assert_eq!(row.size().width, 0.0);
+        }
+    }
 }
