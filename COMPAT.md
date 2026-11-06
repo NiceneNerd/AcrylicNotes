@@ -540,6 +540,13 @@ All chord changes below supersede the M4c follow-up section above.
   editor's focus state and leave typing dead until the next click),
   and the editor carries a stable widget id that preserves its focus
   across pane-mode switches and the quick-switcher overlay too.
+- Popup sizing follows the quick switcher's structure: the popup
+  container inherits a fluid (Fill) width from its Fill-width column
+  and is capped with `max_width`. An explicitly `Shrink` popup
+  container must never hold Fill-width children — iced's flex
+  cross-compression lays them out at accumulated width 0, collapsing
+  the popup to a thin sliver (pinned by headless layout tests in
+  `view.rs`).
 
 ### Phase D — editor context menu
 
