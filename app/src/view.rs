@@ -120,6 +120,9 @@ fn main_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
     if let Some(banner) = &app.banner {
         col = col.push(banner_view(banner, palette));
     }
+    if let Some(pending) = &app.pending_links {
+        col = col.push(link_updates_view(pending, palette));
+    }
     if let Some(error) = &app.error {
         col = col.push(
             row::Row::new()
@@ -191,6 +194,44 @@ fn titles(paths: &[String]) -> String {
         .map(|path| title_of(path))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Non-blocking prompt after a rename/move invalidated links: the user
+/// chooses whether to rewrite them (Obsidian asks first too). Dismissing
+/// leaves the links as they are.
+fn link_updates_view<'a>(
+    pending: &crate::app::PendingLinkUpdates,
+    palette: Palette,
+) -> Element<'a, Message> {
+    let (old, _) = pending.renames.first().cloned().unwrap_or_default();
+    let noun = if old.ends_with(".md") {
+        "note"
+    } else {
+        "folder"
+    };
+    let count = pending.referrers.len();
+    let notes = if count == 1 { "note" } else { "notes" };
+    let background = with_alpha(palette.warning, 0.18);
+    container(
+        row::Row::new()
+            .spacing(8)
+            .push(
+                text(format!(
+                    "Renamed {noun} \u{201C}{}\u{201D} \u{2014} {count} {notes} link to it.",
+                    title_of(&old)
+                ))
+                .class(palette.text),
+            )
+            .push(button::suggested("Update links").on_press(Message::LinkUpdatesApply))
+            .push(button::text("Leave as is").on_press(Message::LinkUpdatesDismiss)),
+    )
+    .padding(6)
+    .width(Length::Fill)
+    .style(move |_| cosmic::widget::container::Style {
+        background: Some(Background::Color(background)),
+        ..Default::default()
+    })
+    .into()
 }
 
 // --- sidebar ---------------------------------------------------------------

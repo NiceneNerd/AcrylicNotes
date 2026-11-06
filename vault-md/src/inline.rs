@@ -469,6 +469,225 @@ fn indented_code_mask(chars: &[char]) -> Vec<bool> {
     mask
 }
 
+// --- link-target spans (rename/link rewriting) ------------------------------
+
+/// A wikilink or embed target found in a document body, as byte ranges into
+/// the FULL source passed to [`link_spans`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSpan {
+    /// Byte range of the note part of the target — between the `[[` /
+    /// `![[` opener and the first `#` (heading/block) or `|` (alias).
+    /// Rewriting exactly this span preserves any `#...`/`|...` suffix.
+    pub target: (usize, usize),
+    /// The raw target text, trimmed the way resolution would see it.
+    pub raw: String,
+    /// `true` for `![[...]]` embeds, `false` for `[[...]]` links.
+    pub embed: bool,
+}
+
+/// Scan a full document for wikilink/embed note targets, recording byte
+/// spans. Frontmatter, code (fenced, indented, inline), math and raw HTML
+/// blocks are skipped exactly like [`extract`] skips them, so a link that
+/// does not render is never rewritten either. `[[#Heading]]` (empty note
+/// part) is not reported — there is nothing to rewrite.
+pub fn link_spans(src: &str) -> Vec<LinkSpan> {
+    // Frontmatter is split off first (like `extract_document`), so
+    // `related: "[[Note]]"` properties are never rewritten. All spans are
+    // byte offsets into the FULL source, hence the body offset.
+    let split = split_frontmatter(src);
+    let offset = split.bom.len() + split.raw.as_deref().map_or(0, str::len);
+    // Unlike `extract`, no sentinel chars are stripped: the offsets must
+    // be exact for byte-range rewriting of the original text.
+    let src_body = &src[offset.min(src.len())..];
+    let chars: Vec<char> = src_body.chars().collect();
+    // Byte offset of each char index; the final entry is `src.len()`.
+    let mut byte_of = Vec::with_capacity(chars.len() + 1);
+    let mut b = 0usize;
+    for &c in &chars {
+        byte_of.push(b);
+        b += c.len_utf8();
+    }
+    byte_of.push(b);
+
+    let code_mask = indented_code_mask(&chars);
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    let mut at_line_start = true;
+    while i < chars.len() {
+        if code_mask[i] {
+            at_line_start = chars[i] == '\n';
+            i += 1;
+            continue;
+        }
+        if at_line_start && chars[i] == '<' {
+            let opens_html = chars
+                .get(i + 1)
+                .is_some_and(|&n| n.is_ascii_alphabetic() || matches!(n, '/' | '!' | '?'));
+            if opens_html {
+                let mut j = i;
+                while j < chars.len() {
+                    let line_end = chars[j..]
+                        .iter()
+                        .position(|&x| x == '\n')
+                        .map_or(chars.len(), |p| j + p);
+                    let blank = chars[j..line_end]
+                        .iter()
+                        .all(|&x| matches!(x, ' ' | '\t' | '\r'));
+                    if blank {
+                        break;
+                    }
+                    j = if line_end < chars.len() {
+                        line_end + 1
+                    } else {
+                        line_end
+                    };
+                }
+                i = j;
+                at_line_start = true;
+                continue;
+            }
+        }
+        if at_line_start {
+            if let Some((fc, flen)) = fence_at(&chars, i) {
+                i = fence_end(&chars, i, fc, flen);
+                at_line_start = true;
+                continue;
+            }
+        }
+        let c = chars[i];
+        match c {
+            '`' => {
+                let n = run_len(&chars, i, '`');
+                i = match find_run(&chars, i + n, '`', n) {
+                    Some(j) => j + n,
+                    None => i + n,
+                };
+                at_line_start = false;
+                continue;
+            }
+            // `\[[x]]` is not a link (confirmed M3); escapes never open one.
+            '\\' => {
+                i = (i + 2).min(chars.len());
+                at_line_start = false;
+                continue;
+            }
+            '$' if starts(&chars, i, "$$") => {
+                i = match find_str(&chars, i + 2, "$$") {
+                    Some(end) => end + 2,
+                    None => i + 1,
+                };
+                at_line_start = false;
+                continue;
+            }
+            '$' => {
+                let mut j = i + 1;
+                let mut closer = None;
+                while j < chars.len() {
+                    if chars[j] == '$' && j > i + 1 && !matches!(chars[j - 1], ' ' | '\t' | '\n') {
+                        closer = Some(j);
+                        break;
+                    }
+                    if chars[j] == '\n' && matches!(chars.get(j + 1), Some('\n') | Some('\r')) {
+                        break;
+                    }
+                    j += 1;
+                }
+                i = match closer {
+                    Some(end) => end + 1,
+                    None => i + 1,
+                };
+                at_line_start = false;
+                continue;
+            }
+            '!' if starts(&chars, i, "![[") => {
+                if let Some((inner, end)) = wiki_inner(&chars, i + 3) {
+                    push_link_span(&mut spans, &byte_of, offset, i, &inner, true);
+                    i = end;
+                    at_line_start = false;
+                    continue;
+                }
+                at_line_start = chars[i] == '\n';
+                i += 1;
+            }
+            '[' if starts(&chars, i, "[[") => {
+                if let Some((inner, end)) = wiki_inner(&chars, i + 2) {
+                    push_link_span(&mut spans, &byte_of, offset, i, &inner, false);
+                    i = end;
+                    at_line_start = false;
+                    continue;
+                }
+                at_line_start = chars[i] == '\n';
+                i += 1;
+            }
+            _ => {
+                at_line_start = c == '\n';
+                i += 1;
+            }
+        }
+    }
+    spans
+}
+
+/// Record the note part of one `[[...]]`/`![[...]]`: from just after the
+/// opener to the first `#` (heading/block) or `|` (alias) — the same
+/// target/alias split `parse_wiki` performs. `offset` maps body-relative
+/// char indices back to full-source byte offsets.
+fn push_link_span(
+    spans: &mut Vec<LinkSpan>,
+    byte_of: &[usize],
+    offset: usize,
+    link_start: usize,
+    inner: &str,
+    embed: bool,
+) {
+    let inner_start = link_start + if embed { 3 } else { 2 };
+    let inner_chars: Vec<char> = inner.chars().collect();
+    let note_len = inner_chars
+        .iter()
+        .position(|&c| c == '#' || c == '|')
+        .unwrap_or(inner_chars.len());
+    if note_len == 0 {
+        return; // `[[#Heading]]`: same-document, nothing to rewrite.
+    }
+    let raw: String = inner_chars[..note_len].iter().collect();
+    spans.push(LinkSpan {
+        target: (
+            offset + byte_of[inner_start],
+            offset + byte_of[inner_start + note_len],
+        ),
+        raw: raw.trim().to_string(),
+        embed,
+    });
+}
+
+/// Rewrite the note part of every wikilink/embed target for which
+/// `resolver` returns `Some(replacement)`. Returns `None` when nothing
+/// changed, so callers can skip the write entirely.
+pub fn rewrite_link_targets(
+    src: &str,
+    resolver: impl Fn(&LinkSpan) -> Option<String>,
+) -> Option<String> {
+    let spans = link_spans(src);
+    let mut out = String::with_capacity(src.len());
+    let mut last = 0usize;
+    let mut changed = false;
+    for span in &spans {
+        let Some(replacement) = resolver(span) else {
+            continue;
+        };
+        let (start, end) = span.target;
+        out.push_str(&src[last..start]);
+        out.push_str(&replacement);
+        last = end;
+        changed = true;
+    }
+    if !changed {
+        return None;
+    }
+    out.push_str(&src[last..]);
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,5 +880,69 @@ mod tests {
                 "line count changed for {src:?}"
             );
         }
+    }
+
+    /// The raw target text of every span, for readable assertions.
+    fn raws(src: &str) -> Vec<String> {
+        link_spans(src).into_iter().map(|s| s.raw).collect()
+    }
+
+    #[test]
+    fn spans_cover_wikilinks_embeds_and_suffixes() {
+        // Plain link and embed.
+        assert_eq!(raws("see [[Note]] here"), vec!["Note"]);
+        assert_eq!(raws("![[img.png|300]]"), vec!["img.png"]);
+        // The note part ends at the first `#` or `|`; suffixes stay out.
+        assert_eq!(raws("[[Note#Head]]"), vec!["Note"]);
+        assert_eq!(raws("[[Note|alias]]"), vec!["Note"]);
+        assert_eq!(raws("[[Note#Head|alias]]"), vec!["Note"]);
+        assert_eq!(raws("[[Note#^bid]]"), vec!["Note"]);
+        // Same-document links have no note part to rewrite.
+        assert!(raws("[[#Head]] and [[#^bid]]").is_empty());
+        // Several on one line.
+        assert_eq!(raws("[[A]] then [[B]]"), vec!["A", "B"]);
+        // Folder targets and surrounding spaces are trimmed for resolution.
+        assert_eq!(raws("[[ folder/Note ]]"), vec!["folder/Note"]);
+    }
+
+    #[test]
+    fn spans_skip_code_math_html_and_frontmatter() {
+        assert!(raws("```rust\n[[in fence]]\n```").is_empty());
+        assert!(raws("\t[[indented code]]").is_empty());
+        assert!(raws("`[[inline code]]`").is_empty());
+        assert!(raws("$x [[in math]] y$").is_empty());
+        assert!(raws("<div>\n[[in html]]\n</div>").is_empty());
+        assert!(raws("\\[[escaped]]").is_empty());
+        assert!(raws("---\nrelated: \"[[FM]]\"\n---\n[[body]]").len() == 1);
+        assert_eq!(raws("---\nrelated: \"[[FM]]\"\n---\n[[body]]")[0], "body");
+    }
+
+    #[test]
+    fn spans_are_byte_offsets_into_the_full_source() {
+        // Multibyte characters before the link must not shift the span.
+        let src = "héllo wörld — see [[Note]] now";
+        let spans = link_spans(src);
+        assert_eq!(spans.len(), 1);
+        let (start, end) = spans[0].target;
+        assert_eq!(&src[start..end], "Note");
+    }
+
+    #[test]
+    fn rewrite_touches_only_resolved_targets() {
+        let src = "a [[Old]] b [[Old#Head|alias]] c [[Stay]] d ![[Old]]";
+        let out = rewrite_link_targets(src, |span| (span.raw == "Old").then(|| "New".to_string()))
+            .expect("something changed");
+        assert_eq!(out, "a [[New]] b [[New#Head|alias]] c [[Stay]] d ![[New]]");
+        // Nothing to do → None (no write).
+        assert!(rewrite_link_targets("no links", |_| None).is_none());
+        assert!(rewrite_link_targets("[[Other]]", |_| None).is_none());
+    }
+
+    #[test]
+    fn rewrite_keeps_byte_accuracy_across_multibyte_text() {
+        let src = "ünïcodé [[A]] and [[B]]";
+        let out =
+            rewrite_link_targets(src, |span| (span.raw == "B").then(|| "x/y".to_string())).unwrap();
+        assert_eq!(out, "ünïcodé [[A]] and [[x/y]]");
     }
 }

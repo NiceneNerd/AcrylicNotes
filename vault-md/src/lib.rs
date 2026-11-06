@@ -17,5 +17,6 @@ pub mod ir;
 pub mod lower;
 
 pub use html::{render_html, RenderContext, RenderOptions};
+pub use inline::{link_spans, rewrite_link_targets, LinkSpan};
 pub use ir::{Alignment, Block, Doc, Embed, Fold, Inline, ListItem, WikiLink, WikiTarget};
 pub use lower::parse_note;

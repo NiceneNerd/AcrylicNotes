@@ -383,6 +383,11 @@ pub enum Message {
     SettingsFontMono(bool),
     /// Nudge the editor font size (clamped).
     SettingsFontSize(i32),
+    // --- link updates after rename/move ---
+    /// Apply the pending wikilink rewrites (banner confirmation).
+    LinkUpdatesApply,
+    /// Leave the invalidated links as they are.
+    LinkUpdatesDismiss,
     SettingsTheme(settings::ThemeChoice),
     SettingsSidebarSolid(bool),
     SettingsDefaultPane(PaneMode),
@@ -460,6 +465,9 @@ pub struct VaultNotes {
     pub pane: PaneMode,
     /// Paths of open tabs that changed on disk while dirty.
     pub banner: Option<Banner>,
+    /// Links invalidated by the last rename/move, awaiting the user's
+    /// banner choice (rewrite or leave).
+    pub pending_links: Option<PendingLinkUpdates>,
     pub error: Option<String>,
     pub vault_input: String,
     pub strict_breaks: bool,
@@ -2027,6 +2035,9 @@ impl VaultNotes {
     }
 
     fn rename_tree_note(&mut self, old: String, new: String) -> Task<Message> {
+        // Snapshot BEFORE the rename: the backlink set and the resolution
+        // index both refer to the old name.
+        let pending = self.collect_link_updates(&[(old.clone(), new.clone())]);
         let outcome = self
             .vault
             .as_mut()
@@ -2040,6 +2051,7 @@ impl VaultNotes {
                 }
                 self.rebuild_index();
                 self.sync_tab_model();
+                self.pending_links = pending;
             }
             Some(Err(error)) => self.error = Some(format!("cannot rename {old}: {error}")),
             None => {}
@@ -2048,6 +2060,8 @@ impl VaultNotes {
     }
 
     fn rename_tree_folder(&mut self, old: String, new: String) -> Task<Message> {
+        // Snapshot BEFORE the rename (see rename_tree_note).
+        let pending = self.collect_link_updates(&[(old.clone(), new.clone())]);
         let outcome = self
             .vault
             .as_mut()
@@ -2069,11 +2083,180 @@ impl VaultNotes {
                     })
                     .collect();
                 self.rebuild_index();
+                self.pending_links = pending;
             }
             Some(Err(error)) => self.error = Some(format!("cannot rename {old}: {error}")),
             None => {}
         }
         Task::none()
+    }
+
+    /// Notes containing wikilinks/embeds that resolve (pre-rename) into
+    /// the scope moved by `renames` — a note-rename pair or a folder-rename
+    /// pair. Referrers whose links would not change (markdown-only links,
+    /// nothing resolving into scope) are filtered out, so a pointless
+    /// prompt never appears. `None` when there is nothing to rewrite.
+    fn collect_link_updates(&self, renames: &[(String, String)]) -> Option<PendingLinkUpdates> {
+        let vault = self.vault.as_ref()?;
+        let pre_index = vault.index();
+        // In scope: a renamed path itself, or anything beneath a renamed
+        // folder (the prefix case never matches for a `.md` note rename).
+        let in_scope = |p: &str| {
+            renames
+                .iter()
+                .any(|(old, _)| p == old || p.starts_with(&format!("{old}/")))
+        };
+        // Backlink keys cover notes AND attachments (embed targets).
+        let mut targets: Vec<String> = vault
+            .notes_sorted()
+            .into_iter()
+            .map(|note| note.path.clone())
+            .collect();
+        targets.extend(vault.attachments_sorted().iter().map(|s| (*s).to_string()));
+        let mut candidates: Vec<String> = Vec::new();
+        for target in &targets {
+            if in_scope(target) {
+                candidates.extend(vault.backlinks(target));
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        // Keep only referrers with at least one wikilink/embed that
+        // resolves into the renamed scope: the rewriter only touches
+        // those, so the prompt should only mention them.
+        let mut referrers = Vec::new();
+        for old_ref in candidates {
+            let text = self.note_text(&old_ref);
+            let hit = vault_md::link_spans(&text).into_iter().any(|span| {
+                !span.raw.is_empty() && pre_index.resolve(&span.raw, &old_ref).is_some_and(in_scope)
+            });
+            if hit {
+                referrers.push(old_ref);
+            }
+        }
+        if referrers.is_empty() {
+            return None;
+        }
+        Some(PendingLinkUpdates {
+            renames: renames.to_vec(),
+            referrers,
+            pre_index,
+        })
+    }
+
+    /// The current text of a note: the open tab's buffer if one exists
+    /// (the live truth for an open note), else the file on disk.
+    fn note_text(&self, path: &str) -> String {
+        if let Some(tab) = self.tabs.iter().find(|tab| tab.path == path) {
+            return tab.content.text();
+        }
+        self.vault
+            .as_ref()
+            .and_then(|vault| std::fs::read_to_string(vault.root().join(path)).ok())
+            .unwrap_or_default()
+    }
+
+    /// Rewrite the wikilink/embed targets that the rename/move
+    /// invalidated (confirmed via the banner). Each referrer is re-scanned
+    /// NOW: only a link whose resolution actually changed is rewritten,
+    /// and the replacement is formatted per the link-path setting.
+    fn apply_link_updates(&mut self) {
+        let Some(pending) = self.pending_links.take() else {
+            return;
+        };
+        let format = self.link_path_format;
+        let (pre_index, post_index, post_notes) = {
+            let Some(vault) = self.vault.as_ref() else {
+                return;
+            };
+            (
+                pending.pre_index,
+                vault.index(),
+                vault
+                    .notes_sorted()
+                    .into_iter()
+                    .map(|note| note.path.clone())
+                    .collect::<Vec<String>>(),
+            )
+        };
+        let new_path_of = |p: &str| -> Option<String> {
+            for (old, new) in &pending.renames {
+                if p == old {
+                    return Some(new.clone());
+                }
+                if let Some(rest) = p.strip_prefix(&format!("{old}/")) {
+                    return Some(format!("{new}/{rest}"));
+                }
+            }
+            None
+        };
+        // Phase 1 (immutable): compute the rewritten text for every
+        // referrer, reading buffers/disk without holding the vault mutably.
+        enum Target {
+            Tab(usize),
+            File(String, String), // path, original disk text
+        }
+        let mut rewrites: Vec<(Target, String)> = Vec::new();
+        for old_ref in &pending.referrers {
+            // The referrer itself may have moved with the rename.
+            let from = new_path_of(old_ref).unwrap_or_else(|| old_ref.clone());
+            let rewrite = |text: &str| -> Option<String> {
+                vault_md::rewrite_link_targets(text, |span| {
+                    if span.raw.is_empty() {
+                        return None;
+                    }
+                    // Where the link pointed before the rename...
+                    let pre = pre_index.resolve(&span.raw, &from)?;
+                    // ...only links into the renamed scope are affected.
+                    let target = new_path_of(pre)?;
+                    // Still resolves to the same note? Leave it alone.
+                    if post_index.resolve(&span.raw, &from) == Some(target.as_str()) {
+                        return None;
+                    }
+                    Some(link_target(&from, &target, &post_notes, format))
+                })
+            };
+            if let Some(idx) = self.tabs.iter().position(|tab| tab.path == from) {
+                let text = self.tabs[idx].content.text();
+                if let Some(new_text) = rewrite(&text) {
+                    rewrites.push((Target::Tab(idx), new_text));
+                }
+            } else {
+                let Some(text) = self
+                    .vault
+                    .as_ref()
+                    .and_then(|vault| std::fs::read_to_string(vault.root().join(&from)).ok())
+                else {
+                    continue;
+                };
+                if let Some(new_text) = rewrite(&text) {
+                    rewrites.push((Target::File(from.clone(), text), new_text));
+                }
+            }
+        }
+        // Phase 2 (mutable): apply.
+        for (target, new_text) in rewrites {
+            match target {
+                Target::Tab(idx) => {
+                    {
+                        let tab = &mut self.tabs[idx];
+                        push_undo(tab);
+                        tab.content = Content::with_text(&new_text);
+                        tab.refresh_doc();
+                    }
+                    self.sync_tab_text(idx);
+                }
+                Target::File(path, original) => {
+                    if let Some(vault) = self.vault.as_mut() {
+                        if let Err(error) = vault.save_note_full(&path, &original, &new_text) {
+                            self.error = Some(format!("could not update links in {path}: {error}"));
+                        }
+                    }
+                }
+            }
+        }
+        self.rebuild_index();
+        self.update_wiki_complete();
     }
 
     /// Delete a note or folder from the tree: files move into the vault's
@@ -2216,6 +2399,7 @@ impl cosmic::Application for VaultNotes {
             active: None,
             pane: persisted.default_pane,
             banner: None,
+            pending_links: None,
             error: None,
             vault_input: String::new(),
             strict_breaks: false,
@@ -2351,6 +2535,14 @@ impl cosmic::Application for VaultNotes {
             }
             Message::BannerDismiss => {
                 self.banner = None;
+                Task::none()
+            }
+            Message::LinkUpdatesApply => {
+                self.apply_link_updates();
+                Task::none()
+            }
+            Message::LinkUpdatesDismiss => {
+                self.pending_links = None;
                 Task::none()
             }
             Message::ErrorDismiss => {
@@ -3148,6 +3340,23 @@ impl Banner {
     fn is_empty(&self) -> bool {
         self.reloaded.is_empty() && self.conflicts.is_empty()
     }
+}
+
+/// A rename/move that invalidated wikilinks, with everything needed to
+/// rewrite them later. The pre-rename index is kept because the old
+/// targets no longer resolve against the current one; at apply time each
+/// referrer is re-scanned fresh, so edits made since the prompt are
+/// picked up and only links whose resolution actually changed are touched.
+#[derive(Debug)]
+pub struct PendingLinkUpdates {
+    /// (old path, new path) for the rename just performed — a note, or a
+    /// folder whose prefix moves every path beneath it.
+    pub renames: Vec<(String, String)>,
+    /// Notes (old paths) containing wikilinks/embeds that resolved into
+    /// the renamed scope, from the pre-rename backlink index.
+    pub referrers: Vec<String>,
+    /// The resolution index as it was before the rename.
+    pub pre_index: VaultIndex,
 }
 
 /// How the editor buffer should be written: body-only (frontmatter bytes are
@@ -4019,6 +4228,7 @@ mod find_tests {
             active: None,
             pane: PaneMode::default(),
             banner: None,
+            pending_links: None,
             error: None,
             vault_input: String::new(),
             strict_breaks: false,
@@ -4893,5 +5103,145 @@ mod link_target_tests {
             crate::settings::load().link_path_format,
             LinkPathFormat::Absolute
         );
+    }
+}
+
+#[cfg(test)]
+mod link_update_tests {
+    use super::*;
+    use cosmic::app::Application as _;
+
+    /// A vault with the given (path, text) files and a rebuilt index.
+    /// The TempDir must stay bound in the caller for the files to exist.
+    fn app_with(files: &[(&str, &str)]) -> (tempfile::TempDir, VaultNotes) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (path, text) in files {
+            if let Some((dir, _)) = path.rsplit_once('/') {
+                std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+            }
+            std::fs::write(tmp.path().join(path), text).unwrap();
+        }
+        let mut app = find_tests::test_app_with_tab("");
+        app.vault = Some(Vault::open(tmp.path()).unwrap());
+        app.rebuild_index();
+        (tmp, app)
+    }
+
+    fn disk(tmp: &tempfile::TempDir, path: &str) -> String {
+        std::fs::read_to_string(tmp.path().join(path)).unwrap()
+    }
+
+    #[test]
+    fn renaming_a_note_prompts_then_rewrites_closed_referrers() {
+        let (tmp, mut app) = app_with(&[("a.md", "see [[b]] here"), ("b.md", "b")]);
+        let _ = app.rename_tree_note("b.md".into(), "c.md".into());
+        // The prompt appears with the referrer named (old path).
+        let pending = app.pending_links.as_ref().expect("prompt appears");
+        assert_eq!(pending.referrers, vec!["a.md"]);
+        assert_eq!(pending.renames, vec![("b.md".into(), "c.md".into())]);
+        // Nothing written until confirmed.
+        assert_eq!(disk(&tmp, "a.md"), "see [[b]] here");
+
+        let _ = app.update(Message::LinkUpdatesApply);
+        assert_eq!(disk(&tmp, "a.md"), "see [[c]] here");
+        assert!(app.pending_links.is_none());
+    }
+
+    #[test]
+    fn rewrites_preserve_headings_aliases_and_embeds() {
+        let (tmp, mut app) = app_with(&[
+            (
+                "a.md",
+                "[[b|alias]] and [[b#Head]] and ![[b]] and [[b#^blk]]",
+            ),
+            ("b.md", "b"),
+        ]);
+        let _ = app.rename_tree_note("b.md".into(), "c.md".into());
+        let _ = app.update(Message::LinkUpdatesApply);
+        assert_eq!(
+            disk(&tmp, "a.md"),
+            "[[c|alias]] and [[c#Head]] and ![[c]] and [[c#^blk]]"
+        );
+    }
+
+    #[test]
+    fn dismissing_leaves_the_links_stale() {
+        let (tmp, mut app) = app_with(&[("a.md", "see [[b]]"), ("b.md", "b")]);
+        let _ = app.rename_tree_note("b.md".into(), "c.md".into());
+        assert!(app.pending_links.is_some());
+        let _ = app.update(Message::LinkUpdatesDismiss);
+        assert!(app.pending_links.is_none());
+        assert_eq!(disk(&tmp, "a.md"), "see [[b]]");
+    }
+
+    #[test]
+    fn no_prompt_when_nothing_resolves_into_scope() {
+        let (_, mut app) = app_with(&[("a.md", "unrelated"), ("b.md", "b")]);
+        let _ = app.rename_tree_note("b.md".into(), "c.md".into());
+        assert!(app.pending_links.is_none());
+        // An unresolved link is not a referrer either.
+        let (_, mut app) = app_with(&[("a.md", "[[missing]]"), ("b.md", "b")]);
+        let _ = app.rename_tree_note("b.md".into(), "c.md".into());
+        assert!(app.pending_links.is_none());
+        // Markdown links are out of scope for the rewriter: no prompt.
+        let (_, mut app) = app_with(&[("a.md", "[text](b.md)"), ("b.md", "b")]);
+        let _ = app.rename_tree_note("b.md".into(), "c.md".into());
+        assert!(app.pending_links.is_none());
+    }
+
+    #[test]
+    fn open_tab_buffers_are_rewritten_not_the_disk_file() {
+        let (tmp, mut app) = app_with(&[("a.md", "see [[b]]"), ("b.md", "b")]);
+        app.tabs.push(Tab::open("a.md".to_string(), "see [[b]]"));
+        let _ = app.rename_tree_note("b.md".into(), "c.md".into());
+        let _ = app.update(Message::LinkUpdatesApply);
+        // The buffer is the live truth for an open note.
+        assert_eq!(app.tabs[1].content.text(), "see [[c]]");
+        // Saving it is the user's normal flow.
+        assert_eq!(disk(&tmp, "a.md"), "see [[b]]");
+    }
+
+    #[test]
+    fn folder_renames_rewrite_links_from_outside_but_not_inside() {
+        let (tmp, mut app) = app_with(&[
+            ("a.md", "[[old/n]]"),
+            ("old/n.md", ""),
+            ("old/m.md", "see [[n]]"),
+        ]);
+        let _ = app.rename_tree_folder("old".into(), "new".into());
+        let _ = app.update(Message::LinkUpdatesApply);
+        // The outside link's target moved: rewritten (Shortest format:
+        // the bare title, unambiguous after the rename).
+        assert_eq!(disk(&tmp, "a.md"), "[[n]]");
+        // The inside bare link still resolves within the folder: untouched.
+        assert_eq!(disk(&tmp, "new/m.md"), "see [[n]]");
+    }
+
+    #[test]
+    fn self_links_in_the_renamed_note_are_rewritten() {
+        let (tmp, mut app) = app_with(&[("b.md", "intro [[b#Head]]")]);
+        let _ = app.rename_tree_note("b.md".into(), "c.md".into());
+        let _ = app.update(Message::LinkUpdatesApply);
+        assert_eq!(disk(&tmp, "c.md"), "intro [[c#Head]]");
+    }
+
+    #[test]
+    fn rewrites_follow_the_link_path_format() {
+        let (tmp, mut app) = app_with(&[("notes/a.md", "[[b]]"), ("b.md", "b")]);
+        app.link_path_format = LinkPathFormat::Relative;
+        let _ = app.rename_tree_note("b.md".into(), "c.md".into());
+        let _ = app.update(Message::LinkUpdatesApply);
+        assert_eq!(disk(&tmp, "notes/a.md"), "[[../c]]");
+    }
+
+    #[test]
+    fn edits_between_prompt_and_apply_are_rescanned() {
+        let (tmp, mut app) = app_with(&[("a.md", "see [[b]]"), ("b.md", "b")]);
+        let _ = app.rename_tree_note("b.md".into(), "c.md".into());
+        assert!(app.pending_links.is_some());
+        // The referrer changes on disk before the user confirms.
+        std::fs::write(tmp.path().join("a.md"), "nothing relevant now").unwrap();
+        let _ = app.update(Message::LinkUpdatesApply);
+        assert_eq!(disk(&tmp, "a.md"), "nothing relevant now");
     }
 }
