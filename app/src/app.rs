@@ -395,6 +395,15 @@ pub enum Message {
     SidebarDrag(f32),
     /// The drag ended (left button released anywhere).
     SidebarDragEnd,
+    // --- tree drag-and-drop ---
+    /// The cursor moved (global mouse subscription).
+    MouseMoved(cosmic::iced::Point),
+    /// The left button went down (global mouse subscription).
+    MousePressed,
+    /// The left button came up (global mouse subscription).
+    MouseReleased,
+    /// Fresh tree-row bounds from the measure operation.
+    TreeBounds(crate::drag::TreeBounds),
     SettingsTheme(settings::ThemeChoice),
     SettingsSidebarSolid(bool),
     SettingsDefaultPane(PaneMode),
@@ -513,6 +522,16 @@ pub struct VaultNotes {
     pub sidebar_width: f32,
     /// A sidebar-width drag is in progress (started on the handle).
     pub sidebar_drag: bool,
+    // --- tree drag-and-drop (drag.rs) ---
+    /// An armed or active tree drag: press position, source row, hover
+    /// target. `None` when no left-press is pending a possible drag.
+    pub tree_drag: Option<TreeDrag>,
+    /// The last seen cursor position (presses carry no position).
+    pub last_cursor: Option<cosmic::iced::Point>,
+    /// Measured tree-row bounds for drag hit-testing.
+    pub tree_bounds: crate::drag::TreeBounds,
+    /// A bounds-measure task is in flight (don't queue another).
+    bounds_pending: bool,
     /// Seconds of editor idle before autosave fires.
     pub autosave_secs: u64,
     /// The pane layout a fresh session starts in.
@@ -1799,6 +1818,104 @@ impl VaultNotes {
 
     /// Re-evaluate the wikilink dropdown against the active tab's text and
     /// cursor: open while an unclosed `[[` is being typed, gone otherwise.
+    /// The hovered drop target of an active tree drag, if any: a folder
+    /// path, or "" for the vault root.
+    pub fn tree_drag_hover(&self) -> Option<&str> {
+        self.tree_drag
+            .as_ref()
+            .filter(|drag| drag.active)
+            .and_then(|drag| drag.hover.as_deref())
+    }
+
+    /// The path of the row an active tree drag is carrying, if any.
+    pub fn tree_drag_source(&self) -> Option<&str> {
+        self.tree_drag
+            .as_ref()
+            .filter(|drag| drag.active)
+            .and_then(|drag| drag.source.as_ref().map(|(path, _)| path.as_str()))
+    }
+
+    /// Advance the tree-drag state machine on cursor movement (drag.rs).
+    fn advance_tree_drag(&mut self, pos: cosmic::iced::Point) {
+        if self.tree_drag.is_none() {
+            return;
+        }
+        if self.tree_drag.as_ref().is_some_and(|drag| drag.active) {
+            let target = self.tree_bounds.hover_target(pos);
+            if let Some(drag) = self.tree_drag.as_mut() {
+                drag.hover = target;
+            }
+            return;
+        }
+        // Still arming: identify the source row from the press position.
+        let source = match self.tree_drag.as_ref().and_then(|drag| drag.source.clone()) {
+            Some(source) => Some(source),
+            None => self
+                .tree_drag
+                .as_ref()
+                .and_then(|drag| self.tree_bounds.row_at(drag.press_at)),
+        };
+        match source {
+            // Press was not on a (draggable) tree row: not a tree drag.
+            None => self.tree_drag = None,
+            Some(source) => {
+                let active = self
+                    .tree_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.press_at.distance(pos) > TREE_DRAG_THRESHOLD);
+                let hover = active.then(|| self.tree_bounds.hover_target(pos)).flatten();
+                if let Some(drag) = self.tree_drag.as_mut() {
+                    drag.source = Some(source);
+                    drag.active = active;
+                    drag.hover = hover;
+                }
+            }
+        }
+    }
+
+    /// A drag was released over `drag.hover`: move the source there via
+    /// the ordinary rename flow (which raises the link-update prompt).
+    fn finish_tree_drag(&mut self, drag: TreeDrag) -> Task<Message> {
+        let Some((source, is_folder)) = drag.source else {
+            return Task::none();
+        };
+        // Releasing over the tree but not on a target (or outside the
+        // tree entirely) cancels.
+        let Some(target) = drag.hover else {
+            return Task::none();
+        };
+        // Releasing over the source row itself is a click, not a move —
+        // the row's button performs its normal action.
+        let released_over_source = self.last_cursor.is_some_and(|pos| {
+            self.tree_bounds
+                .rows
+                .iter()
+                .any(|(path, _, bounds)| *path == source && bounds.contains(pos))
+        });
+        if released_over_source {
+            return Task::none();
+        }
+        let Some(new_path) = crate::drag::drop_path(&source, is_folder, &target) else {
+            return Task::none();
+        };
+        if is_folder {
+            self.rename_tree_folder(source, new_path)
+        } else {
+            self.rename_tree_note(source, new_path)
+        }
+    }
+
+    /// Queue a bounds-measure task unless one is already in flight.
+    fn measure_tree_bounds_if_needed(&mut self) -> Task<Message> {
+        if self.bounds_pending || self.vault.is_none() {
+            return Task::none();
+        }
+        self.bounds_pending = true;
+        crate::drag::measure_tree_bounds()
+            .map(Message::TreeBounds)
+            .map(cosmic::Action::App)
+    }
+
     fn update_wiki_complete(&mut self) {
         if !self.wiki_autocomplete {
             self.dismiss_editor_overlays();
@@ -2434,6 +2551,10 @@ impl cosmic::Application for VaultNotes {
             sidebar_solid: persisted.sidebar_solid,
             sidebar_width: settings::clamp_sidebar_width(persisted.sidebar_width),
             sidebar_drag: false,
+            tree_drag: None,
+            last_cursor: None,
+            tree_bounds: crate::drag::TreeBounds::default(),
+            bounds_pending: false,
             autosave_secs: persisted.autosave_secs,
             default_pane: persisted.default_pane,
             attachment_extensions: persisted.attachment_extensions,
@@ -2493,7 +2614,9 @@ impl cosmic::Application for VaultNotes {
             Message::WatchTick => {
                 let autosave = self.autosave_tick();
                 let poll = self.poll_watcher();
-                Task::batch([autosave, poll])
+                // Keep tree-row bounds fresh for drag hit-testing.
+                let bounds = self.measure_tree_bounds_if_needed();
+                Task::batch([autosave, poll, bounds])
             }
             Message::BannerReload => {
                 // Discard local edits in the conflicting tabs; reload disk.
@@ -2577,6 +2700,45 @@ impl cosmic::Application for VaultNotes {
                 }
                 Task::none()
             }
+            Message::MouseMoved(pos) => {
+                self.last_cursor = Some(pos);
+                self.advance_tree_drag(pos);
+                self.measure_tree_bounds_if_needed()
+            }
+            Message::MousePressed => {
+                // Arm a possible tree drag at the cursor. Only when the
+                // tree is actually on screen: other panels have no rows
+                // and stale bounds would misidentify sources.
+                if self.vault.is_none() || self.panel != SidePanel::Files {
+                    return Task::none();
+                }
+                let Some(pos) = self.last_cursor else {
+                    return Task::none();
+                };
+                if !self.tree_bounds.area.is_some_and(|a| a.contains(pos)) {
+                    return Task::none();
+                }
+                self.tree_drag = Some(TreeDrag {
+                    press_at: pos,
+                    source: None,
+                    active: false,
+                    hover: None,
+                });
+                self.measure_tree_bounds_if_needed()
+            }
+            Message::MouseReleased => {
+                if let Some(drag) = self.tree_drag.take() {
+                    if drag.active {
+                        return self.finish_tree_drag(drag);
+                    }
+                }
+                Task::none()
+            }
+            Message::TreeBounds(bounds) => {
+                self.tree_bounds = bounds;
+                self.bounds_pending = false;
+                Task::none()
+            }
             Message::ErrorDismiss => {
                 self.error = None;
                 Task::none()
@@ -2622,7 +2784,9 @@ impl cosmic::Application for VaultNotes {
                     self.panel = panel;
                 }
                 self.dismiss_editor_overlays();
-                Task::none()
+                // Switching back to Files re-measures the (possibly
+                // re-laid-out) tree rows.
+                self.measure_tree_bounds_if_needed()
             }
             Message::PaneActivated(id) => {
                 self.pane_model.activate(id);
@@ -3017,7 +3181,8 @@ impl cosmic::Application for VaultNotes {
                 if !self.collapsed.remove(&path) {
                     self.collapsed.insert(path);
                 }
-                Task::none()
+                // Row set changed: re-measure for drag hit-testing.
+                self.measure_tree_bounds_if_needed()
             }
             Message::ToggleFold(id) => {
                 if let Some(idx) = self.active {
@@ -3331,6 +3496,25 @@ impl cosmic::Application for VaultNotes {
                 cosmic::iced::time::every(std::time::Duration::from_secs(2))
                     .map(|_| Message::WatchTick),
             );
+            // Global mouse flow for tree drag-and-drop (and cursor
+            // tracking): presses have no position, so the last
+            // CursorMoved stands in for it. Captured events still arrive
+            // (status is ignored) — buttons capture their clicks, and the
+            // drag logic must see them anyway.
+            subs.push(cosmic::iced::event::listen_with(
+                |event, _status, _window| match event {
+                    cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::CursorMoved {
+                        position,
+                    }) => Some(Message::MouseMoved(position)),
+                    cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonPressed(
+                        cosmic::iced::mouse::Button::Left,
+                    )) => Some(Message::MousePressed),
+                    cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonReleased(
+                        cosmic::iced::mouse::Button::Left,
+                    )) => Some(Message::MouseReleased),
+                    _ => None,
+                },
+            ));
         }
         if self.sidebar_drag {
             // While dragging the sidebar handle, track the cursor
@@ -3407,6 +3591,25 @@ pub struct PendingLinkUpdates {
     /// The resolution index as it was before the rename.
     pub pre_index: VaultIndex,
 }
+
+/// A tree drag in progress (see `drag.rs`): armed on left-press, the
+/// source row is identified from the press position's measured bounds,
+/// and the drag activates past a movement threshold.
+#[derive(Debug, Clone)]
+pub struct TreeDrag {
+    /// Where the press happened.
+    pub press_at: cosmic::iced::Point,
+    /// The row under the press: (path, is_folder). Identified lazily so
+    /// freshly measured bounds are used.
+    pub source: Option<(String, bool)>,
+    /// Past the movement threshold: really dragging.
+    pub active: bool,
+    /// The hovered drop target: a folder path, or "" for the vault root.
+    pub hover: Option<String>,
+}
+
+/// Movement (px) from the press before a tree drag activates.
+const TREE_DRAG_THRESHOLD: f32 = crate::drag::DRAG_THRESHOLD;
 
 /// How the editor buffer should be written: body-only (frontmatter bytes are
 /// provably untouched) or full text (the user edited the frontmatter).
@@ -4300,6 +4503,10 @@ mod find_tests {
             sidebar_solid: false,
             sidebar_width: 250.0,
             sidebar_drag: false,
+            tree_drag: None,
+            last_cursor: None,
+            tree_bounds: crate::drag::TreeBounds::default(),
+            bounds_pending: false,
             autosave_secs: 2,
             default_pane: PaneMode::default(),
             attachment_extensions: Vec::new(),
@@ -5339,5 +5546,130 @@ mod sidebar_resize_tests {
         let _ = crate::view::view(&app);
         app.sidebar_drag = true;
         let _ = crate::view::view(&app);
+    }
+}
+
+#[cfg(test)]
+mod tree_drag_tests {
+    use super::*;
+    use cosmic::app::Application as _;
+
+    fn app_with(files: &[(&str, &str)]) -> (tempfile::TempDir, VaultNotes) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (path, text) in files {
+            if let Some((dir, _)) = path.rsplit_once('/') {
+                std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+            }
+            std::fs::write(tmp.path().join(path), text).unwrap();
+        }
+        let mut app = find_tests::test_app_with_tab("");
+        app.vault = Some(Vault::open(tmp.path()).unwrap());
+        app.rebuild_index();
+        (tmp, app)
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> cosmic::iced::Rectangle {
+        cosmic::iced::Rectangle {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    /// Bounds matching a three-row tree: folder "old", then notes "a.md"
+    /// and "old/n.md", inside a 200x300 tree area.
+    fn bounds() -> crate::drag::TreeBounds {
+        crate::drag::TreeBounds {
+            rows: vec![
+                ("old".into(), true, rect(0.0, 0.0, 200.0, 24.0)),
+                ("a.md".into(), false, rect(0.0, 24.0, 200.0, 24.0)),
+                ("old/n.md".into(), false, rect(0.0, 48.0, 200.0, 24.0)),
+            ],
+            area: Some(rect(0.0, 0.0, 200.0, 300.0)),
+        }
+    }
+
+    /// Simulate a press-move-release drag between window positions.
+    fn drag(app: &mut VaultNotes, from: (f32, f32), to: (f32, f32)) {
+        app.last_cursor = Some(cosmic::iced::Point::new(from.0, from.1));
+        let _ = app.update(Message::MousePressed);
+        let _ = app.update(Message::MouseMoved(cosmic::iced::Point::new(to.0, to.1)));
+        let _ = app.update(Message::MouseReleased);
+    }
+
+    #[test]
+    fn dragging_a_note_into_a_folder_moves_the_file() {
+        let (tmp, mut app) = app_with(&[("a.md", ""), ("old/n.md", "")]);
+        app.tree_bounds = bounds();
+        // a.md (row at y=24..48) onto the "old" folder row (y=0..24).
+        drag(&mut app, (10.0, 30.0), (10.0, 8.0));
+        assert!(tmp.path().join("old/a.md").exists(), "note moved");
+        assert!(!tmp.path().join("a.md").exists(), "old path gone");
+        // The drag state is fully cleared.
+        assert!(app.tree_drag.is_none());
+    }
+
+    #[test]
+    fn dragging_a_note_to_the_tree_area_moves_it_to_the_root() {
+        let (tmp, mut app) = app_with(&[("old/n.md", "")]);
+        app.tree_bounds = bounds();
+        // old/n.md (row at y=48..72) onto empty tree space below (root).
+        drag(&mut app, (10.0, 55.0), (10.0, 200.0));
+        assert!(tmp.path().join("n.md").exists(), "moved to root");
+        assert!(!tmp.path().join("old/n.md").exists());
+    }
+
+    #[test]
+    fn dragging_outside_the_tree_cancels() {
+        let (tmp, mut app) = app_with(&[("a.md", "")]);
+        app.tree_bounds = bounds();
+        // Below the tree area: no hover target, no move.
+        drag(&mut app, (10.0, 30.0), (10.0, 400.0));
+        assert!(tmp.path().join("a.md").exists(), "unchanged");
+        assert!(app.tree_drag.is_none());
+    }
+
+    #[test]
+    fn releasing_over_the_source_row_is_a_click_not_a_move() {
+        let (tmp, mut app) = app_with(&[("a.md", ""), ("old/n.md", "")]);
+        app.tree_bounds = bounds();
+        // Past the threshold but still inside the source row's bounds.
+        drag(&mut app, (10.0, 30.0), (60.0, 36.0));
+        assert!(tmp.path().join("a.md").exists(), "stayed put");
+    }
+
+    #[test]
+    fn a_folder_cannot_be_dropped_into_itself() {
+        let (tmp, mut app) = app_with(&[("old/n.md", "")]);
+        app.tree_bounds = bounds();
+        // The "old" folder row onto itself: refused.
+        drag(&mut app, (10.0, 8.0), (30.0, 12.0));
+        assert!(tmp.path().join("old/n.md").exists(), "unchanged");
+        assert!(!tmp.path().join("old/old").exists());
+    }
+
+    #[test]
+    fn a_plain_click_arms_nothing_and_moves_nothing() {
+        let (tmp, mut app) = app_with(&[("a.md", "")]);
+        app.tree_bounds = bounds();
+        // Press and release at the same spot: no movement.
+        app.last_cursor = Some(cosmic::iced::Point::new(10.0, 30.0));
+        let _ = app.update(Message::MousePressed);
+        let _ = app.update(Message::MouseReleased);
+        assert!(tmp.path().join("a.md").exists());
+        assert!(app.tree_drag.is_none());
+    }
+
+    #[test]
+    fn dragging_prompts_for_link_updates_like_a_rename() {
+        let (_tmp, mut app) = app_with(&[("a.md", "see [[n]]"), ("old/n.md", "n")]);
+        app.tree_bounds = bounds();
+        // old/n.md (row at y=48..72) onto the "old" folder row is a
+        // no-op; drop it on a.md's row's folder (root) instead.
+        app.tree_bounds.rows[2] = ("old/n.md".into(), false, rect(0.0, 48.0, 200.0, 24.0));
+        drag(&mut app, (10.0, 55.0), (10.0, 200.0));
+        let pending = app.pending_links.as_ref().expect("link prompt appears");
+        assert_eq!(pending.referrers, vec!["a.md"]);
     }
 }

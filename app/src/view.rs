@@ -333,8 +333,42 @@ fn tree_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
     if app.tree_folder_edit_target() == Some("") {
         col = col.push(tree_edit_row(app, 4.0));
     }
-    col = col.push(nodes_view(&app.tree, 0, app));
-    col.into()
+    col = col.push(nodes_view(&app.tree, 0, app, palette));
+    // The tree area is the root drop region: highlighted while a drag
+    // hovers it (drop = move to the vault root).
+    let root_hover = app.tree_drag_hover() == Some("");
+    container(col)
+        .width(Length::Fill)
+        .id(Id::new(crate::drag::AREA_ID))
+        .style(move |_| {
+            if root_hover {
+                cosmic::widget::container::Style {
+                    background: Some(Background::Color(with_alpha(palette.accent, 0.25))),
+                    ..Default::default()
+                }
+            } else {
+                cosmic::widget::container::Style::default()
+            }
+        })
+        .into()
+}
+
+/// The style of a tree row while a drag is in flight: the hovered drop
+/// target is accented, the dragged row dimmed, everything else plain.
+fn row_drag_style(hover: bool, source: bool, palette: Palette) -> cosmic::widget::container::Style {
+    if hover {
+        cosmic::widget::container::Style {
+            background: Some(Background::Color(with_alpha(palette.accent, 0.3))),
+            ..Default::default()
+        }
+    } else if source {
+        cosmic::widget::container::Style {
+            background: Some(Background::Color(with_alpha(palette.muted, 0.35))),
+            ..Default::default()
+        }
+    } else {
+        cosmic::widget::container::Style::default()
+    }
 }
 
 /// The shared right-click menu for a tree row: new note/folder beside the
@@ -439,6 +473,7 @@ fn nodes_view<'a>(
     nodes: &'a [TreeNode],
     depth: usize,
     app: &'a VaultNotes,
+    palette: Palette,
 ) -> Element<'a, Message> {
     let mut col = column::Column::new().spacing(0).width(Length::Fill);
     for node in nodes {
@@ -470,20 +505,24 @@ fn nodes_view<'a>(
                     .width(Length::Fill)
                     .into()
                 };
+                let hover = app.tree_drag_hover() == Some(path.as_str());
+                let source = app.tree_drag_source() == Some(path.as_str());
                 col = col.push(
                     container(menu_row(row, path))
+                        .id(crate::drag::row_id(true, path))
                         .padding(Padding {
                             left: indent,
                             ..Padding::ZERO
                         })
-                        .width(Length::Fill),
+                        .width(Length::Fill)
+                        .style(move |_| row_drag_style(hover, source, palette)),
                 );
                 if !app.collapsed.contains(path) {
                     // New-note/new-folder inputs render as the folder's first row.
                     if app.tree_folder_edit_target() == Some(path.as_str()) {
                         col = col.push(tree_edit_row(app, indent + 14.0));
                     }
-                    col = col.push(nodes_view(children, depth + 1, app));
+                    col = col.push(nodes_view(children, depth + 1, app, palette));
                 }
             }
             TreeNode::Note { name, path } => {
@@ -524,14 +563,22 @@ fn nodes_view<'a>(
                     .width(Length::Fill)
                     .into()
                 };
-                col = col.push(
-                    container(if is_note { menu_row(row, path) } else { row })
-                        .padding(Padding {
-                            left: indent + 10.0,
-                            ..Padding::ZERO
-                        })
-                        .width(Length::Fill),
-                );
+                let mut row_container = container(if is_note { menu_row(row, path) } else { row })
+                    .padding(Padding {
+                        left: indent + 10.0,
+                        ..Padding::ZERO
+                    })
+                    .width(Length::Fill);
+                if is_note {
+                    // Notes are draggable; attachments are not (they carry
+                    // no row id, so a press on them never arms a drag).
+                    let hover = app.tree_drag_hover() == Some(path.as_str());
+                    let source = app.tree_drag_source() == Some(path.as_str());
+                    row_container = row_container
+                        .id(crate::drag::row_id(false, path))
+                        .style(move |_| row_drag_style(hover, source, palette));
+                }
+                col = col.push(row_container);
             }
         }
     }
