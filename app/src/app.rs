@@ -388,6 +388,13 @@ pub enum Message {
     LinkUpdatesApply,
     /// Leave the invalidated links as they are.
     LinkUpdatesDismiss,
+    // --- sidebar resize ---
+    /// Begin dragging the sidebar's width handle.
+    SidebarDragStart,
+    /// The cursor moved while dragging; the value is the new width.
+    SidebarDrag(f32),
+    /// The drag ended (left button released anywhere).
+    SidebarDragEnd,
     SettingsTheme(settings::ThemeChoice),
     SettingsSidebarSolid(bool),
     SettingsDefaultPane(PaneMode),
@@ -501,6 +508,11 @@ pub struct VaultNotes {
     pub editor_font_size: u16,
     /// Paint the sidebar with a solid surface.
     pub sidebar_solid: bool,
+    /// Sidebar width in pixels, dragged via the handle between the
+    /// sidebar and the note area (clamped, persisted on release).
+    pub sidebar_width: f32,
+    /// A sidebar-width drag is in progress (started on the handle).
+    pub sidebar_drag: bool,
     /// Seconds of editor idle before autosave fires.
     pub autosave_secs: u64,
     /// The pane layout a fresh session starts in.
@@ -2420,6 +2432,8 @@ impl cosmic::Application for VaultNotes {
             editor_font_mono: persisted.editor_font_mono,
             editor_font_size: persisted.editor_font_size,
             sidebar_solid: persisted.sidebar_solid,
+            sidebar_width: settings::clamp_sidebar_width(persisted.sidebar_width),
+            sidebar_drag: false,
             autosave_secs: persisted.autosave_secs,
             default_pane: persisted.default_pane,
             attachment_extensions: persisted.attachment_extensions,
@@ -2543,6 +2557,24 @@ impl cosmic::Application for VaultNotes {
             }
             Message::LinkUpdatesDismiss => {
                 self.pending_links = None;
+                Task::none()
+            }
+            Message::SidebarDragStart => {
+                self.sidebar_drag = true;
+                Task::none()
+            }
+            Message::SidebarDrag(x) => {
+                if self.sidebar_drag {
+                    self.sidebar_width = settings::clamp_sidebar_width(x);
+                }
+                Task::none()
+            }
+            Message::SidebarDragEnd => {
+                if self.sidebar_drag {
+                    self.sidebar_drag = false;
+                    let width = self.sidebar_width;
+                    persist_setting(|s| s.sidebar_width = width);
+                }
                 Task::none()
             }
             Message::ErrorDismiss => {
@@ -3293,14 +3325,31 @@ impl cosmic::Application for VaultNotes {
             }) => Some(Message::KeyPressed(status, modifiers, key)),
             _ => None,
         });
-        match &self.vault {
-            Some(_) => cosmic::iced::Subscription::batch([
-                keys,
+        let mut subs = vec![keys];
+        if self.vault.is_some() {
+            subs.push(
                 cosmic::iced::time::every(std::time::Duration::from_secs(2))
                     .map(|_| Message::WatchTick),
-            ]),
-            None => keys,
+            );
         }
+        if self.sidebar_drag {
+            // While dragging the sidebar handle, track the cursor
+            // globally: mouse_area events stop once the pointer leaves
+            // the handle's few pixels, but the drag must continue and end
+            // (left button released) anywhere in the window.
+            subs.push(cosmic::iced::event::listen_with(
+                |event, _status, _window| match event {
+                    cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::CursorMoved {
+                        position,
+                    }) => Some(Message::SidebarDrag(position.x)),
+                    cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonReleased(
+                        cosmic::iced::mouse::Button::Left,
+                    )) => Some(Message::SidebarDragEnd),
+                    _ => None,
+                },
+            ));
+        }
+        cosmic::iced::Subscription::batch(subs)
     }
 }
 
@@ -4249,6 +4298,8 @@ mod find_tests {
             editor_font_mono: true,
             editor_font_size: 14,
             sidebar_solid: false,
+            sidebar_width: 250.0,
+            sidebar_drag: false,
             autosave_secs: 2,
             default_pane: PaneMode::default(),
             attachment_extensions: Vec::new(),
@@ -5243,5 +5294,50 @@ mod link_update_tests {
         std::fs::write(tmp.path().join("a.md"), "nothing relevant now").unwrap();
         let _ = app.update(Message::LinkUpdatesApply);
         assert_eq!(disk(&tmp, "a.md"), "nothing relevant now");
+    }
+}
+
+#[cfg(test)]
+mod sidebar_resize_tests {
+    use super::*;
+    use cosmic::app::Application as _;
+
+    #[test]
+    fn drag_updates_width_clamped_and_persists_on_release() {
+        let mut app = find_tests::test_app_with_tab("");
+        let _ = app.update(Message::SidebarDragStart);
+        assert!(app.sidebar_drag);
+        // Clamped to the usable range.
+        let _ = app.update(Message::SidebarDrag(30.0));
+        assert_eq!(app.sidebar_width, settings::SIDEBAR_MIN_WIDTH);
+        let _ = app.update(Message::SidebarDrag(10_000.0));
+        assert_eq!(app.sidebar_width, settings::SIDEBAR_MAX_WIDTH);
+        let _ = app.update(Message::SidebarDrag(300.0));
+        assert_eq!(app.sidebar_width, 300.0);
+        // Release persists the width.
+        let _ = app.update(Message::SidebarDragEnd);
+        assert!(!app.sidebar_drag);
+        assert_eq!(crate::settings::load().sidebar_width, 300.0);
+        // Leave the developer's settings file as it was.
+        persist_setting(|s| s.sidebar_width = settings::AppSettings::default().sidebar_width);
+    }
+
+    #[test]
+    fn drag_messages_outside_a_drag_are_ignored() {
+        let mut app = find_tests::test_app_with_tab("");
+        let _ = app.update(Message::SidebarDrag(50.0));
+        assert_eq!(app.sidebar_width, 250.0);
+        assert!(!app.sidebar_drag);
+        // End without start: nothing happens.
+        let _ = app.update(Message::SidebarDragEnd);
+        assert!(!app.sidebar_drag);
+    }
+
+    #[test]
+    fn the_view_builds_with_the_handle_idle_and_dragging() {
+        let mut app = find_tests::test_app_with_tab("");
+        let _ = crate::view::view(&app);
+        app.sidebar_drag = true;
+        let _ = crate::view::view(&app);
     }
 }

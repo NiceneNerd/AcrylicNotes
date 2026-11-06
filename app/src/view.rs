@@ -8,7 +8,7 @@ use cosmic::iced::core::widget::Id;
 use cosmic::iced::widget::{opaque, stack, text_editor};
 use cosmic::iced::{alignment, border, Background, Length, Padding};
 use cosmic::widget::{
-    button, column, container, context_menu, icon, menu, nav_bar, row, scrollable,
+    button, column, container, context_menu, icon, menu, mouse_area, nav_bar, row, scrollable,
     segmented_button, settings, tab_bar, text, text_input, toggler,
 };
 use cosmic::Element;
@@ -134,8 +134,37 @@ fn main_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
     let note = container(note_area(app, palette))
         .width(Length::Fill)
         .height(Length::Fill);
-    col = col.push(row::Row::new().push(sidebar(app, palette)).push(note));
+    col = col.push(
+        row::Row::new()
+            .push(sidebar(app, palette))
+            .push(sidebar_handle(app, palette))
+            .push(note),
+    );
     col.into()
+}
+
+/// The sidebar's drag handle: a slim strip between the sidebar and the
+/// note area. Press starts a global drag (the subscription tracks the
+/// cursor anywhere in the window), release persists the width. The strip
+/// is faintly visible so the affordance can be found; it brightens while
+/// a drag is active.
+fn sidebar_handle<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+    let tint = if app.sidebar_drag {
+        with_alpha(palette.accent, 0.55)
+    } else {
+        with_alpha(palette.muted, 0.25)
+    };
+    mouse_area(
+        container(column::Column::new())
+            .width(Length::Fixed(6.0))
+            .height(Length::Fill)
+            .style(move |_| cosmic::widget::container::Style {
+                background: Some(Background::Color(tint)),
+                ..Default::default()
+            }),
+    )
+    .on_press(Message::SidebarDragStart)
+    .into()
 }
 
 /// Non-blocking external-change banner (M4 decision 7). Two sections:
@@ -269,7 +298,7 @@ fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
             .height(Length::Fill),
     );
     container(col)
-        .width(Length::Fixed(250.0))
+        .width(Length::Fixed(app.sidebar_width))
         .height(Length::Fill)
         .style(move |_| {
             // Default: translucent, so the compositor's frosted-window blur

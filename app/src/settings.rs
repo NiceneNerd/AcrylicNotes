@@ -58,6 +58,9 @@ pub struct AppSettings {
     /// (glass) one.
     #[serde(default)]
     pub sidebar_solid: bool,
+    /// Sidebar width in pixels (the drag handle clamps it).
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
     /// Seconds of editor idle before autosave fires.
     #[serde(default = "default_autosave_secs")]
     pub autosave_secs: u64,
@@ -116,6 +119,20 @@ fn default_autosave_secs() -> u64 {
     2
 }
 
+fn default_sidebar_width() -> f32 {
+    250.0
+}
+
+/// The drag handle's clamp: narrow enough to keep content usable, wide
+/// enough for long note titles.
+pub const SIDEBAR_MIN_WIDTH: f32 = 180.0;
+pub const SIDEBAR_MAX_WIDTH: f32 = 480.0;
+
+/// Clamp a sidebar width to the handle's usable range.
+pub fn clamp_sidebar_width(width: f32) -> f32 {
+    width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -130,6 +147,7 @@ impl Default for AppSettings {
             editor_font_mono: true,
             editor_font_size: default_editor_font_size(),
             sidebar_solid: false,
+            sidebar_width: default_sidebar_width(),
             autosave_secs: default_autosave_secs(),
             default_pane: PaneMode::default(),
             attachment_extensions: Vec::new(),
@@ -198,6 +216,7 @@ mod tests {
             editor_font_mono: true,
             editor_font_size: 18,
             sidebar_solid: true,
+            sidebar_width: 320.0,
             autosave_secs: 5,
             default_pane: PaneMode::Reading,
             attachment_extensions: vec!["png".into(), "pdf".into()],
@@ -233,6 +252,7 @@ mod tests {
         assert!(loaded.editor_font_mono);
         assert_eq!(loaded.editor_font_size, 14);
         assert!(!loaded.sidebar_solid);
+        assert_eq!(loaded.sidebar_width, 250.0);
         assert_eq!(loaded.autosave_secs, 2);
         assert_eq!(loaded.default_pane, PaneMode::Split);
 
@@ -244,5 +264,12 @@ mod tests {
         };
         store_to(&path2, &settings).unwrap();
         assert!(!load_from(&path2).unwrap().glass_enabled);
+    }
+
+    #[test]
+    fn sidebar_width_clamps_to_the_usable_range() {
+        assert_eq!(clamp_sidebar_width(30.0), SIDEBAR_MIN_WIDTH);
+        assert_eq!(clamp_sidebar_width(10_000.0), SIDEBAR_MAX_WIDTH);
+        assert_eq!(clamp_sidebar_width(300.0), 300.0);
     }
 }
