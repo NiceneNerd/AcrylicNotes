@@ -627,3 +627,52 @@ All chord changes below supersede the M4c follow-up section above.
 - The mode is dismissed by tab open/close/switch, pane switches, and
   sidebar navigation, and starting it dismisses the wikilink dropdown
   (the two editor popups never coexist).
+
+### Phase I — loose ends: Esc drawer, link rewriting, sidebar resize, tree drag-drop
+
+- Plain Esc (uncaptured, nothing else open) now closes the settings
+  drawer — the fallback close offered when the drawer shipped. Keys
+  captured by the drawer's own text inputs never reach the global
+  handler, so typing there is unaffected.
+- Renaming a note or folder checks the pre-rename backlink index for
+  wikilinks/embeds that resolve into the renamed scope. When any
+  exist, a non-blocking banner asks first (Obsidian asks too):
+  "Update links" rewrites them, "Leave as is" dismisses, and a rename
+  with nothing to rewrite never shows the banner. Markdown links are
+  deliberately out of scope: the app does not navigate them
+  vault-relatively, so rewriting them would be speculative.
+- Rewriting touches only the note part of each target — `#headings`,
+  `|aliases` and `^block refs` survive — via a span-preserving scan in
+  vault-md (`link_spans`/`rewrite_link_targets`) that skips
+  frontmatter, code, math and raw HTML exactly like the renderer's
+  extraction. Byte offsets are exact across multibyte text.
+- Each referrer is re-scanned at confirm time against a snapshot of
+  the pre-rename index: only links whose resolution actually changed
+  are rewritten (intra-folder bare links keep working after a folder
+  rename and are left alone; self-links in the renamed note are
+  caught). Replacements follow the link-path setting
+  (Shortest/Relative/Absolute), open tabs get the buffer change as one
+  undo step (saved through the normal flow), closed notes are written
+  through the safe save path, and referrers edited between the prompt
+  and the confirm are picked up instead of corrupting spans.
+- The sidebar width is adjustable via the slim handle between the
+  sidebar and the note area (faintly tinted, accent-bright while
+  dragging). While dragging, a global mouse subscription tracks the
+  cursor anywhere in the window — mouse_area events would stop once
+  the pointer leaves the handle — and release persists the width
+  (clamped 180–480px) through the settings file.
+- Notes and folders move by dragging rows onto folder rows (or the
+  tree's empty area = vault root). This is deliberately app-level
+  pointer state, NOT iced's dnd widgets: those are Wayland-protocol-
+  based and unreliable on X11, while this behaves identically on both.
+  Mechanics: a left-press arms a candidate (rows' Buttons capture press
+  events, so per-row detection is impossible); movement past 6px
+  activates the drag; the source row is identified by hit-testing the
+  press position against bounds measured by a widget operation
+  (`tree-row-*` container ids, refreshed on press, movement, folder
+  toggles, panel switches and the watch tick). The hovered folder is
+  accented, the dragged row dimmed, the root target highlighted.
+  Release moves via the ordinary rename flow (link prompt included)
+  and refuses no-ops, folder-into-itself and folder-into-descendant
+  drops; releasing over the source row counts as a click. Attachments
+  are not draggable.
