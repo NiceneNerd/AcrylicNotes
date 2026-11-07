@@ -71,6 +71,7 @@ pub fn header_start(app: &VaultNotes) -> Vec<Element<'_, Message>> {
                 ])
                 .on_activate(Message::PaneActivated),
         )
+        .width(Length::Shrink) // leave room for the window title in the center
         .padding([2, 4])
         .into(),
         // Settings live in the right-side context drawer (Phase G).
