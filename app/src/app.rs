@@ -1857,7 +1857,14 @@ impl VaultNotes {
         };
         match source {
             // Press was not on a (draggable) tree row: not a tree drag.
-            None => self.tree_drag = None,
+            // Fresh bounds may still be in flight (e.g. the tree was just
+            // scrolled), so wait for them before concluding the press
+            // missed every row.
+            None => {
+                if !self.bounds_pending {
+                    self.tree_drag = None;
+                }
+            }
             Some(source) => {
                 let active = self
                     .tree_drag
@@ -1907,7 +1914,10 @@ impl VaultNotes {
 
     /// Queue a bounds-measure task unless one is already in flight.
     fn measure_tree_bounds_if_needed(&mut self) -> Task<Message> {
-        if self.bounds_pending || self.vault.is_none() {
+        // Only measure while the tree is on screen: on other panels the
+        // tree is not built, so the measurement would come back empty and
+        // wipe the bounds a later press needs.
+        if self.bounds_pending || self.vault.is_none() || self.panel != SidePanel::Files {
             return Task::none();
         }
         self.bounds_pending = true;
@@ -5671,5 +5681,56 @@ mod tree_drag_tests {
         drag(&mut app, (10.0, 55.0), (10.0, 200.0));
         let pending = app.pending_links.as_ref().expect("link prompt appears");
         assert_eq!(pending.referrers, vec!["a.md"]);
+    }
+
+    #[test]
+    fn arming_waits_for_fresh_bounds_before_giving_up() {
+        let (tmp, mut app) = app_with(&[("a.md", "")]);
+        app.tree_bounds = bounds();
+        // Press on empty tree space below every row: with the tree just
+        // scrolled, the bounds on hand may predate the scroll and miss
+        // rows the press actually landed on — so a miss is not yet
+        // conclusive while fresh bounds are in flight.
+        app.last_cursor = Some(cosmic::iced::Point::new(10.0, 200.0));
+        let _ = app.update(Message::MousePressed);
+        assert!(app.tree_drag.is_some(), "armed");
+        assert!(app.bounds_pending, "fresh bounds queued");
+
+        // Movement before the fresh bounds arrive: still armed, still
+        // not a drag (the source row is not yet identified).
+        let _ = app.update(Message::MouseMoved(cosmic::iced::Point::new(20.0, 210.0)));
+        assert!(
+            app.tree_drag.as_ref().is_some_and(|drag| !drag.active),
+            "stays armed while bounds are pending"
+        );
+
+        // Fresh bounds arrive and confirm the press hit no row: the
+        // next movement disarms the candidate.
+        let _ = app.update(Message::TreeBounds(bounds()));
+        let _ = app.update(Message::MouseMoved(cosmic::iced::Point::new(25.0, 215.0)));
+        assert!(
+            app.tree_drag.is_none(),
+            "disarmed once the miss is confirmed"
+        );
+        assert!(tmp.path().join("a.md").exists(), "nothing moved");
+    }
+
+    #[test]
+    fn bounds_are_measured_only_while_the_files_panel_is_open() {
+        let (_tmp, mut app) = app_with(&[("a.md", "")]);
+        // Another panel: the tree is not built there, so a measurement
+        // would come back empty and wipe the bounds a later press needs.
+        app.panel = SidePanel::Search;
+        let _ = app.measure_tree_bounds_if_needed();
+        assert!(!app.bounds_pending, "no measure queued off the Files panel");
+
+        // On the Files panel a measure is queued and marked pending.
+        app.panel = SidePanel::Files;
+        let _ = app.measure_tree_bounds_if_needed();
+        assert!(app.bounds_pending, "measure queued");
+
+        // One in flight is enough: no second queue.
+        let _ = app.measure_tree_bounds_if_needed();
+        assert!(app.bounds_pending);
     }
 }

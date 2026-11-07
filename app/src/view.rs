@@ -69,6 +69,7 @@ pub fn header_start(app: &VaultNotes) -> Vec<Element<'_, Message>> {
                     cosmic::theme::spacing().space_s,
                     cosmic::theme::spacing().space_xxs,
                 ])
+                .width(Length::Shrink)
                 .on_activate(Message::PaneActivated),
         )
         .width(Length::Shrink) // leave room for the window title in the center
@@ -295,6 +296,7 @@ fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
     };
     col = col.push(
         scrollable::scrollable(body)
+            .id(Id::new(crate::drag::SCROLL_ID))
             .width(Length::Fill)
             .height(Length::Fill),
     );
