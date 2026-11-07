@@ -585,7 +585,7 @@ All chord changes below supersede the M4c follow-up section above.
 - A gear button in the header opens the right-side COSMIC context
   drawer with every persisted preference: auto-pairs, wikilink
   suggestions, word wrap, monospace editor font, editor font size
-  (10–28 px stepper), theme (System/Dark/Light), solid sidebar, default
+  (10–28 px stepper), theme (System/Dark/Light), default
   pane layout (Split/Source/Reading), hide `.md` in the tree, autosave
   delay (1–60 s stepper), and scroll sync.
 - Each change applies immediately and persists through
@@ -593,9 +593,6 @@ All chord changes below supersede the M4c follow-up section above.
   honors font family, size, and wrapping live; disabling auto-pairs or
   wikilink autocomplete short-circuits those features; autosave uses
   the configured delay; a fresh session starts in the saved layout.
-- The "solid sidebar" toggle paints the sidebar with the theme surface
-  instead of the translucent one (for compositors/window rules where
-  the frosted-window blur is unwanted).
 - Non-markdown vault files (attachments) now appear in the file tree
   with an attachment icon, sorted among the notes. Clicking one opens
   it with the platform handler (`xdg-open`). They deliberately get no
@@ -628,7 +625,7 @@ All chord changes below supersede the M4c follow-up section above.
   sidebar navigation, and starting it dismisses the wikilink dropdown
   (the two editor popups never coexist).
 
-### Phase I — loose ends: Esc drawer, link rewriting, sidebar resize, tree drag-drop
+### Phase I — loose ends: Esc drawer, link rewriting, sidebar collapse, tree drag-drop
 
 - Plain Esc (uncaptured, nothing else open) now closes the settings
   drawer — the fallback close offered when the drawer shipped. Keys
@@ -655,12 +652,24 @@ All chord changes below supersede the M4c follow-up section above.
   undo step (saved through the normal flow), closed notes are written
   through the safe save path, and referrers edited between the prompt
   and the confirm are picked up instead of corrupting spans.
-- The sidebar width is adjustable via the slim handle between the
-  sidebar and the note area (faintly tinted, accent-bright while
-  dragging). While dragging, a global mouse subscription tracks the
-  cursor anywhere in the window — mouse_area events would stop once
-  the pointer leaves the handle — and release persists the width
-  (clamped 180–480px) through the settings file.
+- The sidebar is collapsible via a titlebar button (the far-left
+  navbar icon, mirroring libcosmic's own `nav_bar_toggle`: the icon
+  shows the current state and the button reads selected while the
+  sidebar is visible). The state persists through the settings file.
+  While the sidebar is closed, tree-drag arming and bounds measuring
+  are gated off: bounds measured before collapsing would go stale, and
+  a click inside the old tree area could otherwise arm a drag and move
+  a file on release.
+- The sidebar renders as a floating COSMIC panel: fixed 250px width,
+  padded away from the header above, the note area beside it, and the
+  window's bottom edge (`space_xxs`; the shell's border padding already
+  insets it from the window's sides), painted with the theme's opaque
+  background base at 0.9 opacity (the frosted backdrop still reads
+  through faintly), and corners rounded by the theme's `radius_s` —
+  so the COSMIC Appearance rounding setting (including Sharp) applies.
+  The resizable-width handle is gone: the panel is shown or hidden
+  whole, and the settings drawer's "solid sidebar" toggle went with it
+  (the panel look is near-opaque by design).
 - Notes and folders move by dragging rows onto folder rows (or the
   tree's empty area = vault root). This is deliberately app-level
   pointer state, NOT iced's dnd widgets: those are Wayland-protocol-

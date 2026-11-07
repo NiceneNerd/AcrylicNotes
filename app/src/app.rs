@@ -388,13 +388,9 @@ pub enum Message {
     LinkUpdatesApply,
     /// Leave the invalidated links as they are.
     LinkUpdatesDismiss,
-    // --- sidebar resize ---
-    /// Begin dragging the sidebar's width handle.
-    SidebarDragStart,
-    /// The cursor moved while dragging; the value is the new width.
-    SidebarDrag(f32),
-    /// The drag ended (left button released anywhere).
-    SidebarDragEnd,
+    // --- sidebar collapse ---
+    /// Show or hide the sidebar (file tree and other panels).
+    ToggleSidebar,
     // --- tree drag-and-drop ---
     /// The cursor moved (global mouse subscription).
     MouseMoved(cosmic::iced::Point),
@@ -405,7 +401,6 @@ pub enum Message {
     /// Fresh tree-row bounds from the measure operation.
     TreeBounds(crate::drag::TreeBounds),
     SettingsTheme(settings::ThemeChoice),
-    SettingsSidebarSolid(bool),
     SettingsDefaultPane(PaneMode),
     SettingsHideMdExt(bool),
     /// Nudge the autosave delay in seconds (clamped 1..=60).
@@ -515,13 +510,9 @@ pub struct VaultNotes {
     pub editor_font_mono: bool,
     /// Editor font size in pixels.
     pub editor_font_size: u16,
-    /// Paint the sidebar with a solid surface.
-    pub sidebar_solid: bool,
-    /// Sidebar width in pixels, dragged via the handle between the
-    /// sidebar and the note area (clamped, persisted on release).
-    pub sidebar_width: f32,
-    /// A sidebar-width drag is in progress (started on the handle).
-    pub sidebar_drag: bool,
+    /// Whether the sidebar (file tree and other panels) is shown;
+    /// toggled from the titlebar button.
+    pub sidebar_open: bool,
     // --- tree drag-and-drop (drag.rs) ---
     /// An armed or active tree drag: press position, source row, hover
     /// target. `None` when no left-press is pending a possible drag.
@@ -564,6 +555,15 @@ pub struct VaultNotes {
 
 /// Id of the inline tree-edit text input (focused when the edit starts).
 pub const TREE_EDIT_INPUT: &str = "tree-edit-input";
+
+/// The sidebar panel's fixed width in pixels (no resize handle; the
+/// panel is shown or hidden whole).
+pub const SIDEBAR_WIDTH: f32 = 250.0;
+
+/// The sidebar panel's background opacity: the theme's opaque background
+/// base drawn back this far, so the frosted backdrop still reads through
+/// faintly. 1.0 would be a fully solid surface.
+pub const SIDEBAR_OPACITY: f32 = 0.9;
 
 /// Id of the settings drawer's file-extension input.
 pub const ATTACHMENT_INPUT: &str = "attachment-ext-input";
@@ -1914,10 +1914,15 @@ impl VaultNotes {
 
     /// Queue a bounds-measure task unless one is already in flight.
     fn measure_tree_bounds_if_needed(&mut self) -> Task<Message> {
-        // Only measure while the tree is on screen: on other panels the
-        // tree is not built, so the measurement would come back empty and
-        // wipe the bounds a later press needs.
-        if self.bounds_pending || self.vault.is_none() || self.panel != SidePanel::Files {
+        // Only measure while the tree is on screen: on other panels (or
+        // with the sidebar collapsed) the tree is not built, so the
+        // measurement would come back empty and wipe the bounds a later
+        // press needs.
+        if self.bounds_pending
+            || self.vault.is_none()
+            || self.panel != SidePanel::Files
+            || !self.sidebar_open
+        {
             return Task::none();
         }
         self.bounds_pending = true;
@@ -2558,9 +2563,7 @@ impl cosmic::Application for VaultNotes {
             word_wrap: persisted.word_wrap,
             editor_font_mono: persisted.editor_font_mono,
             editor_font_size: persisted.editor_font_size,
-            sidebar_solid: persisted.sidebar_solid,
-            sidebar_width: settings::clamp_sidebar_width(persisted.sidebar_width),
-            sidebar_drag: false,
+            sidebar_open: persisted.sidebar_open,
             tree_drag: None,
             last_cursor: None,
             tree_bounds: crate::drag::TreeBounds::default(),
@@ -2692,22 +2695,9 @@ impl cosmic::Application for VaultNotes {
                 self.pending_links = None;
                 Task::none()
             }
-            Message::SidebarDragStart => {
-                self.sidebar_drag = true;
-                Task::none()
-            }
-            Message::SidebarDrag(x) => {
-                if self.sidebar_drag {
-                    self.sidebar_width = settings::clamp_sidebar_width(x);
-                }
-                Task::none()
-            }
-            Message::SidebarDragEnd => {
-                if self.sidebar_drag {
-                    self.sidebar_drag = false;
-                    let width = self.sidebar_width;
-                    persist_setting(|s| s.sidebar_width = width);
-                }
+            Message::ToggleSidebar => {
+                self.sidebar_open = !self.sidebar_open;
+                persist_setting(|s| s.sidebar_open = self.sidebar_open);
                 Task::none()
             }
             Message::MouseMoved(pos) => {
@@ -2717,9 +2707,10 @@ impl cosmic::Application for VaultNotes {
             }
             Message::MousePressed => {
                 // Arm a possible tree drag at the cursor. Only when the
-                // tree is actually on screen: other panels have no rows
-                // and stale bounds would misidentify sources.
-                if self.vault.is_none() || self.panel != SidePanel::Files {
+                // tree is actually on screen: other panels have no rows,
+                // a collapsed sidebar hides the tree, and stale bounds
+                // would misidentify sources.
+                if self.vault.is_none() || self.panel != SidePanel::Files || !self.sidebar_open {
                     return Task::none();
                 }
                 let Some(pos) = self.last_cursor else {
@@ -3086,11 +3077,6 @@ impl cosmic::Application for VaultNotes {
                 self.theme = choice;
                 persist_setting(|s| s.theme = choice);
                 theme_task(choice)
-            }
-            Message::SettingsSidebarSolid(on) => {
-                self.sidebar_solid = on;
-                persist_setting(|s| s.sidebar_solid = on);
-                Task::none()
             }
             Message::SettingsDefaultPane(mode) => {
                 self.default_pane = mode;
@@ -3522,23 +3508,6 @@ impl cosmic::Application for VaultNotes {
                     cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonReleased(
                         cosmic::iced::mouse::Button::Left,
                     )) => Some(Message::MouseReleased),
-                    _ => None,
-                },
-            ));
-        }
-        if self.sidebar_drag {
-            // While dragging the sidebar handle, track the cursor
-            // globally: mouse_area events stop once the pointer leaves
-            // the handle's few pixels, but the drag must continue and end
-            // (left button released) anywhere in the window.
-            subs.push(cosmic::iced::event::listen_with(
-                |event, _status, _window| match event {
-                    cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::CursorMoved {
-                        position,
-                    }) => Some(Message::SidebarDrag(position.x)),
-                    cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonReleased(
-                        cosmic::iced::mouse::Button::Left,
-                    )) => Some(Message::SidebarDragEnd),
                     _ => None,
                 },
             ));
@@ -4510,9 +4479,7 @@ mod find_tests {
             word_wrap: true,
             editor_font_mono: true,
             editor_font_size: 14,
-            sidebar_solid: false,
-            sidebar_width: 250.0,
-            sidebar_drag: false,
+            sidebar_open: true,
             tree_drag: None,
             last_cursor: None,
             tree_bounds: crate::drag::TreeBounds::default(),
@@ -5515,47 +5482,75 @@ mod link_update_tests {
 }
 
 #[cfg(test)]
-mod sidebar_resize_tests {
+mod sidebar_collapse_tests {
     use super::*;
     use cosmic::app::Application as _;
 
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> cosmic::iced::Rectangle {
+        cosmic::iced::Rectangle {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
     #[test]
-    fn drag_updates_width_clamped_and_persists_on_release() {
+    fn toggling_the_sidebar_flips_state_and_persists() {
         let mut app = find_tests::test_app_with_tab("");
-        let _ = app.update(Message::SidebarDragStart);
-        assert!(app.sidebar_drag);
-        // Clamped to the usable range.
-        let _ = app.update(Message::SidebarDrag(30.0));
-        assert_eq!(app.sidebar_width, settings::SIDEBAR_MIN_WIDTH);
-        let _ = app.update(Message::SidebarDrag(10_000.0));
-        assert_eq!(app.sidebar_width, settings::SIDEBAR_MAX_WIDTH);
-        let _ = app.update(Message::SidebarDrag(300.0));
-        assert_eq!(app.sidebar_width, 300.0);
-        // Release persists the width.
-        let _ = app.update(Message::SidebarDragEnd);
-        assert!(!app.sidebar_drag);
-        assert_eq!(crate::settings::load().sidebar_width, 300.0);
+        assert!(app.sidebar_open, "starts open");
+        let _ = app.update(Message::ToggleSidebar);
+        assert!(!app.sidebar_open);
+        assert!(!crate::settings::load().sidebar_open, "persisted closed");
+        let _ = app.update(Message::ToggleSidebar);
+        assert!(app.sidebar_open);
+        assert!(crate::settings::load().sidebar_open, "persisted open");
         // Leave the developer's settings file as it was.
-        persist_setting(|s| s.sidebar_width = settings::AppSettings::default().sidebar_width);
+        persist_setting(|s| s.sidebar_open = true);
     }
 
     #[test]
-    fn drag_messages_outside_a_drag_are_ignored() {
+    fn the_view_builds_with_the_sidebar_open_and_closed() {
         let mut app = find_tests::test_app_with_tab("");
-        let _ = app.update(Message::SidebarDrag(50.0));
-        assert_eq!(app.sidebar_width, 250.0);
-        assert!(!app.sidebar_drag);
-        // End without start: nothing happens.
-        let _ = app.update(Message::SidebarDragEnd);
-        assert!(!app.sidebar_drag);
+        let _ = crate::view::view(&app);
+        app.sidebar_open = false;
+        let _ = crate::view::view(&app);
     }
 
     #[test]
-    fn the_view_builds_with_the_handle_idle_and_dragging() {
+    fn a_press_does_not_arm_a_drag_while_the_sidebar_is_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.md"), "").unwrap();
         let mut app = find_tests::test_app_with_tab("");
-        let _ = crate::view::view(&app);
-        app.sidebar_drag = true;
-        let _ = crate::view::view(&app);
+        app.vault = Some(Vault::open(tmp.path()).unwrap());
+        app.rebuild_index();
+        // Bounds left over from before the sidebar was collapsed: a
+        // click inside the old tree area must arm nothing, or a release
+        // over a stale target could move files invisibly.
+        app.tree_bounds = crate::drag::TreeBounds {
+            rows: vec![("a.md".into(), false, rect(0.0, 0.0, 200.0, 24.0))],
+            area: Some(rect(0.0, 0.0, 200.0, 300.0)),
+        };
+        app.sidebar_open = false;
+        app.last_cursor = Some(cosmic::iced::Point::new(10.0, 10.0));
+        let _ = app.update(Message::MousePressed);
+        let _ = app.update(Message::MouseMoved(cosmic::iced::Point::new(10.0, 300.0)));
+        let _ = app.update(Message::MouseReleased);
+        assert!(tmp.path().join("a.md").exists(), "nothing moved");
+        assert!(app.tree_drag.is_none(), "never armed");
+    }
+
+    #[test]
+    fn bounds_are_not_measured_while_the_sidebar_is_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.md"), "").unwrap();
+        let mut app = find_tests::test_app_with_tab("");
+        app.vault = Some(Vault::open(tmp.path()).unwrap());
+        app.rebuild_index();
+        app.panel = SidePanel::Files;
+        app.sidebar_open = false;
+        let _ = app.measure_tree_bounds_if_needed();
+        assert!(!app.bounds_pending, "no measure while the tree is hidden");
     }
 }
 

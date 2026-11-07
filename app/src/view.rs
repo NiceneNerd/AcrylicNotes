@@ -8,7 +8,7 @@ use cosmic::iced::core::widget::Id;
 use cosmic::iced::widget::{opaque, stack, text_editor};
 use cosmic::iced::{alignment, border, Background, Length, Padding};
 use cosmic::widget::{
-    button, column, container, context_menu, icon, menu, mouse_area, nav_bar, row, scrollable,
+    button, column, container, context_menu, icon, menu, nav_bar, row, scrollable,
     segmented_button, settings, tab_bar, text, text_input, toggler,
 };
 use cosmic::Element;
@@ -16,7 +16,8 @@ use cosmic::Element;
 use crate::app::{
     editor_shortcut, find_matches, parent_of, title_of, tree_note_label, unicode_char,
     unicode_entry_binding, LinkPathFormat, Message, Palette, PaneMode, SidePanel, TreeMenuAction,
-    VaultNotes, ATTACHMENT_INPUT, EDITOR_INPUT, FIND_INPUT, SWITCHER_INPUT, TREE_EDIT_INPUT,
+    VaultNotes, ATTACHMENT_INPUT, EDITOR_INPUT, FIND_INPUT, SIDEBAR_OPACITY, SWITCHER_INPUT,
+    TREE_EDIT_INPUT,
 };
 use crate::reading;
 use crate::scroll::READING_SCROLL;
@@ -44,6 +45,18 @@ pub fn header_start(app: &VaultNotes) -> Vec<Element<'_, Message>> {
         return Vec::new();
     }
     vec![
+        // Sidebar visibility toggle, far left like COSMIC's own apps.
+        // The icon mirrors libcosmic's nav_bar_toggle: it shows the
+        // current state (sidebar open -> open-navbar icon), and the
+        // button reads selected while the sidebar is visible.
+        button::icon(icon::from_name(if app.sidebar_open {
+            "navbar-open-symbolic"
+        } else {
+            "navbar-closed-symbolic"
+        }))
+        .selected(app.sidebar_open)
+        .on_press(Message::ToggleSidebar)
+        .into(),
         button::icon(icon::from_name("document-save-symbolic"))
             .on_press(Message::Save)
             .into(),
@@ -138,35 +151,10 @@ fn main_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
         .height(Length::Fill);
     col = col.push(
         row::Row::new()
-            .push(sidebar(app, palette))
-            .push(sidebar_handle(app, palette))
+            .push_maybe(app.sidebar_open.then(|| sidebar(app, palette)))
             .push(note),
     );
     col.into()
-}
-
-/// The sidebar's drag handle: a slim strip between the sidebar and the
-/// note area. Press starts a global drag (the subscription tracks the
-/// cursor anywhere in the window), release persists the width. The strip
-/// is faintly visible so the affordance can be found; it brightens while
-/// a drag is active.
-fn sidebar_handle<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
-    let tint = if app.sidebar_drag {
-        with_alpha(palette.accent, 0.55)
-    } else {
-        with_alpha(palette.muted, 0.25)
-    };
-    mouse_area(
-        container(column::Column::new())
-            .width(Length::Fixed(6.0))
-            .height(Length::Fill)
-            .style(move |_| cosmic::widget::container::Style {
-                background: Some(Background::Color(tint)),
-                ..Default::default()
-            }),
-    )
-    .on_press(Message::SidebarDragStart)
-    .into()
 }
 
 /// Non-blocking external-change banner (M4 decision 7). Two sections:
@@ -272,6 +260,12 @@ fn link_updates_view<'a>(
 /// The nav bar's own solid background is cleared so the whole sidebar reads
 /// as one surface (the nav bar's default style paints `primary.base`, which
 /// split the sidebar into a solid strip over a translucent body).
+/// The sidebar as a floating COSMIC panel: padded away from the window
+/// edges and the note area, nearly opaque (a hint of the frosted backdrop
+/// still reads through), with corners that follow the user's COSMIC
+/// rounding setting (`radius_s`), so the panel goes square automatically
+/// under the Sharp preference. Width is fixed; the panel is shown or
+/// hidden whole via the titlebar toggle.
 fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
     let mut col = column::Column::new().spacing(0).width(Length::Fill);
     col = col.push(
@@ -300,28 +294,37 @@ fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
             .width(Length::Fill)
             .height(Length::Fill),
     );
-    container(col)
-        .width(Length::Fixed(app.sidebar_width))
+    // The styled panel: the background paints over the container's own
+    // padding, so the floating margins must live on an outer transparent
+    // container. The shell already insets the whole content row by its
+    // border padding, hence no left margin here.
+    let panel = container(col)
+        .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_| {
-            // Default: translucent, so the compositor's frosted-window blur
-            // shows through (COSMIC transparency setting). "Solid sidebar"
-            // paints the theme surface instead.
-            let background = if app.sidebar_solid {
-                Some(Background::Color(cosmic::iced::Color::from(
-                    cosmic::theme::active()
-                        .cosmic()
-                        .background(palette.is_dark)
-                        .base,
-                )))
-            } else {
-                None
-            };
+            // `active()` clones the theme, so bind it before borrowing
+            // the cosmic palette out of it.
+            let theme = cosmic::theme::active();
+            let cosmic = theme.cosmic();
             cosmic::widget::container::Style {
-                background,
+                // Almost opaque: the theme's opaque background base drawn
+                // back a touch, so the frosted backdrop still whispers.
+                background: Some(Background::Color(with_alpha(
+                    cosmic::iced::Color::from(cosmic.background(false).base),
+                    SIDEBAR_OPACITY,
+                ))),
+                border: border::Border {
+                    radius: cosmic.radius_s().into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             }
-        })
+        });
+    let gap = f32::from(cosmic::theme::spacing().space_xxs);
+    container(panel)
+        .width(Length::Fixed(crate::app::SIDEBAR_WIDTH))
+        .height(Length::Fill)
+        .padding([gap, gap, gap, 0.0])
         .into()
 }
 
@@ -1256,11 +1259,6 @@ pub fn settings_view<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
                     ),
                 ],
             ),
-        ))
-        .add(toggle(
-            "Solid sidebar",
-            app.sidebar_solid,
-            Message::SettingsSidebarSolid(!app.sidebar_solid),
         ))
         .add(settings::item(
             "Default layout",
