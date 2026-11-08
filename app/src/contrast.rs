@@ -14,15 +14,17 @@
 
 use cosmic::iced::Color;
 
-/// Minimum WCAG 2.x contrast ratio for the editor's body text. 7:1 is
-/// the "enhanced readability" tier: default themes sit between ~11:1 and
-/// ~20:1, so this only lifts themes whose text color is genuinely dim.
-pub const EDITOR_TEXT_MIN_CONTRAST: f32 = 7.0;
+/// Minimum WCAG 2.x contrast ratio for the editor's body text. 10:1
+/// puts the editor on par with the reading pane (the theme's own
+/// text-on-background color measures ~9.7:1 there) while leaving room
+/// before pure white. Default themes sit between ~11:1 and ~20:1, so
+/// this only lifts themes whose text color is genuinely dim.
+pub const EDITOR_TEXT_MIN_CONTRAST: f32 = 10.0;
 
 /// Minimum contrast for the editor's placeholder and syntax-token
-/// colors (the standard AA bar for body text). Tokens keep their
-/// designed hue but never drop below readable.
-pub const EDITOR_SECONDARY_MIN_CONTRAST: f32 = 4.5;
+/// colors (a notch above the 4.5:1 AA bar for body text). Tokens keep
+/// their designed hue but never drop below readable.
+pub const EDITOR_SECONDARY_MIN_CONTRAST: f32 = 5.5;
 
 /// Drawing alpha of the editor's placeholder text (kept from the old
 /// hardcoded style; the contrast guarantee applies after compositing).
@@ -94,10 +96,11 @@ pub fn ensure_contrast(text: Color, surface: Color, alpha: f32, target: f32) -> 
     } else {
         Color::BLACK
     };
-    // 0.25 per step reaches the endpoint in ~36 steps; the cap is a
-    // backstop, and `passes` breaks early once the bar is met.
-    for _ in 0..48 {
-        rgb = blend_toward(rgb, endpoint, 0.25);
+    // 0.1 per step keeps the guarantee tight: the color that comes out
+    // lands within a few percent of the bar rather than a whole step
+    // below it. 0.9^80 is ~0.0002, so the cap reaches the endpoint.
+    for _ in 0..80 {
+        rgb = blend_toward(rgb, endpoint, 0.1);
         if passes(rgb) {
             break;
         }
@@ -207,7 +210,14 @@ mod tests {
         );
         let fixed = ensure_contrast(text, surface, 1.0, EDITOR_TEXT_MIN_CONTRAST);
         assert_eq!(fixed.a, 1.0, "body text is opaque");
-        assert!(contrast_ratio(fixed, surface) >= EDITOR_TEXT_MIN_CONTRAST);
+        let ratio = contrast_ratio(fixed, surface);
+        assert!(ratio >= EDITOR_TEXT_MIN_CONTRAST);
+        // The guarantee is tight: the blend lands just above the bar,
+        // not a whole step below it.
+        assert!(
+            ratio < EDITOR_TEXT_MIN_CONTRAST * 1.15,
+            "landed at {ratio:.2}, too far above the bar"
+        );
         // The lift lands on a tinted color, not a stark white.
         assert!(fixed.r < 1.0 && fixed.b < 1.0);
     }

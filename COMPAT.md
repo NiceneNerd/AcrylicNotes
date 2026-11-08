@@ -699,8 +699,11 @@ All chord changes below supersede the M4c follow-up section above.
   — whichever side has more headroom — until the bar is met, preserving
   the theme's hue. Colors that already pass are returned unchanged, so
   default themes render exactly as before.
-- Bars: body text 7:1 (the enhanced-readability tier; a dim theme lifts
-  from 2.7:1 to ~8.6:1), placeholder 4.5:1 measured after compositing
-  its 0.7 alpha, and syntax-token colors 4.5:1 via the highlighter's
-  `to_format` callback (dim comments/headings lifted, strong accents
-  untouched). Body text is forced opaque.
+- Bars: body text 10:1 (the reading pane's own text-on-background color
+  measures ~9.7:1 there, so the editor now sits on par with it; a dim
+  theme lifts from 2.7:1 to ~10.1:1), placeholder 5.5:1 measured after
+  compositing its 0.7 alpha, and syntax-token colors 5.5:1 via the
+  highlighter's `to_format` callback (dim comments/headings lifted,
+  strong accents untouched). Body text is forced opaque. The blend
+  steps in 0.1 increments, so the bar is tight: the color that comes
+  out lands within a few percent above it rather than a step below.
