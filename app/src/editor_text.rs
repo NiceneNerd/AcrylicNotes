@@ -1,5 +1,5 @@
-//! Editor text contrast: the editor's colors must stay readable on any
-//! COSMIC theme, including custom palettes that ship dim text colors.
+//! Editor text presentation: contrast-guaranteed colors and
+//! font-consistent highlighting, on any COSMIC theme and font choice.
 //!
 //! The editor's body text is the theme palette's `neutral_9`. The default
 //! palettes make that near-black (light mode) or near-white (dark mode),
@@ -11,8 +11,18 @@
 //! fail are blended toward white or black — whichever side of the
 //! surface has more contrast headroom — until they pass, preserving the
 //! theme's hue while guaranteeing the ratio.
+//!
+//! The same treatment applies to fonts: iced's syntect `Highlight`
+//! hardcodes its base family to `Monospace`, so a highlighted italic
+//! stretch renders monospaced even when the editor's font is the system
+//! UI font (or a custom one). [`editor_highlight_format`] re-roots each
+//! span on the editor's actual font, keeping only the weight/style the
+//! syntax theme asked for.
 
+use cosmic::iced::core::font::{Family, Style, Weight};
 use cosmic::iced::Color;
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex, RwLock};
 
 /// Minimum WCAG 2.x contrast ratio for the editor's body text. 10:1
 /// puts the editor on par with the reading pane (the theme's own
@@ -162,10 +172,82 @@ pub fn editor_placeholder_color(theme: &cosmic::Theme) -> Color {
     )
 }
 
+/// The editor's font: the custom family when one is set (it wins over
+/// the monospace toggle), else the monospace/system choice the toggle
+/// makes. An unknown family name falls back to the default font at
+/// render time, so a typo degrades instead of breaking.
+pub fn editor_font(mono: bool, custom_family: &str) -> cosmic::iced::Font {
+    let family = custom_family.trim();
+    if family.is_empty() {
+        return if mono {
+            cosmic::font::mono()
+        } else {
+            cosmic::font::default()
+        };
+    }
+    cosmic::iced::Font {
+        family: Family::Name(intern_family(family)),
+        ..cosmic::iced::Font::DEFAULT
+    }
+}
+
+/// `Family::Name` holds a `&'static str`, so a family typed at runtime
+/// is interned once and leaked; libcosmic's own `FontConfig` conversion
+/// interns font names the same way. Typing in the settings field leaks
+/// one short string per distinct prefix — bounded by keystrokes.
+fn intern_family(family: &str) -> &'static str {
+    static FAMILY_MAP: LazyLock<RwLock<HashSet<&'static str>>> = LazyLock::new(RwLock::default);
+    let mut map = FAMILY_MAP.write().unwrap();
+    if let Some(name) = map.get(family).copied() {
+        return name;
+    }
+    let leaked: &'static str = Box::leak(family.to_owned().into_boxed_str());
+    map.insert(leaked);
+    leaked
+}
+
+/// The font family the editor's highlighted spans must use. iced's
+/// `to_format` callback is a plain fn pointer with no channel for app
+/// state, so the editor's resolved font is parked here on each view
+/// build and read per highlighted span at render time.
+static EDITOR_BASE_FONT: Mutex<cosmic::iced::Font> = Mutex::new(cosmic::iced::Font::MONOSPACE);
+
+/// Park the editor's current font for `editor_highlight_format` to read.
+pub fn set_editor_base_font(font: cosmic::iced::Font) {
+    *EDITOR_BASE_FONT.lock().unwrap() = font;
+}
+
+fn editor_base_font() -> cosmic::iced::Font {
+    *EDITOR_BASE_FONT.lock().unwrap()
+}
+
+/// The font for one highlighted span: the syntax theme may ask for
+/// bold/italic, but iced's `Highlight::font()` hardcodes the base
+/// family to `Monospace` — keep its weight and style, swap in the
+/// editor's actual font. A span that asks for only italics must not
+/// clobber the base font's weight (and vice versa).
+pub fn span_font(span: cosmic::iced::Font, base: cosmic::iced::Font) -> cosmic::iced::Font {
+    cosmic::iced::Font {
+        family: base.family,
+        stretch: base.stretch,
+        weight: if span.weight == Weight::Bold {
+            span.weight
+        } else {
+            base.weight
+        },
+        style: if span.style == Style::Italic {
+            span.style
+        } else {
+            base.style
+        },
+    }
+}
+
 /// The `to_format` callback for the editor's highlighter: every token
 /// color the syntax theme emits is contrast-checked against the editor
 /// surface, so dim tokens (comments, headings on custom themes) are
-/// lifted to the AA bar while strong ones pass through untouched.
+/// lifted to the AA bar while strong ones pass through untouched. Each
+/// span is also re-rooted on the editor's actual font (see `span_font`).
 pub fn editor_highlight_format(
     highlight: &cosmic::iced::highlighter::Highlight,
     theme: &cosmic::Theme,
@@ -178,6 +260,9 @@ pub fn editor_highlight_format(
             1.0,
             EDITOR_SECONDARY_MIN_CONTRAST,
         ));
+    }
+    if let Some(span) = format.font {
+        format.font = Some(span_font(span, editor_base_font()));
     }
     format
 }
@@ -285,5 +370,65 @@ mod tests {
                 >= EDITOR_SECONDARY_MIN_CONTRAST,
             "placeholder"
         );
+    }
+
+    #[test]
+    fn highlighted_spans_use_the_editor_font_not_monospace() {
+        // iced's syntect Highlight hardcodes its base family to
+        // Monospace; a span must re-root on the editor's font while
+        // keeping what the syntax theme asked for.
+        let base = cosmic::iced::Font::with_name("DejaVu Sans");
+        let span = cosmic::iced::Font {
+            style: cosmic::iced::core::font::Style::Italic,
+            ..cosmic::iced::Font::MONOSPACE
+        };
+        let fixed = span_font(span, base);
+        assert_eq!(
+            fixed.family, base.family,
+            "span re-rooted on the editor font"
+        );
+        assert_eq!(
+            fixed.style,
+            cosmic::iced::core::font::Style::Italic,
+            "italics survive"
+        );
+        assert_eq!(
+            fixed.weight, base.weight,
+            "an italic-only span keeps the base weight"
+        );
+
+        let bold = cosmic::iced::Font {
+            weight: cosmic::iced::core::font::Weight::Bold,
+            ..cosmic::iced::Font::MONOSPACE
+        };
+        let fixed = span_font(bold, base);
+        assert_eq!(
+            fixed.weight,
+            cosmic::iced::core::font::Weight::Bold,
+            "bold survives"
+        );
+        assert_eq!(
+            fixed.style, base.style,
+            "a bold-only span keeps the base style"
+        );
+    }
+
+    #[test]
+    fn the_editor_font_follows_the_settings() {
+        // No custom family: the monospace toggle decides.
+        let mono = editor_font(true, "");
+        assert_eq!(mono.family, cosmic::font::mono().family);
+        let ui = editor_font(false, "  ");
+        assert_eq!(ui.family, cosmic::font::default().family);
+        // A custom family wins over the toggle (and surrounding spaces
+        // are trimmed).
+        let custom = editor_font(true, " Fira Code ");
+        assert_eq!(
+            custom.family,
+            cosmic::iced::core::font::Family::Name("Fira Code")
+        );
+        // Interning is stable: the same name resolves to the same
+        // leaked static on repeated calls.
+        assert_eq!(editor_font(false, "Fira Code").family, custom.family);
     }
 }

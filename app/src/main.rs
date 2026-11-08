@@ -6,8 +6,8 @@
 //! in M4c through `vault-glass`.
 
 mod app;
-mod contrast;
 mod drag;
+mod editor_text;
 mod fuzzy;
 mod glass;
 mod reading;

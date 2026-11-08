@@ -48,9 +48,14 @@ pub struct AppSettings {
     /// Soft-wrap long lines in the editor.
     #[serde(default = "default_true")]
     pub word_wrap: bool,
-    /// Edit in the monospace font (off = the system UI font).
+    /// Edit in the monospace font (off = the system UI font). Ignored
+    /// when a custom editor font family is set.
     #[serde(default = "default_true")]
     pub editor_font_mono: bool,
+    /// Custom editor font family name; empty follows the monospace
+    /// toggle. An unknown name falls back to the default font.
+    #[serde(default)]
+    pub editor_font_family: String,
     /// Editor font size in pixels.
     #[serde(default = "default_editor_font_size")]
     pub editor_font_size: u16,
@@ -128,6 +133,7 @@ impl Default for AppSettings {
             wiki_autocomplete: true,
             word_wrap: true,
             editor_font_mono: true,
+            editor_font_family: String::new(),
             editor_font_size: default_editor_font_size(),
             sidebar_open: true,
             autosave_secs: default_autosave_secs(),
@@ -196,6 +202,7 @@ mod tests {
             wiki_autocomplete: true,
             word_wrap: false,
             editor_font_mono: true,
+            editor_font_family: "Fira Code".to_string(),
             editor_font_size: 18,
             sidebar_open: false,
             autosave_secs: 5,
@@ -232,6 +239,7 @@ mod tests {
         assert!(loaded.word_wrap);
         assert!(loaded.editor_font_mono);
         assert_eq!(loaded.editor_font_size, 14);
+        assert!(loaded.editor_font_family.is_empty(), "no custom font");
         // The sidebar starts open for files that predate the field.
         assert!(loaded.sidebar_open);
         assert_eq!(loaded.autosave_secs, 2);

@@ -707,3 +707,20 @@ All chord changes below supersede the M4c follow-up section above.
   strong accents untouched). Body text is forced opaque. The blend
   steps in 0.1 increments, so the bar is tight: the color that comes
   out lands within a few percent above it rather than a step below.
+
+### Editor font: consistent spans and a custom family
+
+- Highlighted stretches no longer force monospace: iced's syntect
+  `Highlight` hardcodes its base family to `Monospace`, so italics/bold
+  spans rendered monospaced even with the editor font set to the system
+  UI font. Each span is now re-rooted on the editor's actual font,
+  keeping only the weight/style the syntax theme asked for (an
+  italic-only span no longer clobbers the base weight, and vice versa).
+  The resolved font is parked in a static on each view build — iced's
+  `to_format` is a plain fn pointer with no channel for app state.
+- The settings drawer's Editor section gains a "Custom font" text
+  input: a family name typed there wins over the monospace toggle
+  (live, persisted per keystroke, blank = toggle behavior). `Family`
+  names are `&'static str`, so typed names are interned and leaked once
+  — the same trick libcosmic's own `FontConfig` conversion uses. An
+  uninstalled name falls back to the default font at render time.

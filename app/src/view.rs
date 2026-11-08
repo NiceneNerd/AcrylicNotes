@@ -16,10 +16,13 @@ use cosmic::Element;
 use crate::app::{
     editor_shortcut, find_matches, parent_of, title_of, tree_note_label, unicode_char,
     unicode_entry_binding, LinkPathFormat, Message, Palette, PaneMode, SidePanel, TreeMenuAction,
-    VaultNotes, ATTACHMENT_INPUT, EDITOR_INPUT, FIND_INPUT, SIDEBAR_OPACITY, SWITCHER_INPUT,
-    TREE_EDIT_INPUT,
+    VaultNotes, ATTACHMENT_INPUT, EDITOR_FONT_INPUT, EDITOR_INPUT, FIND_INPUT, SIDEBAR_OPACITY,
+    SWITCHER_INPUT, TREE_EDIT_INPUT,
 };
-use crate::contrast::{editor_highlight_format, editor_placeholder_color, editor_value_color};
+use crate::editor_text::{
+    editor_font, editor_highlight_format, editor_placeholder_color, editor_value_color,
+    set_editor_base_font,
+};
 use crate::reading;
 use crate::scroll::READING_SCROLL;
 use crate::tree::TreeNode;
@@ -953,6 +956,12 @@ fn editor_pane<'a>(
     palette: Palette,
     wiki: Option<&'a crate::app::WikiComplete>,
 ) -> Element<'a, Message> {
+    // The editor's font: custom family if set, else the monospace
+    // toggle's choice. It is parked for the highlighter so highlighted
+    // spans (italics, bold) share it instead of iced's hardcoded
+    // Monospace base.
+    let base_font = editor_font(app.editor_font_mono, &app.editor_font_family);
+    set_editor_base_font(base_font);
     // Syntect Markdown grammar via iced's highlighter (M4 decision 3);
     // theme follows the system light/dark preference.
     let highlighter_theme = if palette.is_dark {
@@ -967,11 +976,7 @@ fn editor_pane<'a>(
         // Inset the text from the editor's border.
         .padding(8)
         // Font family, size, and wrapping are user preferences (Phase G).
-        .font(if app.editor_font_mono {
-            cosmic::font::mono()
-        } else {
-            cosmic::font::default()
-        })
+        .font(base_font)
         .size(f32::from(app.editor_font_size))
         .wrapping(if app.word_wrap {
             cosmic::iced::core::text::Wrapping::Word
@@ -1234,6 +1239,20 @@ pub fn settings_view<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
             app.editor_font_mono,
             Message::SettingsFontMono(!app.editor_font_mono),
         ))
+        .add(settings::item(
+            "Custom font",
+            text_input("e.g. Fira Code", &app.editor_font_family)
+                .id(Id::new(EDITOR_FONT_INPUT))
+                .on_input(Message::SettingsEditorFontFamily)
+                .width(Length::Fixed(160.0)),
+        ))
+        .add(
+            text(
+                "Overrides the monospace toggle while set; an \
+                    uninstalled name falls back to the default font.",
+            )
+            .size(12),
+        )
         .add(stepper(
             "Font size",
             format!("{} px", app.editor_font_size),

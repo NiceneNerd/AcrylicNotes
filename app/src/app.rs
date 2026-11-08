@@ -381,6 +381,9 @@ pub enum Message {
     SettingsWikiComplete(bool),
     SettingsWordWrap(bool),
     SettingsFontMono(bool),
+    /// Set the custom editor font family (live from the settings
+    /// input; empty follows the monospace toggle).
+    SettingsEditorFontFamily(String),
     /// Nudge the editor font size (clamped).
     SettingsFontSize(i32),
     // --- link updates after rename/move ---
@@ -506,8 +509,12 @@ pub struct VaultNotes {
     pub wiki_autocomplete: bool,
     /// Soft-wrap long lines in the editor.
     pub word_wrap: bool,
-    /// Edit in the monospace font (off = the system UI font).
+    /// Edit in the monospace font (off = the system UI font). Ignored
+    /// when `editor_font_family` is set.
     pub editor_font_mono: bool,
+    /// Custom editor font family name; empty follows the monospace
+    /// toggle.
+    pub editor_font_family: String,
     /// Editor font size in pixels.
     pub editor_font_size: u16,
     /// Whether the sidebar (file tree and other panels) is shown;
@@ -567,6 +574,9 @@ pub const SIDEBAR_OPACITY: f32 = 0.9;
 
 /// Id of the settings drawer's file-extension input.
 pub const ATTACHMENT_INPUT: &str = "attachment-ext-input";
+
+/// Id of the settings drawer's custom editor-font input.
+pub const EDITOR_FONT_INPUT: &str = "editor-font-input";
 
 /// Id of the note editor itself. A *custom* id makes iced persist the
 /// editor's widget state (its focus) in the UI cache and restore it by
@@ -2562,6 +2572,7 @@ impl cosmic::Application for VaultNotes {
             wiki_autocomplete: persisted.wiki_autocomplete,
             word_wrap: persisted.word_wrap,
             editor_font_mono: persisted.editor_font_mono,
+            editor_font_family: persisted.editor_font_family.clone(),
             editor_font_size: persisted.editor_font_size,
             sidebar_open: persisted.sidebar_open,
             tree_drag: None,
@@ -3065,6 +3076,11 @@ impl cosmic::Application for VaultNotes {
             Message::SettingsFontMono(on) => {
                 self.editor_font_mono = on;
                 persist_setting(|s| s.editor_font_mono = on);
+                Task::none()
+            }
+            Message::SettingsEditorFontFamily(family) => {
+                self.editor_font_family = family;
+                persist_setting(|s| s.editor_font_family = self.editor_font_family.clone());
                 Task::none()
             }
             Message::SettingsFontSize(delta) => {
@@ -4478,6 +4494,7 @@ mod find_tests {
             wiki_autocomplete: true,
             word_wrap: true,
             editor_font_mono: true,
+            editor_font_family: String::new(),
             editor_font_size: 14,
             sidebar_open: true,
             tree_drag: None,
@@ -5551,6 +5568,24 @@ mod sidebar_collapse_tests {
         app.sidebar_open = false;
         let _ = app.measure_tree_bounds_if_needed();
         assert!(!app.bounds_pending, "no measure while the tree is hidden");
+    }
+}
+
+#[cfg(test)]
+mod editor_font_tests {
+    use super::*;
+    use cosmic::app::Application as _;
+
+    #[test]
+    fn the_custom_font_family_persists_from_the_settings_input() {
+        let mut app = find_tests::test_app_with_tab("");
+        let _ = app.update(Message::SettingsEditorFontFamily("Fira Code".into()));
+        assert_eq!(app.editor_font_family, "Fira Code");
+        assert_eq!(crate::settings::load().editor_font_family, "Fira Code");
+        // Clearing it returns to the monospace toggle's behavior.
+        let _ = app.update(Message::SettingsEditorFontFamily(String::new()));
+        assert!(app.editor_font_family.is_empty());
+        assert!(crate::settings::load().editor_font_family.is_empty());
     }
 }
 
