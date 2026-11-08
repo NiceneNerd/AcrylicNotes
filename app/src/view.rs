@@ -19,6 +19,7 @@ use crate::app::{
     VaultNotes, ATTACHMENT_INPUT, EDITOR_INPUT, FIND_INPUT, SIDEBAR_OPACITY, SWITCHER_INPUT,
     TREE_EDIT_INPUT,
 };
+use crate::contrast::{editor_highlight_format, editor_placeholder_color, editor_value_color};
 use crate::reading;
 use crate::scroll::READING_SCROLL;
 use crate::tree::TreeNode;
@@ -982,7 +983,10 @@ fn editor_pane<'a>(
                 theme: highlighter_theme,
                 token: "md".to_string(),
             },
-            |highlight, _theme| highlight.to_format(),
+            // Token colors are contrast-checked against the editor
+            // surface (see contrast.rs): dim syntax colors on custom
+            // themes are lifted to the AA bar, strong ones unchanged.
+            editor_highlight_format,
         )
         // Editor-scoped shortcuts: undo/redo, formatting, footnotes,
         // word delete. Anything else falls back to the editor's own
@@ -1017,7 +1021,10 @@ fn editor_pane<'a>(
             // bg_color, which hides the pane's translucent overlay (and
             // any compositor frosted-window blur behind it). Keep only
             // the border and text colors; the pane container's dark
-            // overlay is the visible editor surface.
+            // overlay is the visible editor surface. Text colors come
+            // from contrast.rs so they stay readable on any theme —
+            // including custom palettes whose `neutral_9` is a dim
+            // mid-gray (measured at 2.15:1 before the fix).
             let cosmic = theme.cosmic();
             let border_color = match status {
                 text_editor::Status::Focused { .. } => cosmic.accent.base,
@@ -1030,8 +1037,8 @@ fn editor_pane<'a>(
                     width: 1.0,
                     color: border_color.into(),
                 },
-                placeholder: with_alpha(cosmic.palette.neutral_9.into(), 0.7),
-                value: cosmic.palette.neutral_9.into(),
+                placeholder: editor_placeholder_color(theme),
+                value: editor_value_color(theme),
                 selection: cosmic.accent.base.into(),
             }
         });

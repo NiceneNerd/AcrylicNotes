@@ -685,3 +685,22 @@ All chord changes below supersede the M4c follow-up section above.
   and refuses no-ops, folder-into-itself and folder-into-descendant
   drops; releasing over the source row counts as a click. Attachments
   are not draggable.
+
+### Editor text contrast on any theme
+
+- The editor's colors are contrast-guaranteed rather than trusted from
+  the theme (app/src/contrast.rs). The body text is the theme palette's
+  `neutral_9`, which the default palettes make near-black/near-white —
+  but a custom palette can set it to a mid-gray: a user theme measured
+  at 2.15:1 WCAG against the editor surface, below every readability
+  bar. `ensure_contrast` checks each color against the effective editor
+  surface (the theme's opaque background base with the pane's dark
+  0.18 overlay composited on) and blends failures toward white or black
+  — whichever side has more headroom — until the bar is met, preserving
+  the theme's hue. Colors that already pass are returned unchanged, so
+  default themes render exactly as before.
+- Bars: body text 7:1 (the enhanced-readability tier; a dim theme lifts
+  from 2.7:1 to ~8.6:1), placeholder 4.5:1 measured after compositing
+  its 0.7 alpha, and syntax-token colors 4.5:1 via the highlighter's
+  `to_format` callback (dim comments/headings lifted, strong accents
+  untouched). Body text is forced opaque.
