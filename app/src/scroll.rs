@@ -25,6 +25,9 @@ use cosmic::Action;
 /// Id of the reading pane's scrollable.
 pub const READING_SCROLL: &str = "reading-scroll";
 
+/// Id of the live preview pane's scrollable (R3 scroll-into-view).
+pub const LIVE_SCROLL: &str = "live-scroll";
+
 /// The Id for top-level block `index` in the reading view.
 pub fn block_id(index: usize) -> Id {
     Id::from(format!("block-{index}"))

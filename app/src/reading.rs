@@ -146,28 +146,9 @@ pub fn find_block_with_text(doc: &Doc, query: &str) -> Option<usize> {
 
 /// Render a whole document (frontmatter preview + blocks).
 pub fn render_doc<'a>(doc: &Doc, ctx: &Ctx<'a>) -> Element<'a, Message> {
-    let palette = ctx.palette;
     let mut col = column::Column::new().spacing(10).width(Length::Fill);
-    if let Some(frontmatter) = &doc.frontmatter_raw {
-        // Frontmatter is metadata, not prose: fold it like a callout so it
-        // can be tucked away while reading. It owns a fixed fold id (block
-        // fold ids count up from 0, so this never collides).
-        let open = !ctx.folds.contains(&FRONTMATTER_FOLD);
-        let chevron = if open { "▾ " } else { "▸ " };
-        let mut fm_col = column::Column::new().spacing(6);
-        fm_col = fm_col.push(
-            button::text(format!("{chevron}Frontmatter"))
-                .on_press(Message::ToggleFold(FRONTMATTER_FOLD)),
-        );
-        if open {
-            fm_col = fm_col.push(
-                text(frontmatter.trim_end().to_string())
-                    .font(cosmic::font::mono())
-                    .size(12.0)
-                    .class(ctx.palette.muted),
-            );
-        }
-        col = col.push(container(fm_col).style(move |_| code_block_style(&palette)));
+    if let Some(frontmatter) = render_frontmatter(doc, ctx) {
+        col = col.push(frontmatter);
     }
     // Callout fold ids are assigned sequentially during this render. The
     // traversal is deterministic, so ids are stable between renders; a single
@@ -184,6 +165,40 @@ pub fn render_doc<'a>(doc: &Doc, ctx: &Ctx<'a>) -> Element<'a, Message> {
     col.into()
 }
 
+/// The frontmatter block under `render_doc`: foldable, code-styled;
+/// metadata, not prose. `None` when the note has no frontmatter (no
+/// empty code box is rendered). The live preview's frontmatter region
+/// reuses this.
+pub(crate) fn render_frontmatter<'a>(doc: &Doc, ctx: &Ctx<'a>) -> Option<Element<'a, Message>> {
+    let frontmatter = doc.frontmatter_raw.as_ref()?;
+    let palette = ctx.palette;
+    let mut fm_col = column::Column::new().spacing(6);
+    {
+        // Frontmatter is metadata, not prose: fold it like a callout so it
+        // can be tucked away while reading. It owns a fixed fold id (block
+        // fold ids count up from 0, so this never collides).
+        let open = !ctx.folds.contains(&FRONTMATTER_FOLD);
+        let chevron = if open { "▾ " } else { "▸ " };
+        fm_col = fm_col.push(
+            button::text(format!("{chevron}Frontmatter"))
+                .on_press(Message::ToggleFold(FRONTMATTER_FOLD)),
+        );
+        if open {
+            fm_col = fm_col.push(
+                text(frontmatter.trim_end().to_string())
+                    .font(cosmic::font::mono())
+                    .size(12.0)
+                    .class(ctx.palette.muted),
+            );
+        }
+    }
+    Some(
+        container(fm_col)
+            .style(move |_| code_block_style(&palette))
+            .into(),
+    )
+}
+
 fn render_blocks<'a>(
     blocks: &[Block],
     ctx: &Ctx<'a>,
@@ -198,7 +213,10 @@ fn render_blocks<'a>(
     col.into()
 }
 
-fn render_block<'a>(
+/// Render one markdown block, any nesting level. The live preview calls
+/// this for each unfocused top-level block; `stack` guards embed cycles
+/// and `fold_id` assigns callout fold ids in traversal order.
+pub(crate) fn render_block<'a>(
     block: &Block,
     ctx: &Ctx<'a>,
     depth: usize,

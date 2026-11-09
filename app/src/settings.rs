@@ -100,7 +100,11 @@ pub enum LinkPathFormat {
 /// persists; app.rs re-exports it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaneMode {
+    /// Live preview: blocks render like the reading pane; the block
+    /// being edited is a raw-source text editor.
     #[default]
+    #[serde(rename = "live")]
+    Live,
     #[serde(rename = "split")]
     Split,
     #[serde(rename = "source")]
@@ -243,7 +247,9 @@ mod tests {
         // The sidebar starts open for files that predate the field.
         assert!(loaded.sidebar_open);
         assert_eq!(loaded.autosave_secs, 2);
-        assert_eq!(loaded.default_pane, PaneMode::Split);
+        // Live preview is the new default (PaneMode::Live has `#[default]`);
+        // files older than the field open into it.
+        assert_eq!(loaded.default_pane, PaneMode::Live);
 
         // A glass_enabled=false must survive the roundtrip.
         let path2 = tmp.path().join("settings2.json");
@@ -265,5 +271,25 @@ mod tests {
         std::fs::write(&path, r#"{"sidebar_width": 320.0, "sidebar_solid": true}"#).unwrap();
         let loaded = load_from(&path).unwrap();
         assert_eq!(loaded, AppSettings::default());
+    }
+
+    #[test]
+    fn pane_mode_serializes_as_lowercase_with_live_default() {
+        // The persisted names are the user-facing spokes of the default-pane
+        // choice; "live" joins them and old files' "split" keeps loading.
+        assert_eq!(serde_json::to_string(&PaneMode::Live).unwrap(), r#""live""#);
+        assert_eq!(
+            serde_json::to_string(&PaneMode::Split).unwrap(),
+            r#""split""#
+        );
+        assert_eq!(
+            serde_json::from_str::<PaneMode>(r#""split""#).unwrap(),
+            PaneMode::Split
+        );
+        assert_eq!(
+            serde_json::from_str::<PaneMode>(r#""reading""#).unwrap(),
+            PaneMode::Reading
+        );
+        assert_eq!(PaneMode::default(), PaneMode::Live);
     }
 }

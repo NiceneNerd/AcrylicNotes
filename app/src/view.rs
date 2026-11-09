@@ -850,6 +850,7 @@ fn note_area<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
         col = col.push(find_bar(app, palette));
     }
     let content: Element<'_, Message> = match app.pane {
+        PaneMode::Live => live_pane(app, tab, palette),
         PaneMode::Source => editor_pane(app, tab, palette, app.wiki_complete.as_ref()),
         PaneMode::Reading => reading_pane(app, tab, palette),
         PaneMode::Split => row::Row::new()
@@ -950,6 +951,33 @@ fn find_bar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
 
 // --- panes -----------------------------------------------------------------
 
+/// The text_editor surface style shared by the source editor and the
+/// live preview's focused block. Cosmic's default text_editor style
+/// paints an opaque bg_color, which hides the pane's translucent
+/// overlay (and any compositor frosted-window blur behind it). Keep
+/// only the border and text colors; the pane container's dark overlay
+/// is the visible editor surface. Text colors come from contrast.rs so
+/// they stay readable on any theme — including custom palettes whose
+/// `neutral_9` is a dim mid-gray (measured at 2.15:1 before the fix).
+fn editor_surface_style(theme: &cosmic::Theme, status: text_editor::Status) -> text_editor::Style {
+    let cosmic = theme.cosmic();
+    let border_color = match status {
+        text_editor::Status::Focused { .. } => cosmic.accent.base,
+        _ => cosmic.bg_divider(),
+    };
+    text_editor::Style {
+        background: Background::Color(cosmic::iced::Color::TRANSPARENT),
+        border: border::Border {
+            radius: cosmic.corner_radii.radius_0.into(),
+            width: 1.0,
+            color: border_color.into(),
+        },
+        placeholder: editor_placeholder_color(theme),
+        value: editor_value_color(theme),
+        selection: cosmic.accent.base.into(),
+    }
+}
+
 fn editor_pane<'a>(
     app: &'a VaultNotes,
     tab: &'a crate::app::Tab,
@@ -1021,32 +1049,7 @@ fn editor_pane<'a>(
                 None => text_editor::Binding::from_key_press(press),
             }
         })
-        .style(|theme: &cosmic::Theme, status: text_editor::Status| {
-            // Cosmic's default text_editor style paints an opaque
-            // bg_color, which hides the pane's translucent overlay (and
-            // any compositor frosted-window blur behind it). Keep only
-            // the border and text colors; the pane container's dark
-            // overlay is the visible editor surface. Text colors come
-            // from contrast.rs so they stay readable on any theme —
-            // including custom palettes whose `neutral_9` is a dim
-            // mid-gray (measured at 2.15:1 before the fix).
-            let cosmic = theme.cosmic();
-            let border_color = match status {
-                text_editor::Status::Focused { .. } => cosmic.accent.base,
-                _ => cosmic.bg_divider(),
-            };
-            text_editor::Style {
-                background: Background::Color(cosmic::iced::Color::TRANSPARENT),
-                border: border::Border {
-                    radius: cosmic.corner_radii.radius_0.into(),
-                    width: 1.0,
-                    color: border_color.into(),
-                },
-                placeholder: editor_placeholder_color(theme),
-                value: editor_value_color(theme),
-                selection: cosmic.accent.base.into(),
-            }
-        });
+        .style(editor_surface_style);
     let surface: Element<'a, Message> = container(editor)
         .padding(12)
         .width(Length::Fill)
@@ -1162,6 +1165,197 @@ fn reading_pane<'a>(
     .height(Length::Fill)
     .padding(16)
     .into()
+}
+
+/// Live preview (`Live` pane mode): the note renders like the reading
+/// pane — the same renderer, the same callouts, folds and embeds —
+/// except the block being edited, which is a raw-source text editor
+/// over that block's source. Click a block to edit it; Escape commits
+/// it back to the render.
+fn live_pane<'a>(
+    app: &'a VaultNotes,
+    tab: &'a crate::app::Tab,
+    palette: Palette,
+) -> Element<'a, Message> {
+    let Some(vault) = app.vault.as_ref() else {
+        return container(text("No vault open.")).into();
+    };
+    let ctx = reading::Ctx {
+        vault,
+        index: &app.index,
+        from: tab.path.clone(),
+        strict_breaks: app.strict_breaks,
+        palette,
+        folds: &tab.folds,
+        images: &app.images,
+    };
+    let slices = crate::live::slices(&tab.content.text(), &tab.doc);
+    // Callout fold ids are assigned sequentially across the pass, matching
+    // render_doc's traversal, so they line up with folds taken on this pane
+    // (and stay unique between renders — blocks, callout bodies, embeds).
+    let mut fold_id = 0u64;
+    let mut col = column::Column::new().spacing(10).width(Length::Fill);
+    for (region, slice) in slices.iter().enumerate() {
+        col = col.push(live_region(
+            app,
+            tab,
+            &ctx,
+            palette,
+            slice,
+            region,
+            &mut fold_id,
+        ));
+    }
+    // The id anchors the R3 scroll-into-view work.
+    container(
+        scrollable::scrollable(col)
+            .id(Id::new(crate::scroll::LIVE_SCROLL))
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .padding(16)
+    .into()
+}
+
+/// One region of the live preview: either the focused block's raw
+/// editor, or the block rendered for clicking (the frontmatter and a
+/// blank note's body get their own standing regions).
+fn live_region<'a>(
+    app: &'a VaultNotes,
+    tab: &'a crate::app::Tab,
+    ctx: &reading::Ctx<'a>,
+    palette: Palette,
+    slice: &crate::live::BlockSlice,
+    region: usize,
+    fold_id: &mut u64,
+) -> cosmic::Element<'a, Message> {
+    if app.live.as_ref().is_some_and(|state| state.block == region) {
+        return focused_block_editor(app, palette);
+    }
+    if let Some(block) = slice.block.and_then(|b| tab.doc.blocks.get(b)) {
+        // The block list guards embed cycles (`stack`); the region's own
+        // source line mapping is `slice`, not the block's, because the
+        // buffer edits re-slice after every keystroke.
+        let rendered = reading::render_block(block, ctx, 0, &stack_from(ctx), fold_id);
+        return cosmic::iced::widget::mouse_area(rendered)
+            .on_press(Message::LiveFocus(region))
+            .into();
+    }
+    if tab.doc.frontmatter_raw.is_some() {
+        // The frontmatter region (first region whenever it exists).
+        let rendered =
+            reading::render_frontmatter(&tab.doc, ctx).expect("frontmatter exists per the doc");
+        return cosmic::iced::widget::mouse_area(rendered)
+            .on_press(Message::LiveFocus(region))
+            .into();
+    }
+    // A note with no markdown blocks: one body region, standing open
+    // (ensure_live_focus focuses it) or inviting a click.
+    let placeholder: cosmic::Element<'a, Message> =
+        if crate::live::content_end(&slice.source(&tab.content.text())) == (0, 0) {
+            container(text("Start writing…").class(palette.muted))
+                .width(Length::Fill)
+                .padding([12, 0])
+                .into()
+        } else {
+            container(text("").size(0))
+                .width(Length::Fill)
+                .height(Length::Shrink)
+                .into()
+        };
+    cosmic::iced::widget::mouse_area(placeholder)
+        .on_press(Message::LiveFocus(region))
+        .into()
+}
+
+/// The embed-cycle guard stack render_doc seeds: the note itself.
+fn stack_from<'a>(ctx: &reading::Ctx<'a>) -> Vec<String> {
+    vec![ctx.from.clone()]
+}
+
+/// The focused region's raw-source editor: one buffer, one keystroke
+/// from the note text (see `live_action`). `Shrink` height lets the
+/// buffer grow with its content while the surrounding blocks re-render.
+fn focused_block_editor<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+    let live = app
+        .live
+        .as_ref()
+        .expect("focused editor without live state");
+    let base_font = editor_font(app.editor_font_mono, &app.editor_font_family);
+    set_editor_base_font(base_font);
+    // Same highlighter and surface as the source editor (M4 decision 3);
+    // theme follows the system light/dark preference.
+    let highlighter_theme = if palette.is_dark {
+        cosmic::iced::highlighter::Theme::Base16Ocean
+    } else {
+        cosmic::iced::highlighter::Theme::InspiredGitHub
+    };
+    text_editor(&live.editor)
+        .id(Id::new(EDITOR_INPUT))
+        // The widget auto-fits: `min_bounds()` tracks the buffer.
+        .height(Length::Shrink)
+        .on_action(Message::EditorAction)
+        .padding(8)
+        .font(base_font)
+        .size(f32::from(app.editor_font_size))
+        .wrapping(if app.word_wrap {
+            cosmic::iced::core::text::Wrapping::Word
+        } else {
+            cosmic::iced::core::text::Wrapping::None
+        })
+        .highlight_with::<cosmic::iced::highlighter::Highlighter>(
+            cosmic::iced::highlighter::Settings {
+                theme: highlighter_theme,
+                token: "md".to_string(),
+            },
+            editor_highlight_format,
+        )
+        .key_binding(live_key_binding)
+        .style(editor_surface_style)
+        .into()
+}
+
+/// The live editor's key bindings: Escape commits the region (the
+/// default unfocus would strand the caret behind a silent render),
+/// undo/redo stay app-scoped since the whole note is the undo unit, and
+/// the four boundary keys — arrows, backspace, delete — are intercepted
+/// so `app.rs` can decide between a plain motion and crossing into a
+/// neighboring region. Everything else (typing, Enter, copy/paste,
+/// selection) falls back to the editor's own bindings.
+pub(crate) fn live_key_binding(
+    press: text_editor::KeyPress,
+) -> Option<text_editor::Binding<Message>> {
+    use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
+    if !matches!(press.status, text_editor::Status::Focused { .. }) {
+        return None;
+    }
+    let ctrl = press.modifiers.command();
+    let plain = press.modifiers == Modifiers::default();
+    match &press.key {
+        Key::Named(Named::Escape) => Some(text_editor::Binding::Custom(Message::LiveDismiss)),
+        Key::Character(c) if ctrl => {
+            let lower = c.to_lowercase();
+            match (lower.as_str(), press.modifiers.shift()) {
+                ("z", false) => Some(text_editor::Binding::Custom(Message::EditorUndo)),
+                ("z", true) => Some(text_editor::Binding::Custom(Message::EditorRedo)),
+                ("y", false) => Some(text_editor::Binding::Custom(Message::EditorRedo)),
+                _ => None,
+            }
+        }
+        Key::Named(Named::Backspace) if plain => {
+            Some(text_editor::Binding::Custom(Message::LiveBackspace))
+        }
+        Key::Named(Named::Delete) if plain => {
+            Some(text_editor::Binding::Custom(Message::LiveDelete))
+        }
+        Key::Named(Named::ArrowUp) if plain => Some(text_editor::Binding::Custom(Message::LiveUp)),
+        Key::Named(Named::ArrowDown) if plain => {
+            Some(text_editor::Binding::Custom(Message::LiveDown))
+        }
+        _ => text_editor::Binding::from_key_press(press),
+    }
 }
 
 /// Status bar under the note area: word/character counts for the active
@@ -1290,11 +1484,13 @@ pub fn settings_view<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
             "Default layout",
             choice(
                 match app.default_pane {
+                    PaneMode::Live => "Live",
                     PaneMode::Split => "Split",
                     PaneMode::Source => "Source",
                     PaneMode::Reading => "Reading",
                 },
                 &[
+                    ("Live", Message::SettingsDefaultPane(PaneMode::Live)),
                     ("Split", Message::SettingsDefaultPane(PaneMode::Split)),
                     ("Source", Message::SettingsDefaultPane(PaneMode::Source)),
                     ("Reading", Message::SettingsDefaultPane(PaneMode::Reading)),

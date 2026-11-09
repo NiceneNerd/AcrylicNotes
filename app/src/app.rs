@@ -21,6 +21,7 @@ use vault_core::vault::VaultError;
 use vault_core::{NoteSource, ObsidianSettings, Vault, VaultIndex};
 use vault_md::{parse_note, Doc};
 
+use crate::live;
 use crate::settings;
 use crate::tree::{self, TreeNode};
 
@@ -110,6 +111,16 @@ pub struct WikiComplete {
     /// Ranked note paths (the rows show titles, dimmed parents).
     pub items: Vec<String>,
     pub selected: usize,
+}
+
+/// The live preview's editing state (`Live` pane mode): one open block
+/// region and its raw-source buffer.
+pub struct LiveEdit {
+    /// Index into the note's `live::slices` table.
+    pub block: usize,
+    /// The region's source. The focused text editor renders exactly this
+    /// buffer; edits land here and are spliced back into the note text.
+    pub editor: Content<cosmic::Renderer>,
 }
 
 /// How many wikilink suggestions to show at once.
@@ -453,6 +464,18 @@ pub enum Message {
     TagSelected(String),
     /// Scroll the active tab's reading view to top-level block `idx`.
     JumpToBlock(usize),
+    // --- live preview (`Live` pane mode) ---
+    /// Open block region `idx` in the live preview for editing.
+    LiveFocus(usize),
+    /// An arrow key at a region boundary crossed into the neighbor.
+    LiveUp,
+    LiveDown,
+    /// Backspace at a region's start: delete the newline before it.
+    LiveBackspace,
+    /// Delete at a region's end: delete the newline after it.
+    LiveDelete,
+    /// Commit the open region and let the blocks render again (Escape).
+    LiveDismiss,
     SwitcherToggle,
     SwitcherInput(String),
     SwitcherMove(i32),
@@ -549,6 +572,8 @@ pub struct VaultNotes {
     pub find: Option<Find>,
     /// Wikilink suggestions for the `[[` being typed, when active.
     pub wiki_complete: Option<WikiComplete>,
+    /// The live preview's open editing region (`Live` pane mode), if any.
+    pub live: Option<LiveEdit>,
     /// The node path the open context menu belongs to (`None` when closed).
     pub tree_menu_target: Option<String>,
     // --- COSMIC chrome models ---
@@ -1184,9 +1209,10 @@ fn build_nav_model() -> nav_bar::Model {
 fn build_pane_model() -> segmented_button::Model<segmented_button::SingleSelect> {
     let mut model = segmented_button::Model::default();
     for (i, (mode, label)) in [
+        (PaneMode::Live, "Live"),
+        (PaneMode::Split, "Split"),
         (PaneMode::Source, "Source"),
         (PaneMode::Reading, "Reading"),
-        (PaneMode::Split, "Split"),
     ]
     .into_iter()
     .enumerate()
@@ -1411,10 +1437,16 @@ impl VaultNotes {
 
     fn open_tab(&mut self, path: String) -> Task<Message> {
         self.dismiss_editor_overlays();
+        let was = self.active;
         if let Some(i) = self.tabs.iter().position(|tab| tab.path == path) {
             self.active = Some(i);
+            if was != self.active {
+                // Live-editing state belongs to the previous tab's text.
+                self.live = None;
+            }
             self.sync_tab_model();
-            return self.sync_window_title();
+            let focus = self.ensure_live_focus();
+            return Task::batch([self.sync_window_title(), focus]);
         }
         let source = self
             .vault
@@ -1424,7 +1456,9 @@ impl VaultNotes {
         self.tabs.push(Tab::open(path, &source));
         self.active = Some(self.tabs.len() - 1);
         self.sync_tab_model();
-        self.sync_window_title()
+        self.live = None;
+        let focus = self.ensure_live_focus();
+        Task::batch([self.sync_window_title(), focus])
     }
 
     /// Create a note for an unresolved link and open it.
@@ -1506,6 +1540,19 @@ impl VaultNotes {
     /// Scroll the active tab's reading view to top-level block `idx`,
     /// switching out of source-only mode so the jump is visible.
     fn jump_to_block(&mut self, idx: usize) -> Task<Message> {
+        // Live preview focuses the block instead of scrolling a pane.
+        if self.pane == PaneMode::Live {
+            let Some(tab_idx) = self.active else {
+                return Task::none();
+            };
+            let region = self
+                .live_slices(tab_idx)
+                .iter()
+                .position(|slice| slice.block == Some(idx));
+            if let Some(region) = region {
+                return self.live_focus(region);
+            }
+        }
         if self.pane == PaneMode::Source {
             self.pane = PaneMode::Split;
         }
@@ -1515,6 +1562,348 @@ impl VaultNotes {
         // the freshly built tree (iced/winit/src/lib.rs: build_user_interfaces
         // precedes run_action!).
         crate::scroll::to_block::<Message>(idx, 12.0)
+    }
+
+    // --- live preview (`Live` pane mode) ---
+
+    /// The live preview's slice table for a tab.
+    fn live_slices(&self, tab_idx: usize) -> Vec<live::BlockSlice> {
+        let tab = &self.tabs[tab_idx];
+        live::slices(&tab.content.text(), &tab.doc)
+    }
+
+    /// Where the live caret is in absolute file coordinates, so undo and
+    /// redo can re-aim the block editor after the text is restored.
+    fn live_aim_marker(&self, tab_idx: usize) -> Option<(usize, usize)> {
+        let live = self.live.as_ref()?;
+        let slice = self.live_slices(tab_idx).get(live.block).copied()?;
+        let cursor = live.editor.cursor().position;
+        Some((slice.start_line - 1 + cursor.line, cursor.column))
+    }
+
+    /// Focus the live editor's text input once the view has rebuilt with
+    /// it mounted at the focused region's (possibly new) position.
+    fn live_editor_focus() -> Task<Message> {
+        cosmic::iced::runtime::task::widget::<Message>(
+            cosmic::iced::core::widget::operation::focusable::focus::<Message>(Id::new(
+                EDITOR_INPUT,
+            )),
+        )
+        .map(cosmic::Action::from)
+    }
+
+    /// When the live preview is showing a note with no markdown blocks
+    /// (fresh or emptied), focus its body region so the user can just
+    /// type. Anything else leaves the focus alone.
+    fn ensure_live_focus(&mut self) -> Task<Message> {
+        if self.pane != PaneMode::Live || self.live.is_some() {
+            return Task::none();
+        }
+        let Some(tab_idx) = self.active else {
+            return Task::none();
+        };
+        if !self.tabs[tab_idx].doc.blocks.is_empty() {
+            return Task::none();
+        }
+        let slices = self.live_slices(tab_idx);
+        match slices.len().checked_sub(1) {
+            Some(last) => self.live_focus(last),
+            None => Task::none(),
+        }
+    }
+
+    /// Open block region `idx` for editing in the live preview: its raw
+    /// source becomes the buffer, with the caret at the end of the
+    /// region's content (its trailing blank lines are the gap to the
+    /// next region, not text).
+    fn live_focus(&mut self, idx: usize) -> Task<Message> {
+        if self.pane != PaneMode::Live {
+            return Task::none();
+        }
+        if self.live.as_ref().is_some_and(|state| state.block == idx) {
+            return Task::none();
+        }
+        let Some(tab_idx) = self.active else {
+            return Task::none();
+        };
+        let slices = self.live_slices(tab_idx);
+        let Some(slice) = slices.get(idx).copied() else {
+            return Task::none();
+        };
+        let (line, column) = live::content_end(&slice.source(&self.tabs[tab_idx].content.text()));
+        self.live_jump_to(idx, line, column)
+    }
+
+    /// Move the live editor to region `idx` with the caret at
+    /// `line`/`column` (clamped inside). Rebuilding the buffer resets the
+    /// widget's focus, so a focus task rides along for the post-rebuild
+    /// tree (the runner rebuilds views before running update's actions).
+    fn live_jump_to(&mut self, idx: usize, line: usize, column: usize) -> Task<Message> {
+        let Some(tab_idx) = self.active else {
+            return Task::none();
+        };
+        let slices = self.live_slices(tab_idx);
+        let Some(slice) = slices.get(idx).copied() else {
+            return Task::none();
+        };
+        let tab = &self.tabs[tab_idx];
+        let source = slice.source(&tab.content.text());
+        let (line, column) = live::clamp_position(&source, line, column);
+        let mut editor = Content::with_text(&source);
+        editor.move_to(Cursor {
+            position: Position { line, column },
+            selection: None,
+        });
+        self.live = Some(LiveEdit { block: idx, editor });
+        Self::live_editor_focus()
+    }
+
+    /// An action on the live editor: perform it on the focused region's
+    /// buffer, and for edits splice the buffer back into the note text
+    /// and re-aim at the region now containing the caret (a split or a
+    /// text growth can move region boundaries).
+    fn live_action(&mut self, action: Action) -> Task<Message> {
+        let Some(tab_idx) = self.active else {
+            return Task::none();
+        };
+        let Some(live_block) = self.live.as_ref().map(|live| live.block) else {
+            return Task::none();
+        };
+        let range = {
+            let slice = self.live_slices(tab_idx).get(live_block).copied();
+            match slice {
+                Some(slice) => (slice.start_line, slice.end_line),
+                None => return Task::none(),
+            }
+        };
+        let is_edit = action.is_edit();
+        // Snapshot before the edit so undo can restore it: the whole
+        // document stays the undo unit across regions.
+        if is_edit {
+            push_undo(&mut self.tabs[tab_idx]);
+        }
+        let was_dirty = self.tabs[tab_idx].is_dirty();
+        if let Some(live) = self.live.as_mut() {
+            live.editor.perform(action);
+        }
+        if is_edit {
+            let source = self
+                .live
+                .as_ref()
+                .map_or_else(String::new, |live| live.editor.text());
+            let tab = &mut self.tabs[tab_idx];
+            let new_text = live::replace_lines(&tab.content.text(), range.0, range.1, &source);
+            tab.content = Content::with_text(&new_text);
+            tab.refresh_doc();
+            // Any editor activity resets the idle timer: the user is
+            // still working here.
+            self.last_edit = Some(std::time::Instant::now());
+            if tab.is_dirty() != was_dirty {
+                self.sync_tab_text(tab_idx);
+            }
+        }
+        let (line, column) = self
+            .live
+            .as_ref()
+            .map(|live| {
+                let cursor = live.editor.cursor().position;
+                (range.0 - 1 + cursor.line, cursor.column)
+            })
+            .unwrap_or((0, 0));
+        self.live_aim(line, column);
+        Task::none()
+    }
+
+    /// Perform one edit action on the live editor.
+    fn live_edit(&mut self, edit: Edit) -> Task<Message> {
+        self.live_action(Action::Edit(edit))
+    }
+
+    /// Re-aim the live editor at the region containing `line` (0-based
+    /// file line): re-slice the note text, and when the buffer no longer
+    /// matches its region's source (the edit split or merged blocks),
+    /// rebuild the buffer with the caret clamped inside.
+    fn live_aim(&mut self, line: usize, column: usize) {
+        let Some(tab_idx) = self.active else {
+            return;
+        };
+        let tab = &self.tabs[tab_idx];
+        let text = tab.content.text();
+        let slices = live::slices(&text, &tab.doc);
+        if slices.is_empty() {
+            return;
+        }
+        let idx = live::block_containing(&slices, line);
+        let source = slices[idx].source(&text);
+        let Some(live) = self.live.as_mut() else {
+            return;
+        };
+        if live.editor.text() == source {
+            // Content identical (the common case: the region's source
+            // simply re-tiled): keep the buffer, keep the caret.
+            live.block = idx;
+            return;
+        }
+        let (line, column) = live::clamp_position(
+            &source,
+            line.saturating_sub(slices[idx].start_line - 1),
+            column,
+        );
+        live.editor = Content::with_text(&source);
+        live.editor.move_to(Cursor {
+            position: Position { line, column },
+            selection: None,
+        });
+        live.block = idx;
+    }
+
+    /// Arrow keys in the live editor. At a region's boundary they cross
+    /// into the neighboring region (the caret lands in the matching
+    /// place, with its column preserved where the target line is long
+    /// enough); inside a region they are plain motions.
+    fn live_navigate(&mut self, up: bool) -> Task<Message> {
+        let Some(tab_idx) = self.active else {
+            return Task::none();
+        };
+        let motion = if up { Motion::Up } else { Motion::Down };
+        let Some(live_block) = self.live.as_ref().map(|live| live.block) else {
+            return Task::none();
+        };
+        let Some(cursor) = self.live.as_ref().map(|live| live.editor.cursor()) else {
+            return Task::none();
+        };
+        // A selection stays inside the region: the motion collapses it.
+        if cursor.selection.is_some() {
+            if let Some(live) = self.live.as_mut() {
+                live.editor.perform(Action::Move(motion));
+            }
+            return Task::none();
+        }
+        let slices = self.live_slices(tab_idx);
+        let text = self.tabs[tab_idx].content.text();
+        let Some(source) = slices.get(live_block).map(|s| s.source(&text)) else {
+            return Task::none();
+        };
+        let at_boundary = if up {
+            cursor.position.line == 0
+        } else {
+            cursor.position.line + 1 >= source.split('\n').count()
+        };
+        if !at_boundary {
+            if let Some(live) = self.live.as_mut() {
+                live.editor.perform(Action::Move(motion));
+            }
+            return Task::none();
+        }
+        if up {
+            if live_block == 0 {
+                return Task::none();
+            }
+            let prev = slices[live_block - 1];
+            let prev_source = prev.source(&text);
+            let (line, _) = live::content_end(&prev_source);
+            self.live_jump_to(live_block - 1, line, cursor.position.column)
+        } else if live_block + 1 < slices.len() {
+            self.live_jump_to(live_block + 1, 0, cursor.position.column)
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Backspace in the live editor. At a region's start it deletes the
+    /// newline before it — one character at file level — anywhere else
+    /// it is a plain backspace.
+    fn live_backspace(&mut self) -> Task<Message> {
+        let Some(tab_idx) = self.active else {
+            return Task::none();
+        };
+        let at_start = self.live.as_ref().is_some_and(|live| {
+            let cursor = live.editor.cursor();
+            cursor.selection.is_none() && cursor.position.line == 0 && cursor.position.column == 0
+        });
+        if !at_start {
+            return self.live_edit(Edit::Backspace);
+        }
+        let Some(live_block) = self.live.as_ref().map(|live| live.block) else {
+            return Task::none();
+        };
+        if live_block == 0 {
+            return Task::none();
+        }
+        let slices = self.live_slices(tab_idx);
+        let Some(current) = slices.get(live_block).copied() else {
+            return Task::none();
+        };
+        let text = self.tabs[tab_idx].content.text();
+        let Some(new_text) = live::delete_newline_before(&text, current.start_line) else {
+            return Task::none();
+        };
+        let tab = &mut self.tabs[tab_idx];
+        push_undo(tab);
+        let was_dirty = tab.is_dirty();
+        tab.content = Content::with_text(&new_text);
+        tab.refresh_doc();
+        self.last_edit = Some(std::time::Instant::now());
+        if tab.is_dirty() != was_dirty {
+            self.sync_tab_text(tab_idx);
+        }
+        // One newline before the caret is gone: the caret absolute file
+        // line moves up by one while its column stays at the line start.
+        self.live_aim(current.start_line - 2, 0);
+        Task::none()
+    }
+
+    /// Delete in the live editor. At a region's end it deletes the
+    /// newline after it — one character at file level — anywhere else it
+    /// is a plain delete.
+    fn live_delete(&mut self) -> Task<Message> {
+        let Some(tab_idx) = self.active else {
+            return Task::none();
+        };
+        let Some(live_block) = self.live.as_ref().map(|live| live.block) else {
+            return Task::none();
+        };
+        let Some(cursor) = self.live.as_ref().map(|live| live.editor.cursor()) else {
+            return Task::none();
+        };
+        let at_end = {
+            let source = self
+                .live_slices(tab_idx)
+                .get(live_block)
+                .map(|slice| slice.source(&self.tabs[tab_idx].content.text()))
+                .unwrap_or_default();
+            let (line, column) = live::clamp_position(&source, usize::MAX, usize::MAX);
+            cursor.selection.is_none()
+                && cursor.position.line == line
+                && cursor.position.column == column
+        };
+        if !at_end {
+            return self.live_edit(Edit::Delete);
+        }
+        let slices = self.live_slices(tab_idx);
+        let Some(current) = slices.get(live_block).copied() else {
+            return Task::none();
+        };
+        let (line, column) = (cursor.position.line, cursor.position.column);
+        let text = self.tabs[tab_idx].content.text();
+        // Caret at the region's last line end: the next character is the
+        // newline joining it to whatever line follows the region.
+        let Some(new_text) = live::delete_newline_before(&text, current.end_line + 1) else {
+            return Task::none();
+        };
+        let tab = &mut self.tabs[tab_idx];
+        push_undo(tab);
+        let was_dirty = tab.is_dirty();
+        tab.content = Content::with_text(&new_text);
+        tab.refresh_doc();
+        self.last_edit = Some(std::time::Instant::now());
+        if tab.is_dirty() != was_dirty {
+            self.sync_tab_text(tab_idx);
+        }
+        // The newline is deleted after the caret: its absolute file line
+        // and column are unchanged, and the region still starts here.
+        self.live_aim(current.start_line - 1 + line, column);
+        Task::none()
     }
 
     /// Scroll-sync (Phase F): in Split mode, follow the editor caret — the
@@ -1614,8 +2003,12 @@ impl VaultNotes {
             }
             other => other,
         };
+        // The removed tab may have been the one being live-edited.
+        self.live = None;
         self.sync_tab_model();
-        self.sync_window_title()
+        let title = self.sync_window_title();
+        let focus = self.ensure_live_focus();
+        Task::batch([title, focus])
     }
 
     /// Rebuild the tab-strip model from `tabs` + `active` (after every
@@ -1942,6 +2335,12 @@ impl VaultNotes {
     }
 
     fn update_wiki_complete(&mut self) {
+        if self.pane == PaneMode::Live {
+            // The caret lives in the focused block region's buffer; wiki
+            // completion reaches live preview in a later pass.
+            self.dismiss_editor_overlays();
+            return;
+        }
         if !self.wiki_autocomplete {
             self.dismiss_editor_overlays();
             return;
@@ -2589,6 +2988,7 @@ impl cosmic::Application for VaultNotes {
             tree_menu_target: None,
             find: None,
             wiki_complete: None,
+            live: None,
             nav_model: build_nav_model(),
             pane_model: build_pane_model(),
             tab_model: segmented_button::Model::default(),
@@ -2805,26 +3205,40 @@ impl cosmic::Application for VaultNotes {
                 if let Some(mode) = self.pane_model.data::<PaneMode>(id).copied() {
                     self.pane = mode;
                 }
+                // Live-editing state belongs to the pane; leaving it (or
+                // entering it fresh) drops the open region.
+                self.live = None;
                 self.dismiss_editor_overlays();
-                Task::none()
+                self.ensure_live_focus()
             }
             Message::TabActivated(id) => {
+                let was = self.active;
                 self.tab_model.activate(id);
                 if let Some(idx) = self.tab_model.data::<usize>(id).copied() {
                     if idx < self.tabs.len() {
                         self.active = Some(idx);
                     }
                 }
+                // Live-editing state belongs to the previous tab's text.
+                if was != self.active {
+                    self.live = None;
+                }
                 self.dismiss_editor_overlays();
                 let title = self.sync_window_title();
                 let scroll = self.sync_preview_scroll();
-                Task::batch([title, scroll])
+                let focus = self.ensure_live_focus();
+                Task::batch([title, scroll, focus])
             }
             Message::TabCloseRequested(id) => match self.tab_model.data::<usize>(id).copied() {
                 Some(idx) => self.close_tab(idx),
                 None => Task::none(),
             },
             Message::EditorAction(action) => {
+                // In live preview the action edits the focused region's
+                // buffer and splices back into the note (live_action).
+                if self.pane == PaneMode::Live {
+                    return self.live_action(action);
+                }
                 if let Some(idx) = self.active {
                     let is_edit = action.is_edit();
                     let tab = &mut self.tabs[idx];
@@ -2850,8 +3264,20 @@ impl cosmic::Application for VaultNotes {
                 self.update_wiki_complete();
                 self.sync_preview_scroll()
             }
+            Message::LiveFocus(idx) => self.live_focus(idx),
+            Message::LiveUp => self.live_navigate(true),
+            Message::LiveDown => self.live_navigate(false),
+            Message::LiveBackspace => self.live_backspace(),
+            Message::LiveDelete => self.live_delete(),
+            Message::LiveDismiss => {
+                self.live = None;
+                Task::none()
+            }
             Message::EditorUndo => {
                 if let Some(idx) = self.active {
+                    // Where the live caret is, so it can re-aim after the
+                    // text is restored.
+                    let aim = self.live_aim_marker(idx);
                     let was_dirty = self.tabs[idx].is_dirty();
                     let tab = &mut self.tabs[idx];
                     if undo_tab(tab) {
@@ -2861,12 +3287,16 @@ impl cosmic::Application for VaultNotes {
                             self.sync_tab_text(idx);
                         }
                     }
+                    if let Some((line, column)) = aim {
+                        self.live_aim(line, column);
+                    }
                 }
                 self.update_wiki_complete();
                 self.sync_preview_scroll()
             }
             Message::EditorRedo => {
                 if let Some(idx) = self.active {
+                    let aim = self.live_aim_marker(idx);
                     let was_dirty = self.tabs[idx].is_dirty();
                     let tab = &mut self.tabs[idx];
                     if redo_tab(tab) {
@@ -2875,6 +3305,9 @@ impl cosmic::Application for VaultNotes {
                         if tab.is_dirty() != was_dirty {
                             self.sync_tab_text(idx);
                         }
+                    }
+                    if let Some((line, column)) = aim {
+                        self.live_aim(line, column);
                     }
                 }
                 self.update_wiki_complete();
@@ -2905,6 +3338,11 @@ impl cosmic::Application for VaultNotes {
                 self.sync_preview_scroll()
             }
             Message::EditorAutoPair(typed) => {
+                // Live preview reaches auto-pairs in a later pass; an
+                // unpaired keystroke is the honest fallback meanwhile.
+                if self.pane == PaneMode::Live {
+                    return Task::none();
+                }
                 if !self.auto_pair {
                     return Task::none();
                 }
@@ -3841,12 +4279,12 @@ mod chrome_model_tests {
     }
 
     #[test]
-    fn pane_model_defaults_to_split() {
+    fn pane_model_defaults_to_live() {
         let mut model = build_pane_model();
-        assert_eq!(model.len(), 3);
+        assert_eq!(model.len(), 4);
         assert_eq!(
             model.data::<PaneMode>(model.active()),
-            Some(&PaneMode::Split)
+            Some(&PaneMode::Live)
         );
         let modes: Vec<PaneMode> = model
             .iter()
@@ -3854,7 +4292,12 @@ mod chrome_model_tests {
             .collect();
         assert_eq!(
             modes,
-            [PaneMode::Source, PaneMode::Reading, PaneMode::Split]
+            [
+                PaneMode::Live,
+                PaneMode::Split,
+                PaneMode::Source,
+                PaneMode::Reading
+            ]
         );
         assert!(activate_entity_with(&mut model, &PaneMode::Source));
         assert_eq!(
@@ -4393,7 +4836,7 @@ mod find_tests {
 
     #[test]
     fn find_replace_one_replaces_and_advances() {
-        let mut app = test_app_with_tab("dot dot dot\n");
+        let mut app = find_tests::test_app_with_tab("dot dot dot\n");
         let find = Find {
             query: "dot".to_string(),
             replacement: "spot".to_string(),
@@ -4418,7 +4861,7 @@ mod find_tests {
 
     #[test]
     fn find_replace_all_replaces_everything_in_one_step() {
-        let mut app = test_app_with_tab("aXbXc\nX\n");
+        let mut app = find_tests::test_app_with_tab("aXbXc\nX\n");
         app.find = Some(Find {
             query: "X".to_string(),
             replacement: "Y".to_string(),
@@ -4434,7 +4877,7 @@ mod find_tests {
 
     #[test]
     fn find_step_selects_matches_in_the_editor() {
-        let mut app = test_app_with_tab("one two one\n");
+        let mut app = find_tests::test_app_with_tab("one two one\n");
         app.find = Some(Find {
             query: "one".to_string(),
             ..Find::default()
@@ -4511,6 +4954,7 @@ mod find_tests {
             tree_menu_target: None,
             find: None,
             wiki_complete: None,
+            live: None,
             nav_model: build_nav_model(),
             pane_model: build_pane_model(),
             tab_model: segmented_button::Model::default(),
@@ -5196,7 +5640,12 @@ mod editor_focus_tests {
 
         // Pane modes all build too (each mode restructures the note area,
         // which is why the editor's focus rides on its custom id).
-        for mode in [PaneMode::Source, PaneMode::Reading, PaneMode::Split] {
+        for mode in [
+            PaneMode::Live,
+            PaneMode::Source,
+            PaneMode::Reading,
+            PaneMode::Split,
+        ] {
             app.pane = mode;
             let _ = crate::view::view(&app);
         }
@@ -5762,5 +6211,265 @@ mod tree_drag_tests {
         // One in flight is enough: no second queue.
         let _ = app.measure_tree_bounds_if_needed();
         assert!(app.bounds_pending);
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use cosmic::iced::core::SmolStr;
+    use cosmic::iced::keyboard::{Key, Modifiers};
+    use cosmic::Application as _;
+
+    /// Move the live caret (no selection) inside the focused region.
+    fn aim(app: &mut VaultNotes, line: usize, column: usize) {
+        let live = app.live.as_mut().expect("live region open");
+        live.editor.move_to(Cursor {
+            position: Position { line, column },
+            selection: None,
+        });
+    }
+
+    fn caret(app: &VaultNotes) -> (usize, usize) {
+        let editor = &app.live.as_ref().expect("live region open").editor;
+        let cursor = editor.cursor().position;
+        (cursor.line, cursor.column)
+    }
+
+    #[test]
+    fn typing_in_live_mode_splices_into_the_note() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta");
+        app.live_focus(0);
+        // Caret to the region's start; the buffer is the region's source,
+        // trailing blank line included.
+        assert_eq!(
+            app.live.as_ref().unwrap().editor.text(),
+            "alpha\n",
+            "the buffer is the block source"
+        );
+        aim(&mut app, 0, 0);
+        app.update(Message::EditorAction(Action::Edit(Edit::Insert('X'))));
+        // The keystroke spliced back into the note and the buffer kept the
+        // caret: the region source is re-tiled identically.
+        assert_eq!(app.tabs[0].content.text(), "Xalpha\n\nbeta");
+        assert_eq!(app.live.as_ref().unwrap().editor.text(), "Xalpha\n");
+        assert_eq!(app.live.as_ref().unwrap().block, 0);
+        assert_eq!(caret(&app), (0, 1));
+        // The edit is real: dirty, undoable, autosave-timed.
+        assert!(app.tabs[0].is_dirty());
+        assert!(app.last_edit.is_some());
+    }
+
+    #[test]
+    fn live_backspace_at_region_start_joins_line_by_line() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta\n\ngamma");
+        app.live_focus(1);
+        aim(&mut app, 0, 0);
+        app.update(Message::LiveBackspace);
+        // One newline is deleted at file level: "alpha" merges onto the
+        // "beta" line's region, keeping the blank after it; the blocks
+        // collapse into one soft-broken paragraph region.
+        assert_eq!(app.tabs[0].content.text(), "alpha\nbeta\n\ngamma");
+        let live = app.live.as_ref().unwrap();
+        assert_eq!(live.editor.text(), "alpha\nbeta\n");
+        // The caret stays where "beta" began (line 1, column 0).
+        assert_eq!(caret(&app), (1, 0));
+    }
+
+    #[test]
+    fn live_backspace_inside_a_region_is_a_plain_backspace() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta");
+        app.live_focus(1);
+        aim(&mut app, 0, 1);
+        app.update(Message::LiveBackspace);
+        assert_eq!(app.tabs[0].content.text(), "alpha\n\neta");
+        assert_eq!(caret(&app), (0, 0));
+    }
+
+    #[test]
+    fn live_delete_at_region_end_joins_with_the_region_below() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta\n\ngamma");
+        app.live_focus(0);
+        // live_focus leaves the caret at the region's content end — the
+        // join point after "alpha".
+        assert_eq!(caret(&app), (0, 5));
+        app.update(Message::LiveDelete);
+        assert_eq!(app.tabs[0].content.text(), "alpha\nbeta\n\ngamma");
+        // The caret is unmoved: still right after "alpha".
+        assert_eq!(caret(&app), (0, 5));
+    }
+
+    #[test]
+    fn live_undo_restores_the_note_and_reaims_the_caret() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta");
+        app.live_focus(0);
+        aim(&mut app, 0, 0);
+        app.update(Message::EditorAction(Action::Edit(Edit::Insert('X'))));
+        assert_eq!(app.tabs[0].content.text(), "Xalpha\n\nbeta");
+        // Undo: the mode-agnostic task snapshots the live caret (0,1),
+        // restores the pre-edit text, then re-aims the re-tiled region.
+        let before = caret(&app);
+        app.update(Message::EditorUndo);
+        assert_eq!(app.tabs[0].content.text(), "alpha\n\nbeta");
+        assert_eq!(
+            caret(&app),
+            (before.0, before.1),
+            "the caret lands back where the edit happened"
+        );
+        assert_eq!(app.live.as_ref().unwrap().editor.text(), "alpha\n");
+    }
+
+    #[test]
+    fn live_escape_dismisses_and_blocks_reappear() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta");
+        app.live_focus(0);
+        assert!(app.live.is_some());
+        app.update(Message::LiveDismiss);
+        assert!(app.live.is_none());
+    }
+
+    #[test]
+    fn an_empty_note_opens_its_body_region_for_typing() {
+        let mut app = find_tests::test_app_with_tab("");
+        // No blocks at all: the note is one body region, auto-focused on
+        // open (ensure_live_focus) so the user can just start writing.
+        assert!(app.tabs[0].doc.blocks.is_empty());
+        let _ = app.ensure_live_focus();
+        let live = app.live.as_ref().expect("the body region is open");
+        assert_eq!(live.block, 0);
+        assert_eq!(live.editor.text(), "");
+        assert_eq!(caret(&app), (0, 0));
+    }
+
+    #[test]
+    fn live_boundaries_cross_into_neighboring_regions() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta");
+        app.live_focus(1);
+        // Up from the region's top enters the region above at its
+        // content end (the caret lands after "alpha").
+        app.update(Message::LiveUp);
+        assert_eq!(app.live.as_ref().unwrap().block, 0);
+        assert_eq!(
+            app.tabs[0].content.text(),
+            "alpha\n\nbeta",
+            "navigation does not edit"
+        );
+        // Down from region 0's caret at its content end: first Down
+        // moves onto the region's trailing blank line, the second one
+        // crosses into region 1 (the column is preserved).
+        let live = app.live.as_mut().unwrap();
+        live.editor.move_to(Cursor {
+            position: Position { line: 0, column: 5 },
+            selection: None,
+        });
+        app.update(Message::LiveDown);
+        app.update(Message::LiveDown);
+        assert_eq!(app.live.as_ref().unwrap().block, 1);
+        assert_eq!(caret(&app), (0, 0), "the column is preserved");
+    }
+
+    #[test]
+    fn pane_switch_drops_the_open_region() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta");
+        app.live_focus(0);
+        assert!(app.live.is_some());
+        // The Source segment of the pane model, by entity id.
+        let source_entity = app
+            .pane_model
+            .iter()
+            .find(|id| app.pane_model.data::<PaneMode>(*id) == Some(&PaneMode::Source))
+            .unwrap();
+        app.update(Message::PaneActivated(source_entity));
+        assert_eq!(app.pane, PaneMode::Source);
+        assert!(app.live.is_none());
+    }
+
+    fn press(key: Key, modifiers: Modifiers) -> text_editor::KeyPress {
+        press_text(key, modifiers, None)
+    }
+
+    fn press_text(key: Key, modifiers: Modifiers, text: Option<&str>) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: cosmic::iced::keyboard::key::Physical::Unidentified(
+                cosmic::iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: text.map(SmolStr::new),
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    #[test]
+    fn key_bindings_route_the_live_edits() {
+        let plain = Modifiers::default();
+        // Boundary keys route to the app, not the widget.
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Named(Named::ArrowUp), plain)),
+            Some(text_editor::Binding::Custom(Message::LiveUp))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Named(Named::ArrowDown), plain)),
+            Some(text_editor::Binding::Custom(Message::LiveDown))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Named(Named::Backspace), plain)),
+            Some(text_editor::Binding::Custom(Message::LiveBackspace))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Named(Named::Delete), plain)),
+            Some(text_editor::Binding::Custom(Message::LiveDelete))
+        ));
+        // Escape commits the region instead of unfocusing.
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Named(Named::Escape), plain)),
+            Some(text_editor::Binding::Custom(Message::LiveDismiss))
+        ));
+        // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y stay app-scoped undo/redo.
+        let ctrl = Modifiers::CTRL;
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Character(SmolStr::new("z")), ctrl)),
+            Some(text_editor::Binding::Custom(Message::EditorUndo))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(press(
+                Key::Character(SmolStr::new("z")),
+                ctrl | Modifiers::SHIFT
+            )),
+            Some(text_editor::Binding::Custom(Message::EditorRedo))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Character(SmolStr::new("y")), ctrl)),
+            Some(text_editor::Binding::Custom(Message::EditorRedo))
+        ));
+        // Plain typing keeps the editor's own Insert path: never intercepted.
+        assert!(matches!(
+            crate::view::live_key_binding(press_text(
+                Key::Character(SmolStr::new("q")),
+                plain,
+                Some("q")
+            )),
+            Some(text_editor::Binding::Insert('q'))
+        ));
+        // Shifted arrows fall through to the widget's select-motion path.
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Named(Named::ArrowDown), Modifiers::SHIFT)),
+            Some(text_editor::Binding::Select(_))
+        ));
+        // While unfocused, nothing is bound (mirrors editor_shortcut).
+        assert!(matches!(
+            crate::view::live_key_binding(text_editor::KeyPress {
+                key: Key::Named(Named::Escape),
+                modified_key: Key::Named(Named::Escape),
+                physical_key: cosmic::iced::keyboard::key::Physical::Unidentified(
+                    cosmic::iced::keyboard::key::NativeCode::Unidentified,
+                ),
+                modifiers: Modifiers::default(),
+                text: None,
+                status: text_editor::Status::Active,
+            }),
+            None
+        ));
     }
 }
