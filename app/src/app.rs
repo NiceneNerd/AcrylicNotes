@@ -1021,7 +1021,7 @@ fn relative_link_target(from: &str, target: &str) -> String {
 /// The bracket/quote pairs that are typed as a pair. `None` for every
 /// other character. Both members map to the same pair, so a closing
 /// bracket can be recognised (and stepped over).
-fn pair_for(typed: char) -> Option<(char, char)> {
+pub(crate) fn pair_for(typed: char) -> Option<(char, char)> {
     match typed {
         '(' | ')' => Some(('(', ')')),
         '[' | ']' => Some(('[', ']')),
@@ -1635,10 +1635,23 @@ impl VaultNotes {
     }
 
     /// Move the live editor to region `idx` with the caret at
-    /// `line`/`column` (clamped inside). Rebuilding the buffer resets the
-    /// widget's focus, so a focus task rides along for the post-rebuild
-    /// tree (the runner rebuilds views before running update's actions).
+    /// `line`/`column` (clamped inside), no selection. Rebuilding the
+    /// buffer resets the widget's focus, so a focus task rides along for
+    /// the post-rebuild tree (the runner rebuilds views before running
+    /// update's actions).
     fn live_jump_to(&mut self, idx: usize, line: usize, column: usize) -> Task<Message> {
+        self.live_jump_to_caret(idx, line, column, None)
+    }
+
+    /// The same jump with an optional selection anchor (region-local
+    /// line/column), for find matches that arrive already selected.
+    fn live_jump_to_caret(
+        &mut self,
+        idx: usize,
+        line: usize,
+        column: usize,
+        selection: Option<Position>,
+    ) -> Task<Message> {
         let Some(tab_idx) = self.active else {
             return Task::none();
         };
@@ -1649,20 +1662,32 @@ impl VaultNotes {
         let tab = &self.tabs[tab_idx];
         let source = slice.source(&tab.content.text());
         let (line, column) = live::clamp_position(&source, line, column);
+        let selection = selection.map(|s| {
+            let (s_line, s_column) = live::clamp_position(&source, s.line, s.column);
+            Position {
+                line: s_line,
+                column: s_column,
+            }
+        });
         let mut editor = Content::with_text(&source);
         editor.move_to(Cursor {
             position: Position { line, column },
-            selection: None,
+            selection,
         });
         self.live = Some(LiveEdit { block: idx, editor });
         Self::live_editor_focus()
     }
 
-    /// An action on the live editor: perform it on the focused region's
-    /// buffer, and for edits splice the buffer back into the note text
-    /// and re-aim at the region now containing the caret (a split or a
-    /// text growth can move region boundaries).
-    fn live_action(&mut self, action: Action) -> Task<Message> {
+    /// A batch of editor actions on the live editor's buffer. Like
+    /// `run_editor_command` for the source editor, but splices the
+    /// buffer into the note text once at the end (the region's slice
+    /// range is captured before anything moves the boundaries), then
+    /// re-aims the buffer at the caret and re-evaluates the wiki
+    /// dropdown against the region text.
+    fn live_run(&mut self, actions: Vec<Action>) -> Task<Message> {
+        if actions.is_empty() {
+            return Task::none();
+        }
         let Some(tab_idx) = self.active else {
             return Task::none();
         };
@@ -1676,7 +1701,7 @@ impl VaultNotes {
                 None => return Task::none(),
             }
         };
-        let is_edit = action.is_edit();
+        let is_edit = actions.iter().any(|action| action.is_edit());
         // Snapshot before the edit so undo can restore it: the whole
         // document stays the undo unit across regions.
         if is_edit {
@@ -1684,7 +1709,9 @@ impl VaultNotes {
         }
         let was_dirty = self.tabs[tab_idx].is_dirty();
         if let Some(live) = self.live.as_mut() {
-            live.editor.perform(action);
+            for action in actions {
+                live.editor.perform(action);
+            }
         }
         if is_edit {
             let source = self
@@ -1711,7 +1738,18 @@ impl VaultNotes {
             })
             .unwrap_or((0, 0));
         self.live_aim(line, column);
+        // A region edit can open, move through, or close an unclosed
+        // `[[` in the buffer.
+        self.update_wiki_complete();
         Task::none()
+    }
+
+    /// One action on the live editor: perform it on the focused region's
+    /// buffer, and for edits splice the buffer back into the note text
+    /// and re-aim at the region now containing the caret (a split or a
+    /// text growth can move region boundaries).
+    fn live_action(&mut self, action: Action) -> Task<Message> {
+        self.live_run(vec![action])
     }
 
     /// Perform one edit action on the live editor.
@@ -2059,19 +2097,41 @@ impl VaultNotes {
 
     /// Select find match `index` in the active tab (cursor at its end, the
     /// editor's selection highlighting it).
-    fn select_match(&mut self, index: usize) {
+    fn select_match(&mut self, index: usize) -> Task<Message> {
         let (query, case) = match self.find.as_ref() {
             Some(find) => (find.query.clone(), find.case_sensitive),
-            None => return,
+            None => return Task::none(),
         };
         let Some(idx) = self.active else {
-            return;
+            return Task::none();
         };
         let text = self.tabs[idx].content.text();
         let matches = find_matches(&text, &query, case);
         let Some(found) = matches.get(index).copied() else {
-            return;
+            return Task::none();
         };
+        if self.pane == PaneMode::Live {
+            // The caret and the selection live in the focused region's
+            // buffer: open the region holding the match and select it
+            // there (region-local coordinates).
+            let slices = self.live_slices(idx);
+            let region = live::block_containing(&slices, found.line);
+            let start = slices[region].start_line;
+            let relative_line = found.line - (start - 1);
+            let task = self.live_jump_to_caret(
+                region,
+                relative_line,
+                found.end,
+                Some(Position {
+                    line: relative_line,
+                    column: found.start,
+                }),
+            );
+            if let Some(find) = self.find.as_mut() {
+                find.current = index;
+            }
+            return task;
+        }
         self.tabs[idx].content.move_to(Cursor {
             position: Position {
                 line: found.line,
@@ -2085,38 +2145,54 @@ impl VaultNotes {
         if let Some(find) = self.find.as_mut() {
             find.current = index;
         }
+        Task::none()
     }
 
     /// Step to the next (or previous) match, wrapping around.
-    fn find_step(&mut self, forward: bool) {
+    fn find_step(&mut self, forward: bool) -> Task<Message> {
         let (query, case, current) = match self.find.as_ref() {
             Some(find) => (find.query.clone(), find.case_sensitive, find.current),
-            None => return,
+            None => return Task::none(),
         };
         let Some(tab) = self.active_tab() else {
-            return;
+            return Task::none();
         };
         let text = tab.content.text();
         let len = find_matches(&text, &query, case).len();
         if len == 0 {
-            return;
+            return Task::none();
         }
-        self.select_match(next_index(len, current, forward));
+        self.select_match(next_index(len, current, forward))
     }
 
     /// Jump the find selection to the first match at or after the editor's
-    /// current selection anchor (or cursor).
-    fn find_jump_to_cursor(&mut self) {
-        let anchor = self.active_tab().map(|tab| {
-            let cursor = tab.content.cursor();
-            cursor.selection.unwrap_or(cursor.position)
-        });
+    /// current selection anchor (or cursor). In live preview the anchor is
+    /// the focused region's caret lifted to file coordinates.
+    fn find_jump_to_cursor(&mut self) -> Task<Message> {
+        let anchor = if self.pane == PaneMode::Live {
+            self.live.as_ref().and_then(|live| {
+                let idx = self.active?;
+                let slices = self.live_slices(idx);
+                let slice = slices.get(live.block)?;
+                let cursor = live.editor.cursor();
+                let pos = cursor.selection.unwrap_or(cursor.position);
+                Some(Position {
+                    line: slice.start_line - 1 + pos.line,
+                    column: pos.column,
+                })
+            })
+        } else {
+            self.active_tab().map(|tab| {
+                let cursor = tab.content.cursor();
+                cursor.selection.unwrap_or(cursor.position)
+            })
+        };
         let Some(anchor) = anchor else {
-            return;
+            return Task::none();
         };
         let (query, case) = match self.find.as_ref() {
             Some(find) => (find.query.clone(), find.case_sensitive),
-            None => return,
+            None => return Task::none(),
         };
         let index = self
             .active_tab()
@@ -2129,46 +2205,54 @@ impl VaultNotes {
                 )
             })
             .unwrap_or(0);
-        self.select_match(index);
+        self.select_match(index)
     }
 
     /// Replace find match `index` in the active tab (one undoable step),
     /// then point the selection at the following match.
-    fn find_replace_one(&mut self, index: usize) {
+    fn find_replace_one(&mut self, index: usize) -> Task<Message> {
         let (query, case, replacement) = match self.find.as_ref() {
             Some(find) => (
                 find.query.clone(),
                 find.case_sensitive,
                 find.replacement.clone(),
             ),
-            None => return,
+            None => return Task::none(),
         };
         let Some(idx) = self.active else {
-            return;
+            return Task::none();
         };
         let text = self.tabs[idx].content.text();
         let matches = find_matches(&text, &query, case);
         let Some(found) = matches.get(index).copied() else {
-            return;
+            return Task::none();
         };
         let was_dirty = self.tabs[idx].is_dirty();
+        // Where the live caret is, so the buffer can re-aim after the
+        // whole-text replacement (the focused region may have changed).
+        let aim = self.live_aim_marker(idx);
         {
             let tab = &mut self.tabs[idx];
             push_undo(tab);
             let new_text = replace_spans(&text, &[found], &replacement);
             tab.content = Content::with_text(&new_text);
-            tab.content.move_to(Cursor {
-                position: Position {
-                    line: found.line,
-                    column: found.start + replacement.len(),
-                },
-                selection: None,
-            });
+            if self.pane != PaneMode::Live {
+                tab.content.move_to(Cursor {
+                    position: Position {
+                        line: found.line,
+                        column: found.start + replacement.len(),
+                    },
+                    selection: None,
+                });
+            }
             tab.refresh_doc();
         }
         self.last_edit = Some(std::time::Instant::now());
         if self.tabs[idx].is_dirty() != was_dirty {
             self.sync_tab_text(idx);
+        }
+        if let Some((line, column)) = aim {
+            self.live_aim(line, column);
         }
         // The next match (if any) now sits at the same index.
         let text = self.tabs[idx].content.text();
@@ -2176,32 +2260,36 @@ impl VaultNotes {
         if let Some(find) = self.find.as_mut() {
             find.current = len.min(index);
         }
-        self.select_match(self.find.as_ref().map_or(0, |f| f.current));
+        let task = self.select_match(self.find.as_ref().map_or(0, |f| f.current));
         self.update_wiki_complete();
+        task
     }
 
     /// Replace every match in the active tab (one undoable step).
-    fn find_replace_all(&mut self) {
+    fn find_replace_all(&mut self) -> Task<Message> {
         let (query, case, replacement) = match self.find.as_ref() {
             Some(find) => (
                 find.query.clone(),
                 find.case_sensitive,
                 find.replacement.clone(),
             ),
-            None => return,
+            None => return Task::none(),
         };
         if query.is_empty() {
-            return;
+            return Task::none();
         }
         let Some(idx) = self.active else {
-            return;
+            return Task::none();
         };
         let text = self.tabs[idx].content.text();
         let matches = find_matches(&text, &query, case);
         if matches.is_empty() {
-            return;
+            return Task::none();
         }
         let was_dirty = self.tabs[idx].is_dirty();
+        // Same live-buffer rule as the single replace: re-aim after the
+        // whole-text splice.
+        let aim = self.live_aim_marker(idx);
         {
             let tab = &mut self.tabs[idx];
             push_undo(tab);
@@ -2213,10 +2301,14 @@ impl VaultNotes {
         if self.tabs[idx].is_dirty() != was_dirty {
             self.sync_tab_text(idx);
         }
+        if let Some((line, column)) = aim {
+            self.live_aim(line, column);
+        }
         if let Some(find) = self.find.as_mut() {
             find.current = 0;
         }
         self.update_wiki_complete();
+        Task::none()
     }
 
     /// Re-evaluate the wikilink dropdown against the active tab's text and
@@ -2335,12 +2427,6 @@ impl VaultNotes {
     }
 
     fn update_wiki_complete(&mut self) {
-        if self.pane == PaneMode::Live {
-            // The caret lives in the focused block region's buffer; wiki
-            // completion reaches live preview in a later pass.
-            self.dismiss_editor_overlays();
-            return;
-        }
         if !self.wiki_autocomplete {
             self.dismiss_editor_overlays();
             return;
@@ -2349,8 +2435,24 @@ impl VaultNotes {
             self.dismiss_editor_overlays();
             return;
         };
-        let text = self.tabs[idx].content.text();
-        let cursor = self.tabs[idx].content.cursor().position;
+        // Live preview: the caret and the text live in the focused
+        // region's buffer, not the whole-file one.
+        let (text, cursor) = if self.pane == PaneMode::Live {
+            match (
+                self.live.as_ref().map(|live| live.editor.text()),
+                self.live.as_ref().map(|live| live.editor.cursor().position),
+            ) {
+                (Some(text), Some(cursor)) => (text, cursor),
+                _ => {
+                    self.dismiss_editor_overlays();
+                    return;
+                }
+            }
+        } else {
+            let text = self.tabs[idx].content.text();
+            let cursor = self.tabs[idx].content.cursor().position;
+            (text, cursor)
+        };
         let Some((_, query)) = wiki_query_at(&text, cursor) else {
             self.dismiss_editor_overlays();
             return;
@@ -2380,23 +2482,19 @@ impl VaultNotes {
 
     /// Accept the highlighted wikilink suggestion: replace the partial
     /// `[[query` up to the cursor with the target link (one undoable
-    /// step). The link text follows the link-path-format preference.
-    fn wiki_accept(&mut self) {
+    /// step). The link text follows the link-path-format preference. In
+    /// live preview the edit lands in the focused region's buffer and
+    /// lifts into the note in the same batch.
+    fn wiki_accept(&mut self) -> Task<Message> {
         let Some(target) = self
             .wiki_complete
             .as_ref()
             .and_then(|wiki| wiki.items.get(wiki.selected).cloned())
         else {
-            return;
+            return Task::none();
         };
         let Some(idx) = self.active else {
-            return;
-        };
-        let text = self.tabs[idx].content.text();
-        let cursor = self.tabs[idx].content.cursor().position;
-        let Some((open_col, _)) = wiki_query_at(&text, cursor) else {
-            self.dismiss_editor_overlays();
-            return;
+            return Task::none();
         };
         // The link text follows the link-path-format preference.
         let link = {
@@ -2416,6 +2514,41 @@ impl VaultNotes {
                 "[[{}]]",
                 link_target(&from, &target, &notes, self.link_path_format)
             )
+        };
+        if self.pane == PaneMode::Live {
+            // Edit the region's buffer: select the partial `[[query`
+            // (region-local coordinates) and paste the link, then lift
+            // the buffer into the note in one batch.
+            if self.live.is_none() {
+                self.dismiss_editor_overlays();
+                return Task::none();
+            }
+            let (text, cursor) = {
+                let live = self.live.as_ref().expect("live block without state");
+                (live.editor.text(), live.editor.cursor().position)
+            };
+            let Some((open_col, _)) = wiki_query_at(&text, cursor) else {
+                self.dismiss_editor_overlays();
+                return Task::none();
+            };
+            if let Some(live) = self.live.as_mut() {
+                live.editor.move_to(Cursor {
+                    position: cursor,
+                    selection: Some(Position {
+                        line: cursor.line,
+                        column: open_col,
+                    }),
+                });
+            }
+            let task = self.live_run(vec![Action::Edit(Edit::Paste(Arc::new(link)))]);
+            self.dismiss_editor_overlays();
+            return task;
+        }
+        let text = self.tabs[idx].content.text();
+        let cursor = self.tabs[idx].content.cursor().position;
+        let Some((open_col, _)) = wiki_query_at(&text, cursor) else {
+            self.dismiss_editor_overlays();
+            return Task::none();
         };
         let was_dirty = self.tabs[idx].is_dirty();
         {
@@ -2437,6 +2570,7 @@ impl VaultNotes {
             self.sync_tab_text(idx);
         }
         self.dismiss_editor_overlays();
+        Task::none()
     }
 
     /// Move the dropdown highlight (wrapping).
@@ -3338,13 +3472,34 @@ impl cosmic::Application for VaultNotes {
                 self.sync_preview_scroll()
             }
             Message::EditorAutoPair(typed) => {
-                // Live preview reaches auto-pairs in a later pass; an
-                // unpaired keystroke is the honest fallback meanwhile.
-                if self.pane == PaneMode::Live {
+                if !self.auto_pair {
+                    // Pairing is off, but the keystroke must still land:
+                    // the binding replaced the widget's own insert.
+                    let actions = vec![Action::Edit(Edit::Insert(typed))];
+                    if self.pane == PaneMode::Live {
+                        return self.live_run(actions);
+                    }
+                    if let Some(idx) = self.active {
+                        self.run_editor_command(idx, actions);
+                    }
                     return Task::none();
                 }
-                if !self.auto_pair {
-                    return Task::none();
+                if self.pane == PaneMode::Live {
+                    // The buffer is the region source; the karat is its
+                    // caret. The same decision table applies.
+                    let (text, cursor, selection) = {
+                        let live = self.live.as_ref().expect("live-open auto pair");
+                        (
+                            live.editor.text(),
+                            live.editor.cursor(),
+                            live.editor.selection(),
+                        )
+                    };
+                    let acts = autopair_actions(&text, cursor, typed, selection);
+                    if acts.is_empty() {
+                        return self.live_run(vec![Action::Edit(Edit::Insert(typed))]);
+                    }
+                    return self.live_run(acts);
                 }
                 if let Some(idx) = self.active {
                     let text = self.tabs[idx].content.text();
@@ -3364,37 +3519,40 @@ impl cosmic::Application for VaultNotes {
                     }
                 }
                 self.find = Some(find);
-                self.find_jump_to_cursor();
-                cosmic::widget::text_input::focus::<Message>(Id::new(FIND_INPUT))
-                    .map(cosmic::Action::App)
+                let jump = self.find_jump_to_cursor();
+                let focus = cosmic::widget::text_input::focus::<Message>(Id::new(FIND_INPUT))
+                    .map(cosmic::Action::App);
+                Task::batch([jump, focus])
             }
             Message::FindInput(value) => {
                 if let Some(find) = self.find.as_mut() {
                     find.query = value;
                     find.current = 0;
                 }
-                self.find_jump_to_cursor();
-                Task::none()
+                let jump = self.find_jump_to_cursor();
+                let sync = self.sync_preview_scroll();
+                Task::batch([jump, sync])
             }
             Message::FindClose => {
                 self.find = None;
                 Task::none()
             }
             Message::FindNext => {
-                self.find_step(true);
-                self.sync_preview_scroll()
+                let step = self.find_step(true);
+                let sync = self.sync_preview_scroll();
+                Task::batch([step, sync])
             }
             Message::FindPrev => {
-                self.find_step(false);
-                self.sync_preview_scroll()
+                let step = self.find_step(false);
+                let sync = self.sync_preview_scroll();
+                Task::batch([step, sync])
             }
             Message::FindToggleCase => {
                 if let Some(find) = self.find.as_mut() {
                     find.case_sensitive = !find.case_sensitive;
                     find.current = 0;
                 }
-                self.find_jump_to_cursor();
-                Task::none()
+                self.find_jump_to_cursor()
             }
             Message::FindReplaceInput(value) => {
                 if let Some(find) = self.find.as_mut() {
@@ -3404,23 +3562,27 @@ impl cosmic::Application for VaultNotes {
             }
             Message::FindReplace => {
                 let current = self.find.as_ref().map_or(0, |f| f.current);
-                self.find_replace_one(current);
-                self.sync_preview_scroll()
+                let replace = self.find_replace_one(current);
+                let sync = self.sync_preview_scroll();
+                Task::batch([replace, sync])
             }
             Message::FindReplaceAll => {
-                self.find_replace_all();
-                Task::none()
+                let replace = self.find_replace_all();
+                let sync = self.sync_preview_scroll();
+                Task::batch([replace, sync])
             }
             Message::WikiAccept => {
-                self.wiki_accept();
-                self.sync_preview_scroll()
+                let accept = self.wiki_accept();
+                let sync = self.sync_preview_scroll();
+                Task::batch([accept, sync])
             }
             Message::WikiSelect(index) => {
                 if let Some(wiki) = self.wiki_complete.as_mut() {
                     wiki.selected = index;
                 }
-                self.wiki_accept();
-                self.sync_preview_scroll()
+                let accept = self.wiki_accept();
+                let sync = self.sync_preview_scroll();
+                Task::batch([accept, sync])
             }
             Message::WikiCycle(delta) => {
                 self.wiki_cycle(delta);
@@ -4878,6 +5040,9 @@ mod find_tests {
     #[test]
     fn find_step_selects_matches_in_the_editor() {
         let mut app = find_tests::test_app_with_tab("one two one\n");
+        // Source-editor cursor semantics (the live pane selects its own
+        // region buffer — see live_tests).
+        app.pane = PaneMode::Source;
         app.find = Some(Find {
             query: "one".to_string(),
             ..Find::default()
@@ -5050,6 +5215,9 @@ mod wiki_tests {
     #[test]
     fn wiki_accept_completes_the_link_in_one_undo_step() {
         let mut app = find_tests::test_app_with_tab("see [[no\n");
+        // Source-editor path (the live-buffer path is covered in
+        // live_tests::wiki_accept_in_live_mode_splices_the_link).
+        app.pane = PaneMode::Source;
         // Cursor right after "[[no" (byte column 8).
         app.tabs[0].content.move_to(Cursor {
             position: Position { line: 0, column: 8 },
@@ -6406,70 +6574,219 @@ mod live_tests {
         let plain = Modifiers::default();
         // Boundary keys route to the app, not the widget.
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::ArrowUp), plain)),
+            crate::view::live_key_binding(press(Key::Named(Named::ArrowUp), plain), false),
             Some(text_editor::Binding::Custom(Message::LiveUp))
         ));
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::ArrowDown), plain)),
+            crate::view::live_key_binding(press(Key::Named(Named::ArrowDown), plain), false),
             Some(text_editor::Binding::Custom(Message::LiveDown))
         ));
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::Backspace), plain)),
+            crate::view::live_key_binding(press(Key::Named(Named::Backspace), plain), false),
             Some(text_editor::Binding::Custom(Message::LiveBackspace))
         ));
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::Delete), plain)),
+            crate::view::live_key_binding(press(Key::Named(Named::Delete), plain), false),
             Some(text_editor::Binding::Custom(Message::LiveDelete))
         ));
         // Escape commits the region instead of unfocusing.
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::Escape), plain)),
+            crate::view::live_key_binding(press(Key::Named(Named::Escape), plain), false),
             Some(text_editor::Binding::Custom(Message::LiveDismiss))
+        ));
+        // With the wiki dropdown open, Escape dismisses the dropdown.
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Named(Named::Escape), plain), true),
+            Some(text_editor::Binding::Custom(Message::WikiDismiss))
         ));
         // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y stay app-scoped undo/redo.
         let ctrl = Modifiers::CTRL;
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Character(SmolStr::new("z")), ctrl)),
+            crate::view::live_key_binding(press(Key::Character(SmolStr::new("z")), ctrl), false),
             Some(text_editor::Binding::Custom(Message::EditorUndo))
         ));
         assert!(matches!(
-            crate::view::live_key_binding(press(
-                Key::Character(SmolStr::new("z")),
-                ctrl | Modifiers::SHIFT
-            )),
+            crate::view::live_key_binding(
+                press(Key::Character(SmolStr::new("z")), ctrl | Modifiers::SHIFT),
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::EditorRedo))
         ));
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Character(SmolStr::new("y")), ctrl)),
+            crate::view::live_key_binding(press(Key::Character(SmolStr::new("y")), ctrl), false),
             Some(text_editor::Binding::Custom(Message::EditorRedo))
         ));
         // Plain typing keeps the editor's own Insert path: never intercepted.
         assert!(matches!(
-            crate::view::live_key_binding(press_text(
-                Key::Character(SmolStr::new("q")),
-                plain,
-                Some("q")
-            )),
+            crate::view::live_key_binding(
+                press_text(Key::Character(SmolStr::new("q")), plain, Some("q")),
+                false
+            ),
             Some(text_editor::Binding::Insert('q'))
+        ));
+        // Typed brackets/quotes route through the auto-pair table.
+        assert!(matches!(
+            crate::view::live_key_binding(
+                press_text(Key::Character(SmolStr::new("(")), plain, Some("(")),
+                false
+            ),
+            Some(text_editor::Binding::Custom(Message::EditorAutoPair('(')))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(
+                press_text(Key::Character(SmolStr::new("\"")), plain, Some("\"")),
+                false
+            ),
+            Some(text_editor::Binding::Custom(Message::EditorAutoPair('"')))
         ));
         // Shifted arrows fall through to the widget's select-motion path.
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::ArrowDown), Modifiers::SHIFT)),
+            crate::view::live_key_binding(
+                press(Key::Named(Named::ArrowDown), Modifiers::SHIFT),
+                false
+            ),
             Some(text_editor::Binding::Select(_))
         ));
         // While unfocused, nothing is bound (mirrors editor_shortcut).
         assert!(matches!(
-            crate::view::live_key_binding(text_editor::KeyPress {
-                key: Key::Named(Named::Escape),
-                modified_key: Key::Named(Named::Escape),
-                physical_key: cosmic::iced::keyboard::key::Physical::Unidentified(
-                    cosmic::iced::keyboard::key::NativeCode::Unidentified,
-                ),
-                modifiers: Modifiers::default(),
-                text: None,
-                status: text_editor::Status::Active,
-            }),
+            crate::view::live_key_binding(
+                text_editor::KeyPress {
+                    key: Key::Named(Named::Escape),
+                    modified_key: Key::Named(Named::Escape),
+                    physical_key: cosmic::iced::keyboard::key::Physical::Unidentified(
+                        cosmic::iced::keyboard::key::NativeCode::Unidentified
+                    ),
+                    modifiers: Modifiers::default(),
+                    text: None,
+                    status: text_editor::Status::Active,
+                },
+                false
+            ),
             None
         ));
+    }
+
+    #[test]
+    fn typing_a_pair_in_live_mode_splices_the_pair() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta");
+        app.live_focus(0);
+        aim(&mut app, 0, 0);
+        app.update(Message::EditorAutoPair('('));
+        // The pair went into the region buffer and lifted into the note.
+        assert_eq!(app.tabs[0].content.text(), "()alpha\n\nbeta");
+        assert_eq!(app.live.as_ref().unwrap().editor.text(), "()alpha\n");
+        // The caret sits between the markers.
+        assert_eq!(caret(&app), (0, 1));
+    }
+
+    #[test]
+    fn typing_the_closer_steps_over_instead_of_duplicating() {
+        let mut app = find_tests::test_app_with_tab("ab\n");
+        app.live_focus(0);
+        aim(&mut app, 0, 0);
+        app.update(Message::EditorAutoPair('['));
+        // "[" paired: "[]ab" with the caret between the markers.
+        assert_eq!(app.live.as_ref().unwrap().editor.text(), "[]ab\n");
+        assert_eq!(caret(&app), (0, 1));
+        // Typing "]" now steps over the closer.
+        app.update(Message::EditorAutoPair(']'));
+        assert_eq!(app.live.as_ref().unwrap().editor.text(), "[]ab\n");
+        assert_eq!(caret(&app), (0, 2));
+    }
+
+    #[test]
+    fn auto_pair_off_still_types_the_bracket() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta");
+        app.auto_pair = false;
+        app.live_focus(0);
+        aim(&mut app, 0, 0);
+        app.update(Message::EditorAutoPair('('));
+        // A single plain character lands — no pair, no swallowed key.
+        assert_eq!(app.tabs[0].content.text(), "(alpha\n\nbeta");
+        assert_eq!(caret(&app), (0, 1));
+    }
+
+    #[test]
+    fn wiki_completion_opens_from_the_live_region() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("Alpha.md"), "alpha note\n").unwrap();
+        let mut app = find_tests::test_app_with_tab("see [[al\n");
+        app.vault = Some(Vault::open(tmp.path()).unwrap());
+        app.rebuild_index();
+        app.live_focus(0);
+        // live_focus leaves the caret after "[[al".
+        assert_eq!(caret(&app), (0, 8));
+        app.update_wiki_complete();
+        let wiki = app.wiki_complete.as_ref().expect("the dropdown is open");
+        assert_eq!(wiki.items, vec!["Alpha.md".to_string()]);
+    }
+
+    #[test]
+    fn wiki_accept_in_live_mode_splices_the_link() {
+        let mut app = find_tests::test_app_with_tab("see [[al\n");
+        app.live_focus(0);
+        app.wiki_complete = Some(WikiComplete {
+            items: vec!["Alpha.md".to_string()],
+            selected: 0,
+        });
+        app.wiki_accept();
+        // Shortest format, unique title: the bare title.
+        assert_eq!(app.tabs[0].content.text(), "see [[Alpha]]\n");
+        // The buffer is the region source: trailing blank line included.
+        assert_eq!(app.live.as_ref().unwrap().editor.text(), "see [[Alpha]]\n");
+        // The link closed the dropdown.
+        assert!(app.wiki_complete.is_none());
+        // One undo step restores the partial link.
+        assert!(undo_tab(&mut app.tabs[0]));
+        assert_eq!(app.tabs[0].content.text(), "see [[al\n");
+    }
+
+    #[test]
+    fn find_selects_matches_in_the_live_region() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta alpha\n");
+        app.find = Some(Find {
+            query: "alpha".to_string(),
+            replacement: String::new(),
+            case_sensitive: false,
+            current: 0,
+        });
+        app.live_focus(0);
+        app.select_match(0);
+        // Match 0 opens region 0 with the hit selected.
+        let live = app.live.as_ref().unwrap();
+        assert_eq!(live.block, 0);
+        assert_eq!(caret(&app), (0, 5));
+        assert_eq!(
+            live.editor.cursor().selection,
+            Some(Position { line: 0, column: 0 })
+        );
+        // The next match lives in region 1 (absolute line 2 -> relative 0).
+        app.find_step(true);
+        let live = app.live.as_ref().unwrap();
+        assert_eq!(live.block, 1);
+        assert_eq!(caret(&app), (0, 10));
+        assert_eq!(
+            live.editor.cursor().selection,
+            Some(Position { line: 0, column: 5 })
+        );
+    }
+
+    #[test]
+    fn find_replace_all_keeps_the_live_buffer_fresh() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nx alpha y\n");
+        app.find = Some(Find {
+            query: "alpha".to_string(),
+            replacement: "z".to_string(),
+            case_sensitive: false,
+            current: 0,
+        });
+        app.live_focus(0);
+        app.find_replace_all();
+        assert_eq!(app.tabs[0].content.text(), "z\n\nx z y\n");
+        // The focused region's buffer was re-lifted with the replacement.
+        assert_eq!(app.live.as_ref().unwrap().editor.text(), "z\n");
+        // One undo step restores both regions at once.
+        assert!(undo_tab(&mut app.tabs[0]));
+        assert_eq!(app.tabs[0].content.text(), "alpha\n\nx alpha y\n");
     }
 }

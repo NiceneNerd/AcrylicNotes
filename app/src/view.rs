@@ -1206,17 +1206,26 @@ fn live_pane<'a>(
             &mut fold_id,
         ));
     }
-    // The id anchors the R3 scroll-into-view work.
-    container(
-        scrollable::scrollable(col)
-            .id(Id::new(crate::scroll::LIVE_SCROLL))
-            .width(Length::Fill)
-            .height(Length::Fill),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .padding(16)
-    .into()
+    // The id anchors the scroll-into-view work (R3).
+    let scroll = scrollable::scrollable(col)
+        .id(Id::new(crate::scroll::LIVE_SCROLL))
+        .width(Length::Fill)
+        .height(Length::Fill);
+    // The wiki dropdown is ALWAYS the stack's second child, even closed
+    // (an empty placeholder takes its slot) — a structural change would
+    // rebuild the subtree and drop the focused editor's key state, the
+    // same trap the source editor's popup avoids.
+    let wiki = app.wiki_complete.as_ref();
+    let overlay: cosmic::Element<'a, Message> = match wiki {
+        Some(wiki) => wiki_dropdown(wiki, palette),
+        None => container(column::Column::new()).into(),
+    };
+    let pane: cosmic::Element<'a, Message> = stack([scroll.into(), overlay]).into();
+    container(pane)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(16)
+        .into()
 }
 
 /// One region of the live preview: either the focused block's raw
@@ -1283,6 +1292,7 @@ fn focused_block_editor<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a
         .live
         .as_ref()
         .expect("focused editor without live state");
+    let wiki_open = app.wiki_complete.is_some();
     let base_font = editor_font(app.editor_font_mono, &app.editor_font_family);
     set_editor_base_font(base_font);
     // Same highlighter and surface as the source editor (M4 decision 3);
@@ -1312,20 +1322,22 @@ fn focused_block_editor<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a
             },
             editor_highlight_format,
         )
-        .key_binding(live_key_binding)
+        .key_binding(move |press| live_key_binding(press, wiki_open))
         .style(editor_surface_style)
         .into()
 }
 
-/// The live editor's key bindings: Escape commits the region (the
-/// default unfocus would strand the caret behind a silent render),
-/// undo/redo stay app-scoped since the whole note is the undo unit, and
-/// the four boundary keys — arrows, backspace, delete — are intercepted
-/// so `app.rs` can decide between a plain motion and crossing into a
-/// neighboring region. Everything else (typing, Enter, copy/paste,
+/// The live editor's key bindings: Escape commits the region (or, with
+/// the wiki dropdown open, dismisses it — the dropdown wins), undo/redo
+/// stay app-scoped since the whole note is the undo unit, the four
+/// boundary keys — arrows, backspace, delete — are intercepted so
+/// `app.rs` can decide between a plain motion and crossing into a
+/// neighboring region, and typed brackets/quotes route through the
+/// auto-pair table. Everything else (typing, Enter, copy/paste,
 /// selection) falls back to the editor's own bindings.
 pub(crate) fn live_key_binding(
     press: text_editor::KeyPress,
+    wiki_open: bool,
 ) -> Option<text_editor::Binding<Message>> {
     use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
     if !matches!(press.status, text_editor::Status::Focused { .. }) {
@@ -1333,8 +1345,21 @@ pub(crate) fn live_key_binding(
     }
     let ctrl = press.modifiers.command();
     let plain = press.modifiers == Modifiers::default();
+    // A plainly typed character (byte-column semantics apply later in
+    // the app): pairs route to the auto-pair decision table, everything
+    // else falls back to the widget's own insert.
+    let typed = press
+        .text
+        .as_deref()
+        .and_then(|t| t.chars().find(|c| !c.is_control()));
     match &press.key {
-        Key::Named(Named::Escape) => Some(text_editor::Binding::Custom(Message::LiveDismiss)),
+        // While the wikilink dropdown is open, Esc dismisses it instead
+        // of committing the region (same priority as the source editor).
+        Key::Named(Named::Escape) => Some(text_editor::Binding::Custom(if wiki_open {
+            Message::WikiDismiss
+        } else {
+            Message::LiveDismiss
+        })),
         Key::Character(c) if ctrl => {
             let lower = c.to_lowercase();
             match (lower.as_str(), press.modifiers.shift()) {
@@ -1343,6 +1368,11 @@ pub(crate) fn live_key_binding(
                 ("y", false) => Some(text_editor::Binding::Custom(Message::EditorRedo)),
                 _ => None,
             }
+        }
+        Key::Character(_) if plain && typed.is_some_and(|c| crate::app::pair_for(c).is_some()) => {
+            Some(text_editor::Binding::Custom(Message::EditorAutoPair(
+                typed.expect("checked above"),
+            )))
         }
         Key::Named(Named::Backspace) if plain => {
             Some(text_editor::Binding::Custom(Message::LiveBackspace))
