@@ -724,3 +724,98 @@ All chord changes below supersede the M4c follow-up section above.
   names are `&'static str`, so typed names are interned and leaked once
   — the same trick libcosmic's own `FontConfig` conversion uses. An
   uninstalled name falls back to the default font at render time.
+
+## Wikilinks, footnotes and the file tree (follow-up rounds)
+
+Nine small rounds, each one a commit of its own (A–C).
+
+### Phase A — wikilinks read like links
+
+- **Highlighted in the editors** (A1): iced's highlighter is syntect's
+  Markdown grammar, which knows nothing about `[[wikilinks]]` — they came
+  out as plain text. `app/src/highlight.rs` now wraps that highlighter
+  and paints the links itself: the target half in the theme's accent,
+  the custom-label half in its green, so the two halves of `[[Note|as
+  written]]` read as two things. Both the source editor and the live
+  preview use it. The wrapper keeps the base highlighter's line-by-line
+  contract (the widget feeds lines in order and says which line
+  changed), so fenced code blocks are tracked here too: a wikilink
+  inside a code block is code, not a link. The fence state is
+  checkpointed every 50 lines — the base highlighter's own granularity —
+  so a jump back to an edited line restores the state there.
+- **Completion keeps the label** (A2): accepting a suggestion replaced
+  the whole link, so a label the user had already written was thrown
+  away (`[[|some label]]` became `[[Target]]`). The label that follows
+  the caret is now kept: the completion fills in the target, the label
+  stays, and the caret lands right after the bar — in front of the
+  label, ready to type it. The link's own closing brackets stay where
+  they are, so no brackets are duplicated. Both editors do this.
+- **Labels are inline markdown** (A3): the text after the bar is inline
+  markdown in Obsidian (`[[Note|*bold*]]` shows a bold label), but the
+  IR kept it as a raw string, so the label came out literally,
+  asterisks and all. `WikiLink.alias` is now `Option<Vec<Inline>>`:
+  the extraction stage keeps the raw label, the lowering stage parses it
+  once (`lower::parse_label`), and no renderer re-parses it. The HTML
+  renderer draws the label's markup inside the anchor (a nested anchor
+  is flattened to its text — a link cannot contain a link), the GUI
+  renders it as rich text in the link's color. An empty label falls back
+  to the target's own text; a label that is not inline markdown (a
+  heading, say) stays plain text.
+
+### Phase B — footnotes read like footnotes
+
+- **The definitions gather at the end** (B1): the reading view showed
+  the definitions where they stood in the source, with nothing between
+  them and the prose. They are now collected at the end of the document,
+  under a hairline rule, the way Obsidian's reading view does (and the
+  way the web renderer already did — its `<section class="footnotes">`
+  carries the rule in CSS). The blocks are still *rendered* in source
+  order — the callout fold ids are positional, and the live preview
+  counts them the same way — only their placement changes. Each
+  definition keeps its own block anchor, so a footnote reference still
+  jumps to it.
+- **The references read as raised markers** (B2): a footnote reference
+  showed its raw label (`[^1]` became `[1]` in the middle of the
+  sentence, at the size of the surrounding text). A numbered footnote
+  now reads as a raised marker: the digits are spelled with the Unicode
+  superscript characters (¹²³), because iced's text layout has no
+  baseline offset to raise them with. The marker wears the link color
+  and still jumps to its definition. A named footnote has no digits to
+  raise, so it keeps its bracketed label — smaller, so it does not
+  shout. The definitions wear the same marker, so the text and the
+  footnote list under the rule read as one.
+- **The definitions keep their blank line** (B3): a footnote definition
+  needs a blank line before it — without one, Markdown reads it as a
+  lazy continuation of the paragraph above and it never becomes a
+  footnote. Inserting a footnote did not care: it appended the
+  definition to the end of the note, right below whatever was there.
+  The insertion is now a pure function (`insert_footnote`) that
+  normalizes the definitions on the way: every top-level `[^label]:`
+  line gets exactly one blank line before it (a definition inside a
+  code fence is left alone). The cursor follows the lines the
+  normalization moves. The edit is one undoable step, as before, and a
+  selection is still replaced by the reference.
+
+### Phase C — the file tree and the status bar
+
+- **The tree can be sorted and folded** (C1): the sidebar's file tree
+  had one fixed order — folders by name, notes by name — and no way to
+  fold the whole tree away. A toolbar now sits above the tree. The sort
+  button shows the order in force (**Name A–Z**, **Name Z–A**,
+  **Newest first**, **Oldest first**); a click cycles through the four
+  and a right click opens the menu, where the order in force is
+  checked. The order is remembered across sessions. Folders always
+  come first and always sort by name; only the notes follow the chosen
+  order. The date orders use the note's modification time — the vault
+  does not timestamp attachments, so they sink to the bottom of a date
+  order. Two chevron buttons fold every folder away and open them all
+  again.
+- **The status bar counts the selection** (C2): the status bar only
+  knew the note ("42 words · 318 characters"). With text marked, that
+  number says nothing about the marked words — the thing the user is
+  actually counting. A selection now counts on its own, next to the
+  note's totals: "42 words · 318 characters (7 words · 41
+  characters)". The selection comes from the editor in front: the
+  source editor in the source and split panes, the focused block's
+  editor in the live pane. The reading pane shows no editor, so nothing
+  is selected there.
