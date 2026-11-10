@@ -972,6 +972,71 @@ pub(crate) fn wiki_close_run(text: &str, cursor: Position) -> usize {
         .count()
 }
 
+/// The custom label of the wikilink being typed, if it has one.
+///
+/// The label follows the bar: `[[target|label]]`. While the caret sits
+/// in the target part the label is *after* it, so accepting a
+/// suggestion must keep it: `[[|]]` becomes `[[Target|]]`, not
+/// `[[Target]]|]]`. Returns the label (without the bar and without the
+/// closing brackets) and the column where the replacement ends — the
+/// link's own `]]` stays where it is.
+pub(crate) fn wiki_alias_at(text: &str, cursor: Position) -> Option<(String, usize)> {
+    let line = text.split('\n').nth(cursor.line)?;
+    let end = line.len().min(cursor.column);
+    if !line.is_char_boundary(end) {
+        return None;
+    }
+    let after = &line[end..];
+    let bar = after.find('|')?;
+    // The label runs to the link's closing brackets. A link that is not
+    // closed on this line has no label worth preserving.
+    let close = after[bar + 1..].find("]]")?;
+    let label = after[bar + 1..bar + 1 + close].to_string();
+    Some((label, end + bar + 1 + close))
+}
+
+/// The edit that accepts a wikilink suggestion at `cursor`.
+///
+/// The partial `[[query` is replaced by the link to `target`. A custom
+/// label that follows the caret is kept, and the caret lands right
+/// after the bar — in front of the label, ready to type it.
+struct WikiReplacement {
+    /// The column where the partial link starts.
+    open: usize,
+    /// The column where the replacement ends.
+    end: usize,
+    /// The text that replaces the partial link.
+    text: String,
+    /// Where the caret lands afterwards, when that is not the end of
+    /// the pasted text.
+    caret: Option<usize>,
+}
+
+/// The replacement for the partial wikilink at `cursor`, linking to
+/// `target`. `None` when no wikilink is being typed there.
+fn wiki_replacement(text: &str, cursor: Position, target: &str) -> Option<WikiReplacement> {
+    let (open, _) = wiki_query_at(text, cursor)?;
+    match wiki_alias_at(text, cursor) {
+        Some((label, end)) => Some(WikiReplacement {
+            open,
+            end,
+            // The link's own closing brackets are already in the text
+            // and stay there.
+            text: format!("[[{target}|{label}"),
+            caret: Some(open + 2 + target.len() + 1),
+        }),
+        None => {
+            let close = wiki_close_run(text, cursor);
+            Some(WikiReplacement {
+                open,
+                end: cursor.column + close,
+                text: format!("[[{target}]]"),
+                caret: None,
+            })
+        }
+    }
+}
+
 /// Rank note paths against a partial wikilink query by title (empty
 /// queries pass everything through, like the quick switcher). Items are
 /// paths so duplicate-titled notes stay distinguishable.
@@ -2694,9 +2759,10 @@ impl VaultNotes {
 
     /// Accept the highlighted wikilink suggestion: replace the partial
     /// `[[query` up to the cursor with the target link (one undoable
-    /// step). The link text follows the link-path-format preference. In
-    /// live preview the edit lands in the focused region's buffer and
-    /// lifts into the note in the same batch.
+    /// step). The link text follows the link-path-format preference. A
+    /// custom label that follows the caret is kept. In live preview the
+    /// edit lands in the focused region's buffer and lifts into the note
+    /// in the same batch.
     fn wiki_accept(&mut self) -> Task<Message> {
         let Some(target) = self
             .wiki_complete
@@ -2722,10 +2788,7 @@ impl VaultNotes {
                         .collect()
                 })
                 .unwrap_or_default();
-            format!(
-                "[[{}]]",
-                link_target(&from, &target, &notes, self.link_path_format)
-            )
+            link_target(&from, &target, &notes, self.link_path_format)
         };
         if self.pane == PaneMode::Live {
             // Edit the region's buffer: select the partial `[[query`
@@ -2739,33 +2802,40 @@ impl VaultNotes {
                 let live = self.live.as_ref().expect("live block without state");
                 (live.editor.text(), live.editor.cursor().position)
             };
-            let Some((open_col, _)) = wiki_query_at(&text, cursor) else {
+            let Some(replacement) = wiki_replacement(&text, cursor, &link) else {
                 self.dismiss_editor_overlays();
                 return Task::none();
             };
-            // The auto-pair's closing brackets belong to the link being
-            // replaced: consume them, or the accepted link ends up with
-            // four of them.
-            let close = wiki_close_run(&text, cursor);
             if let Some(live) = self.live.as_mut() {
                 live.editor.move_to(Cursor {
                     position: Position {
                         line: cursor.line,
-                        column: cursor.column + close,
+                        column: replacement.end,
                     },
                     selection: Some(Position {
                         line: cursor.line,
-                        column: open_col,
+                        column: replacement.open,
                     }),
                 });
             }
-            let task = self.live_run(vec![Action::Edit(Edit::Paste(Arc::new(link)))]);
+            // The caret lands right after the bar when a label was kept.
+            let caret = replacement.caret.map(|column| Cursor {
+                position: Position {
+                    line: cursor.line,
+                    column,
+                },
+                selection: None,
+            });
+            let task = self.live_run_with(
+                vec![Action::Edit(Edit::Paste(Arc::new(replacement.text)))],
+                caret,
+            );
             self.dismiss_editor_overlays();
             return task;
         }
         let text = self.tabs[idx].content.text();
         let cursor = self.tabs[idx].content.cursor().position;
-        let Some((open_col, _)) = wiki_query_at(&text, cursor) else {
+        let Some(replacement) = wiki_replacement(&text, cursor, &link) else {
             self.dismiss_editor_overlays();
             return Task::none();
         };
@@ -2773,22 +2843,27 @@ impl VaultNotes {
         {
             let tab = &mut self.tabs[idx];
             push_undo(tab);
-            // The auto-pair's closing brackets belong to the link being
-            // replaced: consume them, or the accepted link ends up with
-            // four of them.
-            let close = wiki_close_run(&text, cursor);
             tab.content.move_to(Cursor {
                 position: Position {
                     line: cursor.line,
-                    column: cursor.column + close,
+                    column: replacement.end,
                 },
                 selection: Some(Position {
                     line: cursor.line,
-                    column: open_col,
+                    column: replacement.open,
                 }),
             });
             tab.content
-                .perform(Action::Edit(Edit::Paste(Arc::new(link))));
+                .perform(Action::Edit(Edit::Paste(Arc::new(replacement.text))));
+            if let Some(column) = replacement.caret {
+                tab.content.move_to(Cursor {
+                    position: Position {
+                        line: cursor.line,
+                        column,
+                    },
+                    selection: None,
+                });
+            }
             tab.refresh_doc();
         }
         self.last_edit = Some(std::time::Instant::now());
@@ -5546,6 +5621,72 @@ mod wiki_tests {
     }
 
     #[test]
+    fn the_custom_label_after_the_caret_is_found() {
+        // The caret sits in front of the bar; the label follows it.
+        assert_eq!(
+            wiki_alias_at("see [[|some label]]", Position { line: 0, column: 6 }),
+            Some(("some label".to_string(), 17))
+        );
+        // An empty label is still a label.
+        assert_eq!(
+            wiki_alias_at("see [[|]]", Position { line: 0, column: 6 }),
+            Some((String::new(), 7))
+        );
+        // No bar: no label.
+        assert_eq!(
+            wiki_alias_at("see [[Note]]", Position { line: 0, column: 6 }),
+            None
+        );
+        // A link that is not closed on this line has no label to keep.
+        assert_eq!(
+            wiki_alias_at("see [[|some label", Position { line: 0, column: 6 }),
+            None
+        );
+    }
+
+    #[test]
+    fn wiki_accept_keeps_the_custom_label() {
+        // The user made the link shape first and put the caret in
+        // front of the bar: accepting a suggestion fills in the target
+        // and leaves the label alone.
+        let mut app = find_tests::test_app_with_tab("see [[|]]\n");
+        app.pane = PaneMode::Source;
+        app.tabs[0].content.move_to(Cursor {
+            position: Position { line: 0, column: 6 },
+            selection: None,
+        });
+        app.wiki_complete = Some(WikiComplete {
+            items: vec!["Note Title.md".to_string()],
+            selected: 0,
+        });
+        app.wiki_accept();
+        assert_eq!(app.tabs[0].content.text(), "see [[Note Title|]]\n");
+        // The caret sits right after the bar.
+        assert_eq!(app.tabs[0].content.cursor().position.column, 17);
+    }
+
+    #[test]
+    fn wiki_accept_keeps_a_written_label() {
+        let mut app = find_tests::test_app_with_tab("see [[|some label]]\n");
+        app.pane = PaneMode::Source;
+        app.tabs[0].content.move_to(Cursor {
+            position: Position { line: 0, column: 6 },
+            selection: None,
+        });
+        app.wiki_complete = Some(WikiComplete {
+            items: vec!["Note Title.md".to_string()],
+            selected: 0,
+        });
+        app.wiki_accept();
+        assert_eq!(
+            app.tabs[0].content.text(),
+            "see [[Note Title|some label]]\n"
+        );
+        // The caret sits right after the bar, in front of the label.
+        assert_eq!(app.tabs[0].content.cursor().position.column, 17);
+    }
+
+    #[test]
     fn wiki_query_stops_at_closers_and_earlier_lines() {
         // A closed link suggests nothing.
         assert_eq!(
@@ -7348,6 +7489,26 @@ mod live_tests {
         });
         app.wiki_accept();
         assert_eq!(app.tabs[0].content.text(), "see [[My Link]]\n");
+    }
+
+    #[test]
+    fn wiki_accept_in_live_mode_keeps_the_custom_label() {
+        let mut app = find_tests::test_app_with_tab("see [[|]]\n");
+        app.live_focus(0);
+        // The caret sits in front of the bar.
+        let live = app.live.as_mut().unwrap();
+        live.editor.move_to(Cursor {
+            position: Position { line: 0, column: 6 },
+            selection: None,
+        });
+        app.wiki_complete = Some(WikiComplete {
+            items: vec!["Alpha.md".to_string()],
+            selected: 0,
+        });
+        app.wiki_accept();
+        assert_eq!(app.tabs[0].content.text(), "see [[Alpha|]]\n");
+        // The caret sits right after the bar.
+        assert_eq!(caret(&app), (0, 12));
     }
 
     #[test]
