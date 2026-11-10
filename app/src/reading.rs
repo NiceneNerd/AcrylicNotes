@@ -133,6 +133,24 @@ fn inline_text(inline: &Inline) -> String {
     }
 }
 
+/// The superscript digits of a footnote number: `12` becomes `¹²`.
+///
+/// iced's text layout has no baseline offset, so a raised marker is
+/// spelled with the Unicode superscript characters. `None` for a label
+/// that is not a number — a named footnote keeps its label.
+fn superscript_digits(label: &str) -> Option<String> {
+    if label.is_empty() || !label.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    const DIGITS: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+    Some(
+        label
+            .chars()
+            .map(|c| DIGITS[c.to_digit(10).expect("an ASCII digit") as usize])
+            .collect(),
+    )
+}
+
 /// The plain text of a run of inlines.
 fn inline_texts(inlines: &[Inline]) -> String {
     inlines.iter().map(inline_text).collect()
@@ -371,15 +389,16 @@ pub(crate) fn render_block<'a>(
         Block::EmbedBlock(embed) => render_embed(embed, ctx, depth, stack, fold_id),
         Block::FootnoteDef { label, body } => {
             let inner = render_blocks(body, ctx, depth, stack, fold_id);
+            // The marker matches the one in the text: a raised number for
+            // a numbered footnote, the label itself for a named one.
+            let marker = match superscript_digits(label) {
+                Some(digits) => text(digits).size(14.0).class(ctx.palette.accent),
+                None => text(format!("[{label}]"))
+                    .size(12.0)
+                    .class(ctx.palette.muted),
+            };
             row::Row::new()
-                .push(
-                    container(
-                        text(format!("↩ {label}"))
-                            .size(12.0)
-                            .class(ctx.palette.muted),
-                    )
-                    .width(Length::Fixed(52.0)),
-                )
+                .push(container(marker).width(Length::Fixed(52.0)))
                 .push(container(inner).width(Length::Fill))
                 .into()
         }
@@ -669,11 +688,20 @@ fn collect_inline_into<'a>(
                 );
             }
             Inline::FootnoteRef(label) => {
-                spans.push(
-                    Span::new(format!("[{label}]"))
-                        .color(ctx.palette.muted)
-                        .link(format!("fnref:{label}")),
-                );
+                let uri = format!("fnref:{label}");
+                match superscript_digits(label) {
+                    // A numbered footnote reads as a raised marker.
+                    Some(marker) => {
+                        spans.push(Span::new(marker).color(ctx.palette.accent).link(uri))
+                    }
+                    // A named one keeps its bracketed label, smaller.
+                    None => spans.push(
+                        Span::new(format!("[{label}]"))
+                            .size(12.0)
+                            .color(ctx.palette.muted)
+                            .link(uri),
+                    ),
+                }
             }
             Inline::InlineFootnote(inner) => {
                 spans.push(base_span("(".to_string(), style, ctx).color(ctx.palette.muted));
@@ -1184,6 +1212,17 @@ mod tests {
         assert_eq!(prose, vec![0, 1]);
         // …and the definitions come last, where the rule goes.
         assert_eq!(footnotes, vec![2]);
+    }
+
+    #[test]
+    fn footnote_numbers_become_superscript_digits() {
+        assert_eq!(superscript_digits("1").as_deref(), Some("¹"));
+        assert_eq!(superscript_digits("12").as_deref(), Some("¹²"));
+        assert_eq!(superscript_digits("0").as_deref(), Some("⁰"));
+        // A named footnote has no digits to raise.
+        assert_eq!(superscript_digits("note"), None);
+        assert_eq!(superscript_digits(""), None);
+        assert_eq!(superscript_digits("1a"), None);
     }
 
     #[test]
