@@ -483,6 +483,8 @@ pub enum Message {
     LiveDelete,
     /// Commit the open region and let the blocks render again (Escape).
     LiveDismiss,
+    /// Apply markdown formatting to the focused region's selection.
+    LiveFormat(Format),
     SwitcherToggle,
     SwitcherInput(String),
     SwitcherMove(i32),
@@ -1161,6 +1163,35 @@ pub(crate) fn editor_shortcut(press: text_editor::KeyPress) -> Option<Message> {
     }
 }
 
+/// The markdown formatting shortcut the live block editor shares with
+/// the source editor: Ctrl+B/I/K/`, Ctrl+Shift+X/H.
+///
+/// Footnote (Ctrl+Alt+F) stays source-only on purpose: its definition
+/// belongs at the end of the *note*, while the live editor's buffer
+/// holds one region's source.
+pub(crate) fn live_format_shortcut(press: text_editor::KeyPress) -> Option<Format> {
+    if !matches!(press.status, text_editor::Status::Focused { .. }) {
+        return None;
+    }
+    if !press.modifiers.command() {
+        return None;
+    }
+    let shift = press.modifiers.shift();
+    let alt = press.modifiers.alt();
+    let cosmic::iced::keyboard::Key::Character(c) = &press.key else {
+        return None;
+    };
+    match (c.to_lowercase().as_str(), shift, alt) {
+        ("b", _, false) => Some(Format::Bold),
+        ("i", _, false) => Some(Format::Italic),
+        ("k", _, false) => Some(Format::Link),
+        ("`", _, false) => Some(Format::Code),
+        ("x", true, false) => Some(Format::Strike),
+        ("h", true, false) => Some(Format::Highlight),
+        _ => None,
+    }
+}
+
 /// While Unicode codepoint entry is open, map an editor key press:
 /// typed characters feed the hex buffer (the handler keeps only hex
 /// digits), Space/Enter commit, Backspace unravels, Esc cancels, and
@@ -1211,9 +1242,14 @@ fn build_nav_model() -> nav_bar::Model {
     model
 }
 
-/// The header pane-mode segmented control: Source / Reading / Split, with
-/// the default mode (`Split`) active.
-fn build_pane_model() -> segmented_button::Model<segmented_button::SingleSelect> {
+/// The header pane-mode segmented control: Live / Split / Source /
+/// Reading, with `active` highlighted.
+///
+/// The highlighted button must follow the pane that is *rendered*, which
+/// at startup is the persisted default layout — not `PaneMode::default()`.
+/// Highlighting the default instead left "Live" lit while the persisted
+/// "Split" layout rendered.
+fn build_pane_model(active: PaneMode) -> segmented_button::Model<segmented_button::SingleSelect> {
     let mut model = segmented_button::Model::default();
     for (i, (mode, label)) in [
         (PaneMode::Live, "Live"),
@@ -1225,7 +1261,7 @@ fn build_pane_model() -> segmented_button::Model<segmented_button::SingleSelect>
     .enumerate()
     {
         model.insert().text(label).data(mode);
-        if mode == PaneMode::default() {
+        if mode == active {
             model.activate_position(i as u16);
         }
     }
@@ -1544,6 +1580,19 @@ impl VaultNotes {
         }
     }
 
+    /// Switch the rendered pane mode, keeping the pane buttons in step:
+    /// the highlighted button must always name the pane on screen.
+    fn set_pane(&mut self, mode: PaneMode) {
+        self.pane = mode;
+        let target = self
+            .pane_model
+            .iter()
+            .find(|id| self.pane_model.data::<PaneMode>(*id) == Some(&mode));
+        if let Some(id) = target {
+            self.pane_model.activate(id);
+        }
+    }
+
     /// Scroll the active tab's reading view to top-level block `idx`,
     /// switching out of source-only mode so the jump is visible.
     fn jump_to_block(&mut self, idx: usize) -> Task<Message> {
@@ -1561,7 +1610,7 @@ impl VaultNotes {
             }
         }
         if self.pane == PaneMode::Source {
-            self.pane = PaneMode::Split;
+            self.set_pane(PaneMode::Split);
         }
         // No frame deferral needed even when the pane just switched: the
         // iced runner rebuilds all user interfaces *before* running the
@@ -3138,7 +3187,7 @@ impl cosmic::Application for VaultNotes {
             wiki_complete: None,
             live: None,
             nav_model: build_nav_model(),
-            pane_model: build_pane_model(),
+            pane_model: build_pane_model(persisted.default_pane),
             tab_model: segmented_button::Model::default(),
         };
         app.core.set_header_title("Vault Notes".to_string());
@@ -3351,7 +3400,7 @@ impl cosmic::Application for VaultNotes {
             Message::PaneActivated(id) => {
                 self.pane_model.activate(id);
                 if let Some(mode) = self.pane_model.data::<PaneMode>(id).copied() {
-                    self.pane = mode;
+                    self.set_pane(mode);
                 }
                 // Live-editing state belongs to the pane; leaving it (or
                 // entering it fresh) drops the open region.
@@ -3420,6 +3469,16 @@ impl cosmic::Application for VaultNotes {
             Message::LiveDismiss => {
                 self.live = None;
                 Task::none()
+            }
+            Message::LiveFormat(format) => {
+                // The live editor has its own buffer: the selection and
+                // the markers belong to the focused region, and the
+                // splice back into the note is `live_run`'s job.
+                let Some(live) = self.live.as_ref() else {
+                    return Task::none();
+                };
+                let actions = format_actions(live.editor.selection(), format);
+                self.live_run(actions)
             }
             Message::EditorUndo => {
                 if let Some(idx) = self.active {
@@ -3915,7 +3974,7 @@ impl cosmic::Application for VaultNotes {
                 let query = self.search_query.clone();
                 let open_task = self.open_tab(path);
                 if self.pane == PaneMode::Source {
-                    self.pane = PaneMode::Split;
+                    self.set_pane(PaneMode::Split);
                 }
                 // Scroll to the first block whose text contains the query.
                 // No deferral needed: the runner rebuilds the view (with the
@@ -4456,7 +4515,7 @@ mod chrome_model_tests {
 
     #[test]
     fn pane_model_defaults_to_live() {
-        let mut model = build_pane_model();
+        let mut model = build_pane_model(PaneMode::default());
         assert_eq!(model.len(), 4);
         assert_eq!(
             model.data::<PaneMode>(model.active()),
@@ -4480,6 +4539,45 @@ mod chrome_model_tests {
             model.data::<PaneMode>(model.active()),
             Some(&PaneMode::Source)
         );
+    }
+
+    #[test]
+    fn pane_model_highlights_the_persisted_layout_not_the_default() {
+        // Startup renders the persisted layout: the highlighted button
+        // must name that pane, or the control lies about what is on
+        // screen.
+        for mode in [
+            PaneMode::Live,
+            PaneMode::Split,
+            PaneMode::Source,
+            PaneMode::Reading,
+        ] {
+            let model = build_pane_model(mode);
+            assert_eq!(
+                model.data::<PaneMode>(model.active()),
+                Some(&mode),
+                "pane button does not follow {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_pane_keeps_the_rendered_pane_and_the_button_in_step() {
+        let mut app = find_tests::test_app_with_tab("hello");
+        for mode in [
+            PaneMode::Split,
+            PaneMode::Source,
+            PaneMode::Reading,
+            PaneMode::Live,
+        ] {
+            app.set_pane(mode);
+            assert_eq!(app.pane, mode);
+            assert_eq!(
+                app.pane_model.data::<PaneMode>(app.pane_model.active()),
+                Some(&mode),
+                "pane button does not follow {mode:?}"
+            );
+        }
     }
 
     #[test]
@@ -4541,12 +4639,50 @@ mod editor_tests {
     }
 
     #[test]
+    fn live_format_shortcuts_map_to_the_formatting_markers() {
+        let ctrl = Modifiers::CTRL;
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        assert_eq!(
+            live_format_shortcut(key_press(Key::Character("b".into()), ctrl)),
+            Some(Format::Bold)
+        );
+        assert_eq!(
+            live_format_shortcut(key_press(Key::Character("i".into()), ctrl)),
+            Some(Format::Italic)
+        );
+        assert_eq!(
+            live_format_shortcut(key_press(Key::Character("k".into()), ctrl)),
+            Some(Format::Link)
+        );
+        assert_eq!(
+            live_format_shortcut(key_press(Key::Character("`".into()), ctrl)),
+            Some(Format::Code)
+        );
+        assert_eq!(
+            live_format_shortcut(key_press(Key::Character("x".into()), ctrl_shift)),
+            Some(Format::Strike)
+        );
+        assert_eq!(
+            live_format_shortcut(key_press(Key::Character("h".into()), ctrl_shift)),
+            Some(Format::Highlight)
+        );
+        // Unmodified keys and non-formatting combos are not formats.
+        assert_eq!(
+            live_format_shortcut(key_press(Key::Character("b".into()), Modifiers::default())),
+            None
+        );
+        assert_eq!(
+            live_format_shortcut(key_press(Key::Character("z".into()), ctrl)),
+            None
+        );
+    }
+
+    #[test]
     fn editor_shortcuts_map_to_messages() {
         let ctrl = Modifiers::CTRL;
         let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
         let ctrl_shift_alt = Modifiers::CTRL | Modifiers::SHIFT | Modifiers::ALT;
         let ctrl_alt = Modifiers::CTRL | Modifiers::ALT;
-
         assert!(matches!(
             editor_shortcut(key_press(Key::Character("z".into()), ctrl)),
             Some(Message::EditorUndo)
@@ -5135,7 +5271,7 @@ mod find_tests {
             wiki_complete: None,
             live: None,
             nav_model: build_nav_model(),
-            pane_model: build_pane_model(),
+            pane_model: build_pane_model(PaneMode::default()),
             tab_model: segmented_button::Model::default(),
         };
         app.tabs.push(Tab::open("t.md".to_string(), text));
@@ -6440,6 +6576,38 @@ mod live_tests {
         // The edit is real: dirty, undoable, autosave-timed.
         assert!(app.tabs[0].is_dirty());
         assert!(app.last_edit.is_some());
+    }
+
+    #[test]
+    fn live_format_wraps_the_regions_selection() {
+        let mut app = find_tests::test_app_with_tab("alpha here\n\nbeta");
+        app.live_focus(0);
+        // Select "here" inside the focused region.
+        let live = app.live.as_mut().unwrap();
+        live.editor.move_to(Cursor {
+            position: Position { line: 0, column: 6 },
+            selection: Some(Position {
+                line: 0,
+                column: 10,
+            }),
+        });
+        app.update(Message::LiveFormat(Format::Bold));
+        // The markers went into the region buffer and were spliced back
+        // into the note.
+        assert_eq!(app.tabs[0].content.text(), "alpha **here**\n\nbeta");
+        assert_eq!(app.live.as_ref().unwrap().editor.text(), "alpha **here**\n");
+    }
+
+    #[test]
+    fn live_format_without_a_selection_inserts_empty_markers() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta");
+        app.live_focus(0);
+        aim(&mut app, 0, 5);
+        app.update(Message::LiveFormat(Format::Bold));
+        // The same convention as the source editor: an empty bold is the
+        // marker pair `****` with the caret in the middle.
+        assert_eq!(app.tabs[0].content.text(), "alpha****\n\nbeta");
+        assert_eq!(caret(&app), (0, 7));
     }
 
     #[test]

@@ -1344,12 +1344,15 @@ fn focused_block_editor<'a>(
 
 /// The live editor's key bindings: Escape commits the region (or, with
 /// the wiki dropdown open, dismisses it — the dropdown wins), undo/redo
-/// stay app-scoped since the whole note is the undo unit, the four
-/// boundary keys — arrows, backspace, delete — are intercepted so
-/// `app.rs` can decide between a plain motion and crossing into a
-/// neighboring region, and typed brackets/quotes route through the
-/// auto-pair table. Everything else (typing, Enter, copy/paste,
-/// selection) falls back to the editor's own bindings.
+/// stay app-scoped since the whole note is the undo unit, the markdown
+/// formatting shortcuts (Ctrl+B/I/K/`, Ctrl+Shift+X/H) become
+/// `LiveFormat` messages applied to the live buffer, the four boundary
+/// keys — arrows, backspace, delete — are intercepted so `app.rs` can
+/// decide between a plain motion and crossing into a neighboring region,
+/// and typed brackets/quotes route through the auto-pair table.
+/// Everything else (typing, Enter, copy/paste, selection) falls back to
+/// the editor's own bindings — including Ctrl combos the formatting map
+/// does not claim, so copy/cut/paste/select-all keep working.
 pub(crate) fn live_key_binding(
     press: text_editor::KeyPress,
     wiki_open: bool,
@@ -1381,7 +1384,13 @@ pub(crate) fn live_key_binding(
                 ("z", false) => Some(text_editor::Binding::Custom(Message::EditorUndo)),
                 ("z", true) => Some(text_editor::Binding::Custom(Message::EditorRedo)),
                 ("y", false) => Some(text_editor::Binding::Custom(Message::EditorRedo)),
-                _ => None,
+                _ => match crate::app::live_format_shortcut(press.clone()) {
+                    Some(format) => Some(text_editor::Binding::Custom(Message::LiveFormat(format))),
+                    // Unhandled ctrl combos keep the editor's own
+                    // bindings (copy, cut, paste, select all) — the
+                    // source editor falls back the same way.
+                    None => text_editor::Binding::from_key_press(press),
+                },
             }
         }
         Key::Character(_) if plain && typed.is_some_and(|c| crate::app::pair_for(c).is_some()) => {
