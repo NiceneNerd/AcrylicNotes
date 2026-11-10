@@ -162,13 +162,50 @@ pub fn render_doc<'a>(doc: &Doc, ctx: &Ctx<'a>) -> Element<'a, Message> {
     // embeds) keeps them globally unique per tab.
     let mut fold_id = 0u64;
     let stack = vec![ctx.from.clone()];
-    for (i, block) in doc.blocks.iter().enumerate() {
-        let element = render_block(block, ctx, 0, &stack, &mut fold_id);
+    // The blocks are RENDERED in source order — the fold ids are positional
+    // and the live preview counts them the same way — but PLACED in reading
+    // order: the prose first, the footnote definitions last, under a rule.
+    let (prose, footnotes) = reading_order(&doc.blocks);
+    let mut rendered: Vec<Option<Element<'a, Message>>> = Vec::with_capacity(doc.blocks.len());
+    for block in &doc.blocks {
+        rendered.push(Some(render_block(block, ctx, 0, &stack, &mut fold_id)));
+    }
+    for i in prose {
+        let element = rendered[i].take().expect("every block renders once");
         // Anchor every top-level block so outline/search jumps can measure
         // and scroll to it (see scroll.rs). The container is pass-through.
         col = col.push(container(element).id(Id::from(format!("block-{i}"))));
     }
+    if !footnotes.is_empty() {
+        // The rule: a hairline between the prose and the footnotes.
+        col = col.push(cosmic::iced::widget::rule::horizontal(1));
+        for i in footnotes {
+            let element = rendered[i].take().expect("every block renders once");
+            // The anchor keeps the block's own index, so a footnote
+            // reference still jumps to its definition.
+            col = col.push(container(element).id(Id::from(format!("block-{i}"))));
+        }
+    }
     col.into()
+}
+
+/// A document's blocks in reading order: the prose first, the footnote
+/// definitions last.
+///
+/// Obsidian's reading view gathers the footnote definitions at the end of
+/// the document, under a rule; the web renderer does the same (see
+/// vault-md's `<section class="footnotes">`). The GUI follows.
+fn reading_order(blocks: &[Block]) -> (Vec<usize>, Vec<usize>) {
+    let mut prose = Vec::with_capacity(blocks.len());
+    let mut footnotes = Vec::new();
+    for (i, block) in blocks.iter().enumerate() {
+        if matches!(block, Block::FootnoteDef { .. }) {
+            footnotes.push(i);
+        } else {
+            prose.push(i);
+        }
+    }
+    (prose, footnotes)
 }
 
 /// How many stop positions the fold-id cursor advances for this doc: one
@@ -1137,6 +1174,16 @@ mod tests {
         assert!(matches!(alias[2], Inline::Emph(_)), "{alias:?}");
         // And it reads as its plain text.
         assert_eq!(plain_inlines(&alias), "bold and em");
+    }
+
+    #[test]
+    fn the_footnotes_are_rendered_last_under_the_rule() {
+        let doc = parse_note("Text[^1]\n\nMore text.\n\n[^1]: The note.\n");
+        let (prose, footnotes) = reading_order(&doc.blocks);
+        // The prose keeps its source order…
+        assert_eq!(prose, vec![0, 1]);
+        // …and the definitions come last, where the rule goes.
+        assert_eq!(footnotes, vec![2]);
     }
 
     #[test]
