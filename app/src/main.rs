@@ -10,6 +10,7 @@ mod drag;
 mod editor_text;
 mod fuzzy;
 mod glass;
+mod highlight;
 mod live;
 mod reading;
 mod scroll;

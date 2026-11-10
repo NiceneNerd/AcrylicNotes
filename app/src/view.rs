@@ -1012,7 +1012,7 @@ fn editor_pane<'a>(
         } else {
             cosmic::iced::core::text::Wrapping::None
         })
-        .highlight_with::<cosmic::iced::highlighter::Highlighter>(
+        .highlight_with::<crate::highlight::MarkdownHighlighter>(
             cosmic::iced::highlighter::Settings {
                 theme: highlighter_theme,
                 token: "md".to_string(),
@@ -1020,6 +1020,7 @@ fn editor_pane<'a>(
             // Token colors are contrast-checked against the editor
             // surface (see contrast.rs): dim syntax colors on custom
             // themes are lifted to the AA bar, strong ones unchanged.
+            // Wikilinks are painted on top (see highlight.rs).
             editor_highlight_format,
         )
         // Editor-scoped shortcuts: undo/redo, formatting, footnotes,
@@ -1309,7 +1310,7 @@ fn focused_block_editor<'a>(
         } else {
             cosmic::iced::core::text::Wrapping::None
         })
-        .highlight_with::<cosmic::iced::highlighter::Highlighter>(
+        .highlight_with::<crate::highlight::MarkdownHighlighter>(
             cosmic::iced::highlighter::Settings {
                 theme: highlighter_theme,
                 token: "md".to_string(),

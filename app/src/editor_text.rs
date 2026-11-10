@@ -248,12 +248,22 @@ pub fn span_font(span: cosmic::iced::Font, base: cosmic::iced::Font) -> cosmic::
 /// surface, so dim tokens (comments, headings on custom themes) are
 /// lifted to the AA bar while strong ones pass through untouched. Each
 /// span is also re-rooted on the editor's actual font (see `span_font`).
+///
+/// A wikilink range overrides the markdown color: the target half wears
+/// the theme's accent, the custom-label half its green — the two sides
+/// of `[[target|label]]` read apart at a glance.
 pub fn editor_highlight_format(
-    highlight: &cosmic::iced::highlighter::Highlight,
+    highlight: &crate::highlight::Highlight,
     theme: &cosmic::Theme,
 ) -> cosmic::iced::core::text::highlighter::Format<cosmic::iced::Font> {
-    let mut format = highlight.to_format();
-    if let Some(color) = format.color {
+    use crate::highlight::WikiPart;
+    let mut format = highlight.base;
+    let color = match highlight.wiki {
+        Some(WikiPart::Target) => Some(palette_color(theme.cosmic().accent.base)),
+        Some(WikiPart::Alias) => Some(palette_color(theme.cosmic().success.base)),
+        None => format.color,
+    };
+    if let Some(color) = color {
         format.color = Some(ensure_contrast(
             color,
             editor_surface(theme),
@@ -411,6 +421,47 @@ mod tests {
             fixed.style, base.style,
             "a bold-only span keeps the base style"
         );
+    }
+
+    #[test]
+    fn wikilinks_get_two_distinct_readable_colors() {
+        use crate::highlight::WikiPart;
+        use cosmic::iced::core::text::highlighter::Format;
+
+        let theme = cosmic::Theme::default();
+        let base = Format {
+            color: None,
+            font: None,
+        };
+        let target = editor_highlight_format(
+            &crate::highlight::Highlight {
+                base,
+                wiki: Some(WikiPart::Target),
+            },
+            &theme,
+        );
+        let alias = editor_highlight_format(
+            &crate::highlight::Highlight {
+                base,
+                wiki: Some(WikiPart::Alias),
+            },
+            &theme,
+        );
+        let target = target.color.expect("the target half is colored");
+        let alias = alias.color.expect("the label half is colored");
+        assert_ne!(
+            (target.r, target.g, target.b),
+            (alias.r, alias.g, alias.b),
+            "the two sides of a wikilink read apart"
+        );
+        // Both meet the syntax-token bar on the editor surface.
+        let surface = editor_surface(&theme);
+        for color in [target, alias] {
+            assert!(
+                contrast_ratio(composite_over(color, surface), surface)
+                    >= EDITOR_SECONDARY_MIN_CONTRAST
+            );
+        }
     }
 
     #[test]
