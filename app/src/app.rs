@@ -2013,19 +2013,22 @@ impl VaultNotes {
             return Task::none();
         }
         let slices = self.live_slices(tab_idx);
-        let text = self.tabs[tab_idx].content.text();
-        let Some(source) = slices.get(live_block).map(|s| s.source(&text)) else {
+        if live_block >= slices.len() {
             return Task::none();
-        };
-        let at_boundary = if up {
-            cursor.position.line == 0
-        } else {
-            cursor.position.line + 1 >= source.split('\n').count()
-        };
-        if !at_boundary {
-            if let Some(live) = self.live.as_mut() {
-                live.editor.perform(Action::Move(motion));
-            }
+        }
+        let text = self.tabs[tab_idx].content.text();
+        // The editor's own motion is visual-line aware: it walks the
+        // wrapped rows of a long line before it would leave the region.
+        // Only a motion that cannot move the caret (the caret is on the
+        // region's first or last visual row) crosses into the neighbor.
+        let before = cursor.position;
+        if let Some(live) = self.live.as_mut() {
+            live.editor.perform(Action::Move(motion));
+        }
+        let after = self.live.as_ref().map(|live| live.editor.cursor().position);
+        if after != Some(before) {
+            // The caret moved inside the region — possibly from one
+            // wrapped row of a long line to the next.
             return Task::none();
         }
         if up {
@@ -4228,10 +4231,17 @@ impl cosmic::Application for VaultNotes {
                         _ => Task::none(),
                     }
                 } else if self.wiki_complete.is_some() {
-                    // The editor's own key_binding already intercepts these
-                    // (returning WikiDismiss for Esc), so events here are
-                    // ones the editor ignored — e.g. the editor not focused.
+                    // The editor's own key_binding already intercepts
+                    // these (arrows walk the suggestions, Esc dismisses
+                    // them), so events here are ones the editor ignored
+                    // — e.g. the editor not focused.
                     match key {
+                        Key::Named(Named::ArrowUp) if modifiers == Modifiers::default() => {
+                            self.update(Message::WikiCycle(-1))
+                        }
+                        Key::Named(Named::ArrowDown) if modifiers == Modifiers::default() => {
+                            self.update(Message::WikiCycle(1))
+                        }
                         Key::Named(Named::Tab) if modifiers.control() => {
                             let step: i32 = if modifiers.shift() { -1 } else { 1 };
                             self.update(Message::WikiCycle(step))
@@ -7153,6 +7163,93 @@ mod live_tests {
             ),
             None
         ));
+    }
+
+    #[test]
+    fn the_arrows_walk_the_region_before_crossing_into_the_next_one() {
+        // A paragraph of two lines: the caret walks the region's own
+        // lines first. (The editor's motion is visual-line aware, so a
+        // wrapped line counts as the several rows it is drawn as.)
+        let mut app = find_tests::test_app_with_tab("alpha\nbeta\n\ngamma");
+        app.live_focus(0);
+        aim(&mut app, 0, 0);
+        app.update(Message::LiveDown);
+        assert_eq!(
+            app.live.as_ref().unwrap().block,
+            0,
+            "the caret stays inside the region while it can move"
+        );
+        assert_eq!(caret(&app), (1, 0));
+        // The region's trailing blank line is still inside the region.
+        app.update(Message::LiveDown);
+        assert_eq!(app.live.as_ref().unwrap().block, 0);
+        assert_eq!(caret(&app), (2, 0));
+        // The next Down has nowhere left to go inside the region: it
+        // crosses into the next one.
+        app.update(Message::LiveDown);
+        assert_eq!(app.live.as_ref().unwrap().block, 1);
+    }
+
+    #[test]
+    fn the_wiki_dropdown_owns_the_arrows_while_it_is_open() {
+        let plain = Modifiers::default();
+        // The live editor: the arrows walk the suggestions instead of
+        // moving the caret between blocks.
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Named(Named::ArrowUp), plain), true),
+            Some(text_editor::Binding::Custom(Message::WikiCycle(-1)))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Named(Named::ArrowDown), plain), true),
+            Some(text_editor::Binding::Custom(Message::WikiCycle(1)))
+        ));
+        // Without the dropdown, the arrows keep navigating the regions.
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Named(Named::ArrowUp), plain), false),
+            Some(text_editor::Binding::Custom(Message::LiveUp))
+        ));
+        // The source editor: same, and the arrows leave the caret alone.
+        assert!(matches!(
+            crate::view::editor_key_binding(press(Key::Named(Named::ArrowUp), plain), true, false),
+            Some(text_editor::Binding::Custom(Message::WikiCycle(-1)))
+        ));
+        assert!(matches!(
+            crate::view::editor_key_binding(
+                press(Key::Named(Named::ArrowDown), plain),
+                true,
+                false
+            ),
+            Some(text_editor::Binding::Custom(Message::WikiCycle(1)))
+        ));
+        // Escape still dismisses the dropdown in both editors.
+        assert!(matches!(
+            crate::view::editor_key_binding(press(Key::Named(Named::Escape), plain), true, false),
+            Some(text_editor::Binding::Custom(Message::WikiDismiss))
+        ));
+        // Shift+Arrow still extends the selection instead.
+        assert!(matches!(
+            crate::view::live_key_binding(
+                press(Key::Named(Named::ArrowDown), Modifiers::SHIFT),
+                true
+            ),
+            Some(text_editor::Binding::Select(_))
+        ));
+    }
+
+    #[test]
+    fn the_arrows_walk_the_suggestions() {
+        let mut app = find_tests::test_app_with_tab("see [[no\n");
+        app.wiki_complete = Some(WikiComplete {
+            items: vec!["Alpha.md".to_string(), "Beta.md".to_string()],
+            selected: 0,
+        });
+        app.update(Message::WikiCycle(1));
+        assert_eq!(app.wiki_complete.as_ref().unwrap().selected, 1);
+        app.update(Message::WikiCycle(-1));
+        assert_eq!(app.wiki_complete.as_ref().unwrap().selected, 0);
+        // The wrap-around keeps the highlight in range.
+        app.update(Message::WikiCycle(-1));
+        assert_eq!(app.wiki_complete.as_ref().unwrap().selected, 1);
     }
 
     #[test]

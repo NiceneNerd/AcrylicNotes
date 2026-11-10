@@ -5,6 +5,7 @@
 //! `Message`. Colors come from the active cosmic theme via `Palette`.
 
 use cosmic::iced::core::widget::Id;
+use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
 use cosmic::iced::widget::{opaque, stack, text_editor};
 use cosmic::iced::{alignment, border, Background, Length, Padding};
 use cosmic::widget::{
@@ -1025,29 +1026,7 @@ fn editor_pane<'a>(
         // word delete. Anything else falls back to the editor's own
         // bindings (copy/cut/paste/select-all, arrows, …).
         .key_binding(move |press: text_editor::KeyPress| {
-            // While Unicode codepoint entry (Ctrl+Shift+U) is open, the
-            // editor swallows typing and feeds the hex buffer instead.
-            if app.unicode_input.is_some() {
-                if let Some(binding) = unicode_entry_binding(&press) {
-                    return Some(binding);
-                }
-            }
-            // While the wikilink dropdown is open, Esc dismisses it
-            // instead of the editor's default unfocus. (Tab and
-            // Ctrl+Tab are not editor-bound; they reach the global
-            // handler, which accepts/cycles the dropdown.)
-            if wiki.is_some()
-                && press.key
-                    == cosmic::iced::keyboard::Key::Named(
-                        cosmic::iced::keyboard::key::Named::Escape,
-                    )
-            {
-                return Some(text_editor::Binding::Custom(Message::WikiDismiss));
-            }
-            match editor_shortcut(press.clone()) {
-                Some(message) => Some(text_editor::Binding::Custom(message)),
-                None => text_editor::Binding::from_key_press(press),
-            }
+            editor_key_binding(press, wiki.is_some(), app.unicode_input.is_some())
         })
         .style(editor_surface_style);
     let surface: Element<'a, Message> = container(editor)
@@ -1342,14 +1321,58 @@ fn focused_block_editor<'a>(
         .into()
 }
 
+/// The source editor's key bindings.
+///
+/// While Unicode codepoint entry (Ctrl+Shift+U) is open, the editor
+/// swallows typing and feeds the hex buffer instead. While the wikilink
+/// dropdown is open, Esc dismisses it instead of the editor's default
+/// unfocus, and the arrows walk the suggestions instead of moving the
+/// caret. (Tab and Ctrl+Tab are not editor-bound; they reach the
+/// global handler, which accepts/cycles the dropdown.)
+///
+/// Everything else is an editor-scoped shortcut (undo/redo, formatting,
+/// footnotes, word delete) or falls back to the editor's own bindings
+/// (copy/cut/paste/select-all, arrows, …).
+pub(crate) fn editor_key_binding(
+    press: text_editor::KeyPress,
+    wiki_open: bool,
+    unicode_open: bool,
+) -> Option<text_editor::Binding<Message>> {
+    if unicode_open {
+        if let Some(binding) = unicode_entry_binding(&press) {
+            return Some(binding);
+        }
+    }
+    if wiki_open {
+        match &press.key {
+            Key::Named(Named::Escape) => {
+                return Some(text_editor::Binding::Custom(Message::WikiDismiss));
+            }
+            Key::Named(Named::ArrowUp) if press.modifiers == Modifiers::default() => {
+                return Some(text_editor::Binding::Custom(Message::WikiCycle(-1)));
+            }
+            Key::Named(Named::ArrowDown) if press.modifiers == Modifiers::default() => {
+                return Some(text_editor::Binding::Custom(Message::WikiCycle(1)));
+            }
+            _ => {}
+        }
+    }
+    match editor_shortcut(press.clone()) {
+        Some(message) => Some(text_editor::Binding::Custom(message)),
+        None => text_editor::Binding::from_key_press(press),
+    }
+}
+
 /// The live editor's key bindings: Escape commits the region (or, with
-/// the wiki dropdown open, dismisses it — the dropdown wins), undo/redo
-/// stay app-scoped since the whole note is the undo unit, the markdown
-/// formatting shortcuts (Ctrl+B/I/K/`, Ctrl+Shift+X/H) become
-/// `LiveFormat` messages applied to the live buffer, the four boundary
-/// keys — arrows, backspace, delete — are intercepted so `app.rs` can
-/// decide between a plain motion and crossing into a neighboring region,
-/// and typed brackets/quotes route through the auto-pair table.
+/// the wiki dropdown open, dismisses it — the dropdown wins), the arrows
+/// walk the dropdown's suggestions while it is open (and otherwise move
+/// the caret), undo/redo stay app-scoped since the whole note is the
+/// undo unit, the markdown formatting shortcuts (Ctrl+B/I/K/`,
+/// Ctrl+Shift+X/H) become `LiveFormat` messages applied to the live
+/// buffer, the four boundary keys — arrows, backspace, delete — are
+/// intercepted so `app.rs` can decide between a plain motion and
+/// crossing into a neighboring region, and typed brackets/quotes route
+/// through the auto-pair table.
 /// Everything else (typing, Enter, copy/paste, selection) falls back to
 /// the editor's own bindings — including Ctrl combos the formatting map
 /// does not claim, so copy/cut/paste/select-all keep working.
@@ -1357,7 +1380,6 @@ pub(crate) fn live_key_binding(
     press: text_editor::KeyPress,
     wiki_open: bool,
 ) -> Option<text_editor::Binding<Message>> {
-    use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
     if !matches!(press.status, text_editor::Status::Focused { .. }) {
         return None;
     }
@@ -1378,6 +1400,14 @@ pub(crate) fn live_key_binding(
         } else {
             Message::LiveDismiss
         })),
+        // The dropdown owns the arrows while it is open: they walk the
+        // suggestions instead of moving the caret between blocks.
+        Key::Named(Named::ArrowUp) if wiki_open && plain => {
+            Some(text_editor::Binding::Custom(Message::WikiCycle(-1)))
+        }
+        Key::Named(Named::ArrowDown) if wiki_open && plain => {
+            Some(text_editor::Binding::Custom(Message::WikiCycle(1)))
+        }
         Key::Character(c) if ctrl => {
             let lower = c.to_lowercase();
             match (lower.as_str(), press.modifiers.shift()) {
