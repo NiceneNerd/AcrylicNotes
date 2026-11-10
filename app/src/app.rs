@@ -951,6 +951,27 @@ pub(crate) fn wiki_query_at(text: &str, cursor: Position) -> Option<(usize, Stri
     Some((open, query.to_string()))
 }
 
+/// The closing brackets the auto-pair left directly after the caret.
+///
+/// Accepting a wiki completion replaces the `[[query` the user typed.
+/// With auto-pair on, the caret also sits in front of the `]]` the
+/// pairer inserted; those must be consumed with the rest, or the
+/// accepted link ends up with four closing brackets.
+pub(crate) fn wiki_close_run(text: &str, cursor: Position) -> usize {
+    let Some(line) = text.split('\n').nth(cursor.line) else {
+        return 0;
+    };
+    let end = line.len().min(cursor.column);
+    if !line.is_char_boundary(end) {
+        return 0;
+    }
+    line[end..]
+        .chars()
+        .take(2)
+        .take_while(|c| *c == ']')
+        .count()
+}
+
 /// Rank note paths against a partial wikilink query by title (empty
 /// queries pass everything through, like the quick switcher). Items are
 /// paths so duplicate-titled notes stay distinguishable.
@@ -1055,56 +1076,151 @@ fn char_before(text: &str, pos: Position) -> Option<char> {
     line.get(..pos.column)?.chars().next_back()
 }
 
+/// The byte offset of a cursor position in `text`.
+///
+/// Columns are byte offsets within their line (the editor's own
+/// convention), so the offset is the sum of the lines before it.
+fn offset_at(text: &str, pos: Position) -> usize {
+    let mut offset = 0;
+    for (line, text_line) in text.split('\n').enumerate() {
+        if line == pos.line {
+            return offset + pos.column.min(text_line.len());
+        }
+        offset += text_line.len() + 1;
+    }
+    offset
+}
+
+/// The cursor position at a byte offset in `text`.
+fn position_at(text: &str, offset: usize) -> Position {
+    let mut rest = offset;
+    for (line, text_line) in text.split('\n').enumerate() {
+        if rest <= text_line.len() {
+            return Position { line, column: rest };
+        }
+        rest -= text_line.len() + 1;
+    }
+    // Past the end: the end of the last line.
+    let lines: Vec<&str> = text.split('\n').collect();
+    let last = lines.len().saturating_sub(1);
+    Position {
+        line: last,
+        column: lines[last].len(),
+    }
+}
+
+/// The text a cursor's selection covers, with its bounds in document
+/// order: the start position, the end position, and the text between.
+fn selected_text(text: &str, cursor: Cursor) -> Option<(Position, Position, String)> {
+    let anchor = cursor.selection?;
+    let (start, end) =
+        if (anchor.line, anchor.column) <= (cursor.position.line, cursor.position.column) {
+            (anchor, cursor.position)
+        } else {
+            (cursor.position, anchor)
+        };
+    let from = offset_at(text, start);
+    let to = offset_at(text, end);
+    Some((start, end, text.get(from..to)?.to_string()))
+}
+
+/// What an auto-pair keystroke does: the editor actions to perform, and
+/// the cursor to restore once they have run.
+///
+/// A wrapped selection stays selected — the text between the markers —
+/// so typing another opener pairs again: select "My Link", type "[",
+/// type "[" again, and the link reads "[[My Link]]".
+pub(crate) struct AutoPair {
+    /// The editor actions to perform.
+    pub actions: Vec<Action>,
+    /// The cursor to restore after the actions ran: the caret at the
+    /// end of the wrapped text, the selection still on it.
+    pub select: Option<Cursor>,
+}
+
 /// The editor actions for a typed bracket/quote:
-/// - a selection is wrapped in the pair,
+/// - a selection is wrapped in the pair, and stays selected,
 /// - typing the closing character right before the same character steps
 ///   over it instead of duplicating it,
 /// - quotes only pair at word boundaries, so an apostrophe inside a word
 ///   stays a plain character ("don't" must not become "don''t"),
 /// - otherwise the pair is inserted with the cursor between the markers.
-fn autopair_actions(
-    text: &str,
-    cursor: Cursor,
-    typed: char,
-    selection: Option<String>,
-) -> Vec<Action> {
+fn autopair_actions(text: &str, cursor: Cursor, typed: char) -> AutoPair {
     let Some((open, close)) = pair_for(typed) else {
-        return Vec::new();
+        return AutoPair {
+            actions: Vec::new(),
+            select: None,
+        };
     };
     let is_opener = typed == open;
 
-    // A selection is wrapped in the pair (openers only).
-    if let Some(sel) = selection.filter(|s| !s.is_empty()) {
-        let wrapped = if is_opener {
-            format!("{open}{sel}{close}")
-        } else {
-            typed.to_string()
-        };
-        return vec![Action::Edit(Edit::Paste(Arc::new(wrapped)))];
+    // A selection is wrapped in the pair (openers only). The wrapped
+    // text stays selected: the caret lands after it, the selection
+    // covers the text between the markers.
+    if let Some((start, end, sel)) = selected_text(text, cursor) {
+        if !sel.is_empty() {
+            if !is_opener {
+                // A closing bracket over a selection just replaces it.
+                return AutoPair {
+                    actions: vec![Action::Edit(Edit::Paste(Arc::new(typed.to_string())))],
+                    select: None,
+                };
+            }
+            let from = offset_at(text, start);
+            let to = offset_at(text, end);
+            let wrapped = format!("{open}{sel}{close}");
+            // The inner text starts after the opener and ends before the
+            // closer, in the text the paste produces.
+            let inner_start = from + open.len_utf8();
+            let inner_end = inner_start + sel.len();
+            let mut new_text = String::with_capacity(text.len() + wrapped.len());
+            new_text.push_str(&text[..from]);
+            new_text.push_str(&wrapped);
+            new_text.push_str(&text[to..]);
+            return AutoPair {
+                actions: vec![Action::Edit(Edit::Paste(Arc::new(wrapped)))],
+                select: Some(Cursor {
+                    position: position_at(&new_text, inner_end),
+                    selection: Some(position_at(&new_text, inner_start)),
+                }),
+            };
+        }
     }
 
     // Typing the closing character right before the same character steps
     // over it instead of duplicating it.
     if typed == close && char_at(text, cursor.position) == Some(close) {
-        return vec![Action::Move(Motion::Right)];
+        return AutoPair {
+            actions: vec![Action::Move(Motion::Right)],
+            select: None,
+        };
     }
 
     // A closing bracket on its own is just the character.
     if !is_opener {
-        return vec![Action::Edit(Edit::Insert(typed))];
+        return AutoPair {
+            actions: vec![Action::Edit(Edit::Insert(typed))],
+            select: None,
+        };
     }
 
     // Quotes only pair at word boundaries, so an apostrophe inside a word
     // stays a plain character ("don't" must not become "don''t").
     if open == close && char_before(text, cursor.position).is_some_and(|c| c.is_alphanumeric()) {
-        return vec![Action::Edit(Edit::Insert(typed))];
+        return AutoPair {
+            actions: vec![Action::Edit(Edit::Insert(typed))],
+            select: None,
+        };
     }
 
     // Otherwise insert the pair with the cursor between the markers.
-    vec![
-        Action::Edit(Edit::Paste(Arc::new(format!("{open}{close}")))),
-        Action::Move(Motion::Left),
-    ]
+    AutoPair {
+        actions: vec![
+            Action::Edit(Edit::Paste(Arc::new(format!("{open}{close}")))),
+            Action::Move(Motion::Left),
+        ],
+        select: None,
+    }
 }
 
 /// Map an editor key press to a shortcut message, or `None` to fall
@@ -1748,6 +1864,16 @@ impl VaultNotes {
     /// re-aims the buffer at the caret and re-evaluates the wiki
     /// dropdown against the region text.
     fn live_run(&mut self, actions: Vec<Action>) -> Task<Message> {
+        self.live_run_with(actions, None)
+    }
+
+    /// As `live_run`, but restoring a cursor in the region's buffer
+    /// afterwards (the auto-pair keeps a wrapped selection selected).
+    ///
+    /// The restore happens before the re-aim: when the edit changed the
+    /// region's shape, the buffer is rebuilt and the selection is
+    /// dropped with it.
+    fn live_run_with(&mut self, actions: Vec<Action>, select: Option<Cursor>) -> Task<Message> {
         if actions.is_empty() {
             return Task::none();
         }
@@ -1774,6 +1900,12 @@ impl VaultNotes {
         if let Some(live) = self.live.as_mut() {
             for action in actions {
                 live.editor.perform(action);
+            }
+            // The auto-pair wraps a selection and keeps it selected: the
+            // caret moves back inside the markers, the selection covers
+            // the wrapped text.
+            if let Some(cursor) = select {
+                live.editor.move_to(cursor);
             }
         }
         if is_edit {
@@ -2138,6 +2270,17 @@ impl VaultNotes {
     /// Perform a multi-action editor command (formatting, word delete) as
     /// one undoable step, then refresh derived state.
     fn run_editor_command(&mut self, idx: usize, actions: Vec<Action>) {
+        self.run_editor_command_with(idx, actions, None);
+    }
+
+    /// As `run_editor_command`, but restoring a cursor afterwards (the
+    /// auto-pair keeps a wrapped selection selected).
+    fn run_editor_command_with(
+        &mut self,
+        idx: usize,
+        actions: Vec<Action>,
+        select: Option<Cursor>,
+    ) {
         if actions.is_empty() {
             return;
         }
@@ -2147,6 +2290,9 @@ impl VaultNotes {
             push_undo(tab);
             for action in actions {
                 tab.content.perform(action);
+            }
+            if let Some(cursor) = select {
+                tab.content.move_to(cursor);
             }
             tab.refresh_doc();
         }
@@ -2594,9 +2740,16 @@ impl VaultNotes {
                 self.dismiss_editor_overlays();
                 return Task::none();
             };
+            // The auto-pair's closing brackets belong to the link being
+            // replaced: consume them, or the accepted link ends up with
+            // four of them.
+            let close = wiki_close_run(&text, cursor);
             if let Some(live) = self.live.as_mut() {
                 live.editor.move_to(Cursor {
-                    position: cursor,
+                    position: Position {
+                        line: cursor.line,
+                        column: cursor.column + close,
+                    },
                     selection: Some(Position {
                         line: cursor.line,
                         column: open_col,
@@ -2617,8 +2770,15 @@ impl VaultNotes {
         {
             let tab = &mut self.tabs[idx];
             push_undo(tab);
+            // The auto-pair's closing brackets belong to the link being
+            // replaced: consume them, or the accepted link ends up with
+            // four of them.
+            let close = wiki_close_run(&text, cursor);
             tab.content.move_to(Cursor {
-                position: cursor,
+                position: Position {
+                    line: cursor.line,
+                    column: cursor.column + close,
+                },
                 selection: Some(Position {
                     line: cursor.line,
                     column: open_col,
@@ -3560,26 +3720,21 @@ impl cosmic::Application for VaultNotes {
                 if self.pane == PaneMode::Live {
                     // The buffer is the region source; the karat is its
                     // caret. The same decision table applies.
-                    let (text, cursor, selection) = {
+                    let (text, cursor) = {
                         let live = self.live.as_ref().expect("live-open auto pair");
-                        (
-                            live.editor.text(),
-                            live.editor.cursor(),
-                            live.editor.selection(),
-                        )
+                        (live.editor.text(), live.editor.cursor())
                     };
-                    let acts = autopair_actions(&text, cursor, typed, selection);
-                    if acts.is_empty() {
+                    let pair = autopair_actions(&text, cursor, typed);
+                    if pair.actions.is_empty() {
                         return self.live_run(vec![Action::Edit(Edit::Insert(typed))]);
                     }
-                    return self.live_run(acts);
+                    return self.live_run_with(pair.actions, pair.select);
                 }
                 if let Some(idx) = self.active {
                     let text = self.tabs[idx].content.text();
                     let cursor = self.tabs[idx].content.cursor();
-                    let selection = self.tabs[idx].content.selection();
-                    let actions = autopair_actions(&text, cursor, typed, selection);
-                    self.run_editor_command(idx, actions);
+                    let pair = autopair_actions(&text, cursor, typed);
+                    self.run_editor_command_with(idx, pair.actions, pair.select);
                 }
                 self.sync_preview_scroll()
             }
@@ -4912,6 +5067,22 @@ mod autopair_tests {
         }
     }
 
+    /// A cursor whose selection runs from the anchor to the caret.
+    fn cursor_selecting(line: usize, column: usize, anchor_line: usize, anchor: usize) -> Cursor {
+        Cursor {
+            position: Position { line, column },
+            selection: Some(Position {
+                line: anchor_line,
+                column: anchor,
+            }),
+        }
+    }
+
+    /// The actions of an auto-pair decision.
+    fn actions(text: &str, cursor: Cursor, typed: char) -> Vec<Action> {
+        autopair_actions(text, cursor, typed).actions
+    }
+
     #[test]
     fn pair_table_covers_brackets_and_quotes() {
         assert_eq!(pair_for('('), Some(('(', ')')));
@@ -4949,24 +5120,63 @@ mod autopair_tests {
     #[test]
     fn a_selection_is_wrapped_in_the_pair() {
         assert_eq!(
-            autopair_actions(
-                "hello world\n",
-                cursor_at(0, 0),
-                '(',
-                Some("world".to_string())
-            ),
+            actions("hello world\n", cursor_selecting(0, 11, 0, 6), '('),
             vec![Action::Edit(Edit::Paste(Arc::new("(world)".to_string())))]
         );
         assert_eq!(
-            autopair_actions("x\n", cursor_at(0, 0), '"', Some("q".to_string())),
+            actions("q\n", cursor_selecting(0, 1, 0, 0), '"'),
             vec![Action::Edit(Edit::Paste(Arc::new("\"q\"".to_string())))]
         );
     }
 
     #[test]
+    fn a_wrapped_selection_stays_selected() {
+        // "world" is wrapped in brackets: the text between the markers
+        // stays selected, so another opener pairs again.
+        let pair = autopair_actions("hello world\n", cursor_selecting(0, 11, 0, 6), '[');
+        let cursor = pair.select.expect("the wrapped text stays selected");
+        // "(world)" puts "world" at columns 7..12.
+        assert_eq!(
+            cursor.position,
+            Position {
+                line: 0,
+                column: 12
+            }
+        );
+        assert_eq!(cursor.selection, Some(Position { line: 0, column: 7 }));
+        // The caret sits before the closing bracket.
+        let mut text = "hello world\n".to_string();
+        text.replace_range(6..11, "[world]");
+        assert_eq!(&text[7..12], "world");
+    }
+
+    #[test]
+    fn a_wrapped_selection_across_lines_keeps_its_bounds() {
+        // The selection covers "one\ntwo": the wrapped text starts on
+        // the first line and ends on the second.
+        let text = "one\ntwo\n";
+        let pair = autopair_actions(text, cursor_selecting(1, 3, 0, 0), '(');
+        let cursor = pair.select.expect("the wrapped text stays selected");
+        assert_eq!(cursor.position, Position { line: 1, column: 3 });
+        assert_eq!(cursor.selection, Some(Position { line: 0, column: 1 }));
+    }
+
+    #[test]
+    fn a_closer_over_a_selection_replaces_it() {
+        // Typing the closing bracket does not wrap: it replaces the
+        // selection, and nothing stays selected.
+        let pair = autopair_actions("hello world\n", cursor_selecting(0, 11, 0, 6), ']');
+        assert_eq!(
+            pair.actions,
+            vec![Action::Edit(Edit::Paste(Arc::new("]".to_string())))]
+        );
+        assert!(pair.select.is_none());
+    }
+
+    #[test]
     fn without_a_selection_the_pair_is_inserted() {
         assert_eq!(
-            autopair_actions("", cursor_at(0, 0), '(', None),
+            actions("", cursor_at(0, 0), '('),
             vec![
                 Action::Edit(Edit::Paste(Arc::new("()".to_string()))),
                 Action::Move(Motion::Left),
@@ -4978,12 +5188,12 @@ mod autopair_tests {
     fn typing_the_closer_steps_over_it() {
         // The cursor sits before the ")" of "()" — typing ")" moves past it.
         assert_eq!(
-            autopair_actions("()", cursor_at(0, 1), ')', None),
+            actions("()", cursor_at(0, 1), ')'),
             vec![Action::Move(Motion::Right)]
         );
         // Not before a closer: the character is simply inserted.
         assert_eq!(
-            autopair_actions("x", cursor_at(0, 1), ')', None),
+            actions("x", cursor_at(0, 1), ')'),
             vec![Action::Edit(Edit::Insert(')'))]
         );
     }
@@ -4992,41 +5202,66 @@ mod autopair_tests {
     fn quotes_do_not_pair_inside_a_word() {
         // An apostrophe inside a word stays a plain character.
         assert_eq!(
-            autopair_actions("don", cursor_at(0, 3), '\'', None),
+            actions("don", cursor_at(0, 3), '\''),
             vec![Action::Edit(Edit::Insert('\''))]
         );
         // After a space (or at the start) they pair.
-        assert_eq!(
-            autopair_actions("don ", cursor_at(0, 4), '\'', None).len(),
-            2
-        );
-        assert_eq!(autopair_actions("", cursor_at(0, 0), '"', None).len(), 2);
+        assert_eq!(actions("don ", cursor_at(0, 4), '\'').len(), 2);
+        assert_eq!(actions("", cursor_at(0, 0), '"').len(), 2);
     }
 
     #[test]
     fn typing_a_pair_end_to_end_does_not_duplicate_closers() {
         let mut tab = Tab::open("t.md".to_string(), "");
         // Type "(" → "()" with the cursor in the middle.
-        for action in autopair_actions("", tab.content.cursor(), '(', None) {
+        for action in actions("", tab.content.cursor(), '(') {
             tab.content.perform(action);
         }
         assert_eq!(tab.content.text(), "()");
         // Type ")" → the cursor steps over the existing closer.
-        for action in autopair_actions(&tab.content.text(), tab.content.cursor(), ')', None) {
+        for action in actions(&tab.content.text(), tab.content.cursor(), ')') {
             tab.content.perform(action);
         }
         assert_eq!(tab.content.text(), "()");
         // The cursor now sits after the pair, so a new opener starts there.
-        for action in autopair_actions(&tab.content.text(), tab.content.cursor(), '[', None) {
+        for action in actions(&tab.content.text(), tab.content.cursor(), '[') {
             tab.content.perform(action);
         }
         assert_eq!(tab.content.text(), "()[]");
         // Typing the closer of that pair steps over it too.
-        for action in autopair_actions(&tab.content.text(), tab.content.cursor(), ']', None) {
+        for action in actions(&tab.content.text(), tab.content.cursor(), ']') {
             tab.content.perform(action);
         }
         assert_eq!(tab.content.text(), "()[]");
         tab.refresh_doc();
+    }
+
+    #[test]
+    fn pairing_a_selection_twice_makes_a_wikilink() {
+        // Select "My Link", pair it with "[", then pair it again: the
+        // selection survives the first pair, so the second one wraps it
+        // a second time.
+        let mut tab = Tab::open("t.md".to_string(), "My Link\n");
+        tab.content.move_to(cursor_selecting(0, 7, 0, 0));
+        let pair = autopair_actions(&tab.content.text(), tab.content.cursor(), '[');
+        for action in pair.actions {
+            tab.content.perform(action);
+        }
+        if let Some(cursor) = pair.select {
+            tab.content.move_to(cursor);
+        }
+        assert_eq!(tab.content.text(), "[My Link]\n");
+        assert_eq!(tab.content.selection(), Some("My Link".to_string()));
+
+        let pair = autopair_actions(&tab.content.text(), tab.content.cursor(), '[');
+        for action in pair.actions {
+            tab.content.perform(action);
+        }
+        if let Some(cursor) = pair.select {
+            tab.content.move_to(cursor);
+        }
+        assert_eq!(tab.content.text(), "[[My Link]]\n");
+        assert_eq!(tab.content.selection(), Some("My Link".to_string()));
     }
 }
 
@@ -5386,6 +5621,78 @@ mod wiki_tests {
         let tab = &mut app.tabs[0];
         assert!(undo_tab(tab));
         assert_eq!(tab.content.text(), "see [[no\n");
+    }
+
+    #[test]
+    fn wiki_close_run_counts_the_brackets_the_pairer_left() {
+        // The caret sits in front of the "]]" the auto-pair inserted.
+        let text = "see [[My Link]]";
+        assert_eq!(
+            wiki_close_run(
+                text,
+                Position {
+                    line: 0,
+                    column: 13
+                }
+            ),
+            2
+        );
+        // Nothing behind the caret: nothing to consume.
+        assert_eq!(
+            wiki_close_run(
+                "see [[My Link",
+                Position {
+                    line: 0,
+                    column: 13
+                }
+            ),
+            0
+        );
+        // A single bracket is a bracket.
+        assert_eq!(
+            wiki_close_run(
+                "see [[My Link]",
+                Position {
+                    line: 0,
+                    column: 13
+                }
+            ),
+            1
+        );
+        // At most the link's own two brackets are consumed.
+        assert_eq!(
+            wiki_close_run(
+                "see [[My Link]]]",
+                Position {
+                    line: 0,
+                    column: 13
+                }
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn wiki_accept_consumes_the_auto_paired_closing_brackets() {
+        // With auto-pair on, typing "[[My Link" leaves the pairer's "]]"
+        // behind the caret. Accepting the completion must consume them
+        // with the rest, or the link ends up with four brackets.
+        let mut app = find_tests::test_app_with_tab("see [[My Link]]\n");
+        app.pane = PaneMode::Source;
+        // The caret sits right after "My Link", in front of the "]]".
+        app.tabs[0].content.move_to(Cursor {
+            position: Position {
+                line: 0,
+                column: 13,
+            },
+            selection: None,
+        });
+        app.wiki_complete = Some(WikiComplete {
+            items: vec!["My Link.md".to_string()],
+            selected: 0,
+        });
+        app.wiki_accept();
+        assert_eq!(app.tabs[0].content.text(), "see [[My Link]]\n");
     }
 
     #[test]
@@ -6921,6 +7228,54 @@ mod live_tests {
         // One undo step restores the partial link.
         assert!(undo_tab(&mut app.tabs[0]));
         assert_eq!(app.tabs[0].content.text(), "see [[al\n");
+    }
+
+    #[test]
+    fn wiki_accept_in_live_mode_consumes_the_auto_paired_brackets() {
+        // Same as the source path, in the region's buffer: the "]]" the
+        // auto-pair left behind the caret goes with the partial link.
+        let mut app = find_tests::test_app_with_tab("see [[My Link]]\n");
+        app.live_focus(0);
+        // The caret sits right after "My Link", in front of the "]]".
+        let live = app.live.as_mut().unwrap();
+        live.editor.move_to(Cursor {
+            position: Position {
+                line: 0,
+                column: 13,
+            },
+            selection: None,
+        });
+        app.wiki_complete = Some(WikiComplete {
+            items: vec!["My Link.md".to_string()],
+            selected: 0,
+        });
+        app.wiki_accept();
+        assert_eq!(app.tabs[0].content.text(), "see [[My Link]]\n");
+    }
+
+    #[test]
+    fn auto_pair_keeps_a_wrapped_selection_in_the_live_region() {
+        let mut app = find_tests::test_app_with_tab("My Link\n");
+        app.live_focus(0);
+        // Select "My Link" in the region.
+        let live = app.live.as_mut().unwrap();
+        live.editor.move_to(Cursor {
+            position: Position { line: 0, column: 7 },
+            selection: Some(Position { line: 0, column: 0 }),
+        });
+        app.update(Message::EditorAutoPair('['));
+        assert_eq!(app.tabs[0].content.text(), "[My Link]\n");
+        // The wrapped text is still selected: pairing again nests it.
+        assert_eq!(
+            app.live.as_ref().unwrap().editor.selection(),
+            Some("My Link".to_string())
+        );
+        app.update(Message::EditorAutoPair('['));
+        assert_eq!(app.tabs[0].content.text(), "[[My Link]]\n");
+        assert_eq!(
+            app.live.as_ref().unwrap().editor.selection(),
+            Some("My Link".to_string())
+        );
     }
 
     #[test]
