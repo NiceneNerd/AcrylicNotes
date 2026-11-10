@@ -1240,42 +1240,49 @@ fn live_region<'a>(
     region: usize,
     fold_id: &mut u64,
 ) -> cosmic::Element<'a, Message> {
-    if app.live.as_ref().is_some_and(|state| state.block == region) {
-        return focused_block_editor(app, palette);
-    }
-    if let Some(block) = slice.block.and_then(|b| tab.doc.blocks.get(b)) {
-        // The block list guards embed cycles (`stack`); the region's own
-        // source line mapping is `slice`, not the block's, because the
-        // buffer edits re-slice after every keystroke.
-        let rendered = reading::render_block(block, ctx, 0, &stack_from(ctx), fold_id);
-        return cosmic::iced::widget::mouse_area(rendered)
-            .on_press(Message::LiveFocus(region))
-            .into();
-    }
-    if tab.doc.frontmatter_raw.is_some() {
-        // The frontmatter region (first region whenever it exists).
-        let rendered =
-            reading::render_frontmatter(&tab.doc, ctx).expect("frontmatter exists per the doc");
-        return cosmic::iced::widget::mouse_area(rendered)
-            .on_press(Message::LiveFocus(region))
-            .into();
-    }
-    // A note with no markdown blocks: one body region, standing open
-    // (ensure_live_focus focuses it) or inviting a click.
-    let placeholder: cosmic::Element<'a, Message> =
-        if crate::live::content_end(&slice.source(&tab.content.text())) == (0, 0) {
-            container(text("Start writing…").class(palette.muted))
-                .width(Length::Fill)
-                .padding([12, 0])
+    let inner: cosmic::Element<'a, Message> =
+        if app.live.as_ref().is_some_and(|state| state.block == region) {
+            focused_block_editor(app, palette)
+        } else if let Some(block) = slice.block.and_then(|b| tab.doc.blocks.get(b)) {
+            // The block list guards embed cycles (`stack`); the region's own
+            // source line mapping is `slice`, not the block's, because the
+            // buffer edits re-slice after every keystroke.
+            let rendered = reading::render_block(block, ctx, 0, &stack_from(ctx), fold_id);
+            cosmic::iced::widget::mouse_area(rendered)
+                .on_press(Message::LiveFocus(region))
+                .into()
+        } else if tab.doc.frontmatter_raw.is_some() {
+            // The frontmatter region (first region whenever it exists).
+            let rendered =
+                reading::render_frontmatter(&tab.doc, ctx).expect("frontmatter exists per the doc");
+            cosmic::iced::widget::mouse_area(rendered)
+                .on_press(Message::LiveFocus(region))
                 .into()
         } else {
-            container(text("").size(0))
-                .width(Length::Fill)
-                .height(Length::Shrink)
+            // A note with no markdown blocks: one body region, standing open
+            // (ensure_live_focus focuses it) or inviting a click.
+            let placeholder: cosmic::Element<'a, Message> =
+                if crate::live::content_end(&slice.source(&tab.content.text())) == (0, 0) {
+                    container(text("Start writing…").class(palette.muted))
+                        .width(Length::Fill)
+                        .padding([12, 0])
+                        .into()
+                } else {
+                    container(text("").size(0))
+                        .width(Length::Fill)
+                        .height(Length::Shrink)
+                        .into()
+                };
+            cosmic::iced::widget::mouse_area(placeholder)
+                .on_press(Message::LiveFocus(region))
                 .into()
         };
-    cosmic::iced::widget::mouse_area(placeholder)
-        .on_press(Message::LiveFocus(region))
+    // The transparent wrapper carries the region anchor used by the
+    // scroll-into-view op (`to_live_region`). Inner ids (the focused
+    // editor's EDITOR_INPUT, heading anchors) piggyback inside it.
+    container(inner)
+        .id(crate::scroll::live_region_id(region))
+        .width(Length::Fill)
         .into()
 }
 

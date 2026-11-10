@@ -1675,7 +1675,12 @@ impl VaultNotes {
             selection,
         });
         self.live = Some(LiveEdit { block: idx, editor });
-        Self::live_editor_focus()
+        // The runner rebuilds views before running these actions, so the
+        // measure op sees the region mounted in the fresh tree (the same
+        // ordering the reading pane's `to_block` relies on).
+        let scroll = crate::scroll::to_live_region::<Message>(idx, 12.0);
+        let focus = Self::live_editor_focus();
+        Task::batch([scroll, focus])
     }
 
     /// A batch of editor actions on the live editor's buffer. Like
@@ -6739,6 +6744,21 @@ mod live_tests {
         // One undo step restores the partial link.
         assert!(undo_tab(&mut app.tabs[0]));
         assert_eq!(app.tabs[0].content.text(), "see [[al\n");
+    }
+
+    #[test]
+    fn jump_to_block_focuses_the_holding_region_and_scrolls_it_in() {
+        // "alpha\n\nbeta\n\ngamma" spans (1,2),(3,4),(5,5): block 2 is
+        // region 2. An outline on block 2 opens its region's editor.
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta\n\ngamma\n");
+        app.live = None;
+        app.jump_to_block(2);
+        assert_eq!(app.live.as_ref().unwrap().block, 2);
+        // The batch carries the region anchor measure op plus the editor
+        // focus op: both must exist even though their effects are
+        // runtime-side (view tree + widget state).
+        app.jump_to_block(0);
+        assert_eq!(app.live.as_ref().unwrap().block, 0);
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Scroll-to-anchor plumbing for the reading view (M4b): outline clicks,
 //! search-hit jumps and same-document `[[#heading]]` links all need to move
-//! the reading scrollable to a specific top-level block.
+//! the reading scrollable to a specific top-level block. The live preview
+//! pane (R3) reuses the same two-phase op with its own scrollable and
+//! per-region anchors.
 //!
 //! iced exposes `scroll_to(id, AbsoluteOffset)` but not "scroll to widget",
 //! so this runs a two-phase widget operation:
@@ -33,7 +35,12 @@ pub fn block_id(index: usize) -> Id {
     Id::from(format!("block-{index}"))
 }
 
-/// Measures the anchor's position inside the reading scrollable.
+/// The Id for live-preview region `index` (tagged in `view::live_region`).
+pub fn live_region_id(index: usize) -> Id {
+    Id::from(format!("live-region-{index}"))
+}
+
+/// Measures the anchor's position inside the scrollable.
 struct Measure {
     scrollable: Id,
     target: Id,
@@ -70,14 +77,19 @@ impl Operation<Option<(f32, f32)>> for Measure {
     }
 }
 
-/// A task that scrolls the reading view so top-level block `index` sits near
-/// the top of the viewport. If the anchor or the scrollable is not in the
-/// tree (e.g. the pane is in source mode), the task is a no-op.
-pub fn to_block<Message: Send + 'static>(index: usize, margin: f32) -> Task<Message> {
-    let scrollable_id = Id::new(READING_SCROLL);
+/// A two-phase "scroll widget into view" task for one scrollable: measure
+/// the anchor's and the scrollable content's positions during one layout
+/// pass, then scroll by their difference (minus a top margin). If the
+/// anchor or the scrollable is not in the tree, the task is a no-op.
+fn scroll_to_anchor<Message: Send + 'static>(
+    scrollable: &'static str,
+    target: Id,
+    margin: f32,
+) -> Task<Message> {
+    let scrollable_id = Id::new(scrollable);
     let measure = iced_task::widget::<Option<(f32, f32)>>(Measure {
         scrollable: scrollable_id.clone(),
-        target: block_id(index),
+        target,
         block_y: None,
         content_y: None,
     });
@@ -94,4 +106,34 @@ pub fn to_block<Message: Send + 'static>(index: usize, margin: f32) -> Task<Mess
         }
         None => Task::none(),
     })
+}
+
+/// A task that scrolls the reading view so top-level block `index` sits near
+/// the top of the viewport. If the anchor or the scrollable is not in the
+/// tree (e.g. the pane is in source mode), the task is a no-op.
+pub fn to_block<Message: Send + 'static>(index: usize, margin: f32) -> Task<Message> {
+    scroll_to_anchor::<Message>(READING_SCROLL, block_id(index), margin)
+}
+
+/// A task that scrolls the live pane so region `index` sits near the top
+/// of the viewport. No-op when the region or the scrollable is missing
+/// (e.g. the pane is not in live mode).
+pub fn to_live_region<Message: Send + 'static>(index: usize, margin: f32) -> Task<Message> {
+    scroll_to_anchor::<Message>(LIVE_SCROLL, live_region_id(index), margin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anchor_ids_encode_their_index() {
+        // The ids must be stable across renders: the view tags each
+        // region/block container with exactly these ids, and the
+        // measure op looks them up by string equality.
+        assert_eq!(block_id(2), Id::new("block-2"));
+        assert_eq!(live_region_id(3), Id::new("live-region-3"));
+        // Region ids never collide with block ids.
+        assert_ne!(block_id(1).clone(), live_region_id(1));
+    }
 }
