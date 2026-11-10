@@ -157,7 +157,11 @@ pub struct WikiTarget {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WikiLink {
     pub target: WikiTarget,
-    pub alias: Option<String>,
+    /// The custom label after the bar, parsed as inline markdown:
+    /// `[[Note|*bold*]]` carries an emphasized label. `None` when the
+    /// link has no label (or an empty one) — the target's own text is
+    /// shown then.
+    pub alias: Option<Vec<Inline>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

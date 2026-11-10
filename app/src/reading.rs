@@ -118,11 +118,12 @@ fn inline_text(inline: &Inline) -> String {
         | Inline::Strong(inner)
         | Inline::Strike(inner)
         | Inline::Highlight(inner)
-        | Inline::InlineFootnote(inner) => inner.iter().map(inline_text).collect(),
-        Inline::Link { content, .. } => content.iter().map(inline_text).collect(),
+        | Inline::InlineFootnote(inner) => inline_texts(inner),
+        Inline::Link { content, .. } => inline_texts(content),
         Inline::WikiLink(link) => link
             .alias
-            .clone()
+            .as_ref()
+            .map(|alias| inline_texts(alias))
             .unwrap_or_else(|| link.target.note.clone()),
         Inline::Image { alt, .. } => alt.clone(),
         Inline::Embed(embed) => embed.target.note.clone(),
@@ -130,6 +131,11 @@ fn inline_text(inline: &Inline) -> String {
         Inline::FootnoteRef(l) => format!("[{l}]"),
         Inline::SoftBreak | Inline::HardBreak => " ".to_string(),
     }
+}
+
+/// The plain text of a run of inlines.
+fn inline_texts(inlines: &[Inline]) -> String {
+    inlines.iter().map(inline_text).collect()
 }
 
 /// First top-level block whose text contains `query` (case-insensitive) —
@@ -589,13 +595,25 @@ fn collect_inline_into<'a>(
                 extras.push(inline_image(url, alt, ctx));
             }
             Inline::WikiLink(link) => {
-                let (label, uri, color) = wikilink_span(link, ctx);
-                let mut span = Span::new(label).color(color).link(uri);
-                span = span.font_maybe(style.font);
-                if style.strike {
-                    span = span.strikethrough(true);
+                let (uri, color) = wikilink_target(link, ctx);
+                match wikilink_label(link) {
+                    // The custom label is inline markdown: it keeps its
+                    // own formatting inside the link.
+                    WikiLabel::Custom(inlines) => {
+                        let mut inner = style.clone();
+                        inner.link = Some(uri);
+                        inner.color = Some(color);
+                        collect_inline_into(inlines, ctx, &inner, spans, extras);
+                    }
+                    WikiLabel::Target(text) => {
+                        let mut span = Span::new(text).color(color).link(uri);
+                        span = span.font_maybe(style.font);
+                        if style.strike {
+                            span = span.strikethrough(true);
+                        }
+                        spans.push(span);
+                    }
                 }
-                spans.push(span);
             }
             Inline::Embed(embed) => {
                 extras.push(render_embed(
@@ -652,21 +670,34 @@ fn base_span(s: String, style: &InlineStyle, ctx: &Ctx) -> Span<'static, String,
     span
 }
 
-/// Label, URI and color for a wikilink, mirroring the HTML renderer
+/// The text of a wikilink: its custom label (inline markdown) or, when
+/// it has none, the target's own display text.
+enum WikiLabel<'a> {
+    /// The custom label after the bar, parsed as inline content.
+    Custom(&'a [Inline]),
+    /// The target's display text.
+    Target(String),
+}
+
+/// The label of a wikilink, mirroring the HTML renderer
 /// (`[[Note#Heading]]` reads "Note > Heading"; confirmed, M3).
-fn wikilink_span(link: &WikiLink, ctx: &Ctx) -> (String, String, Color) {
+fn wikilink_label(link: &WikiLink) -> WikiLabel<'_> {
     let target = &link.target;
-    let label = match &link.alias {
-        Some(alias) => alias.clone(),
-        None => match (&target.heading, &target.block) {
+    match &link.alias {
+        Some(alias) => WikiLabel::Custom(alias),
+        None => WikiLabel::Target(match (&target.heading, &target.block) {
             (Some(h), _) if !target.note.is_empty() => format!("{} > {h}", target.note),
             (Some(h), _) => h.clone(),
             (None, Some(_)) if !target.note.is_empty() => target.note.clone(),
             (None, Some(b)) => format!("^{b}"),
             (None, None) => target.note.clone(),
-        },
-    };
+        }),
+    }
+}
 
+/// Where a wikilink points, and the color it wears.
+fn wikilink_target(link: &WikiLink, ctx: &Ctx) -> (String, Color) {
+    let target = &link.target;
     if target.note.is_empty() {
         // Same-document anchor: inert until M4b wires scrolling.
         let anchor = match (&target.heading, &target.block) {
@@ -674,13 +705,12 @@ fn wikilink_span(link: &WikiLink, ctx: &Ctx) -> (String, String, Color) {
             (None, Some(b)) => format!("^{b}"),
             (None, None) => String::new(),
         };
-        return (label, format!("scroll:{anchor}"), ctx.palette.accent);
+        return (format!("scroll:{anchor}"), ctx.palette.accent);
     }
 
     match ctx.index.resolve(&target.note, &ctx.from) {
-        Some(path) => (label, format!("note:{path}"), ctx.palette.accent),
+        Some(path) => (format!("note:{path}"), ctx.palette.accent),
         None => (
-            label,
             format!("create:{}|{}", target.note, ctx.from),
             ctx.palette.muted,
         ),
@@ -907,7 +937,8 @@ fn plain_inlines(inlines: &[Inline]) -> String {
 
 fn plain_wiki_label(link: &WikiLink) -> String {
     link.alias
-        .clone()
+        .as_ref()
+        .map(|alias| plain_inlines(alias))
         .unwrap_or_else(|| link.target.note.clone())
 }
 
@@ -1038,8 +1069,8 @@ mod tests {
             },
             alias: None,
         };
-        let (label, uri, _) = wikilink_span(&link, &ctx);
-        assert_eq!(label, "Glass");
+        assert_eq!(label_text(&wikilink_label(&link)), "Glass");
+        let (uri, _) = wikilink_target(&link, &ctx);
         assert_eq!(uri, "note:Glass.md");
 
         // Unresolved wikilink -> offer to create it, remembering the source.
@@ -1051,7 +1082,7 @@ mod tests {
             },
             alias: None,
         };
-        let (_, uri, _) = wikilink_span(&missing, &ctx);
+        let (uri, _) = wikilink_target(&missing, &ctx);
         assert_eq!(uri, "create:Missing|Source.md");
 
         // `[[Note#Heading]]` reads "Note > Heading" (confirmed, M3).
@@ -1063,8 +1094,8 @@ mod tests {
             },
             alias: None,
         };
-        let (label, uri, _) = wikilink_span(&headed, &ctx);
-        assert_eq!(label, "Glass > Intro");
+        assert_eq!(label_text(&wikilink_label(&headed)), "Glass > Intro");
+        let (uri, _) = wikilink_target(&headed, &ctx);
         assert_eq!(uri, "note:Glass.md");
 
         // Same-document anchors are inert until M4b wires scrolling.
@@ -1076,9 +1107,36 @@ mod tests {
             },
             alias: None,
         };
-        let (label, uri, _) = wikilink_span(&anchor, &ctx);
-        assert_eq!(label, "Intro");
+        assert_eq!(label_text(&wikilink_label(&anchor)), "Intro");
+        let (uri, _) = wikilink_target(&anchor, &ctx);
         assert_eq!(uri, "scroll:Intro");
+    }
+
+    /// The readable text of a wikilink label.
+    fn label_text(label: &WikiLabel) -> String {
+        match label {
+            WikiLabel::Custom(inlines) => plain_inlines(inlines),
+            WikiLabel::Target(text) => text.clone(),
+        }
+    }
+
+    #[test]
+    fn a_wikilink_label_keeps_its_inline_formatting() {
+        // `[[Note|**bold**]]` — the label is inline markdown.
+        let doc = parse_note("see [[Note|**bold** and *em*]]\n");
+        let link = match &doc.blocks[0] {
+            Block::Paragraph { content, .. } => match &content[1] {
+                Inline::WikiLink(link) => link.clone(),
+                other => panic!("expected a wikilink, got {other:?}"),
+            },
+            other => panic!("expected a paragraph, got {other:?}"),
+        };
+        // The label is parsed, not kept as raw text.
+        let alias = link.alias.expect("the link has a label");
+        assert!(matches!(alias[0], Inline::Strong(_)), "{alias:?}");
+        assert!(matches!(alias[2], Inline::Emph(_)), "{alias:?}");
+        // And it reads as its plain text.
+        assert_eq!(plain_inlines(&alias), "bold and em");
     }
 
     #[test]

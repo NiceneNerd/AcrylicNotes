@@ -57,6 +57,35 @@ pub fn lower_source_spanned(src: &str) -> (Vec<Block>, Vec<crate::ir::SourceSpan
     lower_comrak_spanned(&extracted)
 }
 
+/// Parse a wikilink's custom label as inline markdown.
+///
+/// The text after the bar is inline markdown in Obsidian: `[[Note|*bold*]]`
+/// shows a bold label. The label is parsed once per document parse and
+/// carried in the IR as inline content, so renderers never re-parse it.
+///
+/// A label that does not parse as inline content (it looks like a heading
+/// or a list) is kept as plain text — the label is still the label.
+pub(crate) fn parse_label(label: &str) -> Vec<Inline> {
+    let extracted = crate::inline::extract(label);
+    let arena = Arena::new();
+    let root = parse_document(&arena, &extracted.text, &comrak_options());
+    let mut out = Vec::new();
+    for child in root.children() {
+        match &child.data().value {
+            // A label is inline content; a paragraph holds it.
+            NodeValue::Paragraph => out.extend(lower_inlines(child, &extracted.tokens)),
+            NodeValue::Text(text) => out.extend(crate::inline::lower_text(text, &extracted.tokens)),
+            // Anything block-level (a heading, a list) contributes no
+            // inline content: the fallback below keeps the label.
+            _ => {}
+        }
+    }
+    if out.is_empty() && !label.is_empty() {
+        return vec![Inline::Text(label.to_string())];
+    }
+    out
+}
+
 fn lower_comrak_spanned(extracted: &Extracted) -> (Vec<Block>, Vec<crate::ir::SourceSpan>) {
     let arena = Arena::new();
     let root = parse_document(&arena, &extracted.text, &comrak_options());
@@ -691,6 +720,50 @@ mod tests {
             Block::Paragraph { content, .. } => assert!(content
                 .iter()
                 .any(|i| matches!(i, Inline::WikiLink(w) if w.target.note == "a *b* c"))),
+            other => panic!("expected paragraph, got {other:?}"),
+        }
+    }
+
+    /// The label after the bar is inline markdown: it is parsed once,
+    /// when the document is lowered, and the IR carries it parsed.
+    #[test]
+    fn a_wikilink_label_is_parsed_as_inline_markdown() {
+        let doc = parsed("see [[Note|**bold** and *em*]]\n");
+        let link = wikilink_of(&doc);
+        let alias = link.alias.as_ref().expect("the link has a label");
+        assert!(matches!(alias[0], Inline::Strong(_)), "{alias:?}");
+        assert!(matches!(alias[2], Inline::Emph(_)), "{alias:?}");
+    }
+
+    #[test]
+    fn an_empty_wikilink_label_shows_the_target() {
+        let doc = parsed("see [[Note|]]\n");
+        let link = wikilink_of(&doc);
+        assert!(
+            link.alias.is_none(),
+            "an empty label falls back to the target's own text"
+        );
+    }
+
+    #[test]
+    fn a_label_that_is_not_inline_markdown_stays_text() {
+        // A heading is block-level: the label is kept as plain text.
+        let doc = parsed("see [[Note|# Heading]]\n");
+        let link = wikilink_of(&doc);
+        let alias = link.alias.as_ref().expect("the link has a label");
+        assert_eq!(alias, &vec![Inline::Text("# Heading".to_string())]);
+    }
+
+    /// The first wikilink of a document's first paragraph.
+    fn wikilink_of(doc: &Doc) -> crate::ir::WikiLink {
+        match &doc.blocks[0] {
+            Block::Paragraph { content, .. } => content
+                .iter()
+                .find_map(|inline| match inline {
+                    Inline::WikiLink(link) => Some(link.clone()),
+                    _ => None,
+                })
+                .expect("a wikilink"),
             other => panic!("expected paragraph, got {other:?}"),
         }
     }

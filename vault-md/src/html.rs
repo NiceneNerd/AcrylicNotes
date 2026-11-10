@@ -725,20 +725,39 @@ fn render_inline(inline: &Inline, ctx: &RenderContext, out: &mut String) {
     }
 }
 
+/// The text of a wikilink: its custom label (inline markdown) or, when
+/// it has none, the target's own display text.
+enum WikiLabel<'a> {
+    /// The custom label after the bar, parsed as inline content.
+    Custom(&'a [Inline]),
+    /// The target's display text.
+    Target(String),
+}
+
+impl WikiLabel<'_> {
+    /// Write the label into the anchor that is being built.
+    fn write(&self, ctx: &RenderContext, out: &mut String) {
+        match self {
+            WikiLabel::Custom(inlines) => render_label(inlines, ctx, out),
+            WikiLabel::Target(text) => out.push_str(&escape(text)),
+        }
+    }
+}
+
 /// Wikilinks resolve through the index; unresolved ones get `is-unresolved`
 /// and keep their target in `data-target`. `[[Note#Heading]]` displays as
 /// "Note > Heading" unless an alias is given.
 fn render_wikilink(link: &crate::ir::WikiLink, ctx: &RenderContext, out: &mut String) {
     let target = &link.target;
     let label = match &link.alias {
-        Some(alias) => alias.clone(),
+        Some(alias) => WikiLabel::Custom(alias),
         None => {
             let note_display = if target.note.is_empty() {
                 String::new()
             } else {
                 target.note.clone()
             };
-            match (&target.heading, &target.block) {
+            WikiLabel::Target(match (&target.heading, &target.block) {
                 // `[[Note#Heading]]` reads "Note > Heading" (confirmed, M3).
                 (Some(h), _) if !note_display.is_empty() => format!("{note_display} > {h}"),
                 (Some(h), _) => h.clone(),
@@ -749,7 +768,7 @@ fn render_wikilink(link: &crate::ir::WikiLink, ctx: &RenderContext, out: &mut St
                 // block id itself is the label (ASSUMPTION, see COMPAT.md).
                 (None, Some(b)) => format!("^{b}"),
                 (None, None) => note_display,
-            }
+            })
         }
     };
 
@@ -760,11 +779,9 @@ fn render_wikilink(link: &crate::ir::WikiLink, ctx: &RenderContext, out: &mut St
             (None, Some(b)) => format!("#^{}", escape_attr(b)),
             _ => String::new(),
         };
-        let _ = write!(
-            out,
-            "<a class=\"internal-link\" href=\"{anchor}\">{}</a>",
-            escape(&label)
-        );
+        let _ = write!(out, "<a class=\"internal-link\" href=\"{anchor}\">");
+        label.write(ctx, out);
+        out.push_str("</a>");
         return;
     }
 
@@ -781,22 +798,87 @@ fn render_wikilink(link: &crate::ir::WikiLink, ctx: &RenderContext, out: &mut St
         Some(path) => {
             let _ = write!(
                 out,
-                "<a class=\"internal-link\" href=\"{}{fragment}\" data-href=\"{}\">{}</a>",
+                "<a class=\"internal-link\" href=\"{}{fragment}\" data-href=\"{}\">",
                 ctx.note_href(&path),
-                escape_attr(&path),
-                escape(&label)
+                escape_attr(&path)
             );
         }
         None => {
             let _ = write!(
                 out,
-                "<a class=\"internal-link is-unresolved\" data-href=\"{}\">{}</a>",
-                escape_attr(&target.note),
-                escape(&label)
+                "<a class=\"internal-link is-unresolved\" data-href=\"{}\">",
+                escape_attr(&target.note)
             );
         }
     }
+    label.write(ctx, out);
+    out.push_str("</a>");
     let _ = LinkKind::Wiki; // resolution semantics live in VaultIndex
+}
+
+/// Render a wikilink's custom label: inline markdown, without nested
+/// anchors — a link cannot contain another link.
+fn render_label(inlines: &[Inline], ctx: &RenderContext, out: &mut String) {
+    for inline in inlines {
+        match inline {
+            Inline::Text(text) => out.push_str(&escape(text)),
+            Inline::Emph(children) => wrap_label("em", children, ctx, out),
+            Inline::Strong(children) => wrap_label("strong", children, ctx, out),
+            Inline::Strike(children) => wrap_label("del", children, ctx, out),
+            Inline::Highlight(children) => wrap_label("mark", children, ctx, out),
+            Inline::Code(code) => {
+                let _ = write!(out, "<code>{}</code>", escape(code));
+            }
+            Inline::Math(text) => {
+                let _ = write!(
+                    out,
+                    "<span class=\"math math-inline\">$ {} $</span>",
+                    escape(text)
+                );
+            }
+            Inline::Tag(name) => {
+                let _ = write!(out, "<span class=\"tag\">#{}</span>", escape(name));
+            }
+            // A link, image or wikilink inside a label shows as its text:
+            // an anchor cannot nest another anchor.
+            other => out.push_str(&escape(&label_text(other))),
+        }
+    }
+}
+
+/// Wrap a label's children in a tag.
+fn wrap_label(tag: &str, children: &[Inline], ctx: &RenderContext, out: &mut String) {
+    let _ = write!(out, "<{tag}>");
+    render_label(children, ctx, out);
+    let _ = write!(out, "</{tag}>");
+}
+
+/// The readable text of an inline that a label cannot render as markup.
+fn label_text(inline: &Inline) -> String {
+    match inline {
+        Inline::Text(text) | Inline::Code(text) | Inline::Math(text) => text.clone(),
+        Inline::Emph(inner)
+        | Inline::Strong(inner)
+        | Inline::Strike(inner)
+        | Inline::Highlight(inner)
+        | Inline::InlineFootnote(inner) => label_texts(inner),
+        Inline::Link { content, .. } => label_texts(content),
+        Inline::WikiLink(link) => match &link.alias {
+            Some(alias) => label_texts(alias),
+            None => link.target.note.clone(),
+        },
+        Inline::Image { alt, .. } => alt.clone(),
+        Inline::Embed(embed) => embed.target.note.clone(),
+        Inline::Tag(name) => format!("#{name}"),
+        Inline::FootnoteRef(label) => format!("[{label}]"),
+        Inline::Html(html) => html.clone(),
+        Inline::SoftBreak | Inline::HardBreak => " ".to_string(),
+    }
+}
+
+/// The readable text of a run of inlines.
+fn label_texts(inlines: &[Inline]) -> String {
+    inlines.iter().map(label_text).collect()
 }
 
 fn wrap_inline(tag: &str, children: &[Inline], ctx: &RenderContext, out: &mut String) {

@@ -3,3 +3,5 @@ See [[Note]] and [[Note|alias]] and [[Note#Target]] and [[Note#^bid]] and [[#Sel
 Unresolved: [[Missing Note]].
 
 Sentinels stay whole: [[a *b* c]] and [[Note|*alias*]] and [[Note]](paren).
+
+Labels are inline markdown: [[Note|**bold** label]] and [[Note|`code`]] and [[Note|mixed *em* and **strong**]].

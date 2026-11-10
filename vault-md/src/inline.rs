@@ -4,7 +4,9 @@
 //! `![[..]]` and drops `%%comments%%`, skipping code. Each wikilink/embed is
 //! replaced by an opaque sentinel so comrak can't split it (e.g. `[[a *b* c]]`).
 //! Stage 2 (`lower_text`): runs on comrak Text nodes. Swaps sentinels back to
-//! IR inlines and recognizes `#tags`.
+//! IR inlines and recognizes `#tags`. A wikilink's custom label is inline
+//! markdown, so it is parsed here too (see `lower::parse_label`) and the IR
+//! carries it parsed.
 //!
 //! For whole documents prefer [`extract_document`], which splits YAML
 //! frontmatter off FIRST so properties like `related: "[[Note]]"` are never
@@ -18,11 +20,24 @@ const CLOSE: char = '\u{E001}';
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
-    Wiki(WikiLink),
+    Wiki(RawWikiLink),
     Embed(Embed),
     /// Characters that must survive as literal text: an escaped `\#` is not
     /// a tag, and comrak would consume the backslash before `lower_text` ran.
     Literal(String),
+}
+
+/// A wikilink as it appears in the source: the target and the raw label
+/// text after the bar.
+///
+/// The label is *inline markdown* — Obsidian renders `[[Note|*bold*]]`
+/// with a bold label — so it is parsed when the document is lowered
+/// (see `lower::parse_label`) and the IR carries it parsed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawWikiLink {
+    pub target: WikiTarget,
+    /// The text after the bar, unparsed.
+    pub alias: Option<String>,
 }
 
 #[derive(Debug)]
@@ -247,7 +262,17 @@ pub fn lower_text(text: &str, tokens: &[Token]) -> Vec<Inline> {
                 if let Some(t) = token {
                     flush(&mut buf, &mut out);
                     out.push(match t {
-                        Token::Wiki(w) => Inline::WikiLink(w.clone()),
+                        Token::Wiki(raw) => Inline::WikiLink(WikiLink {
+                            target: raw.target.clone(),
+                            // The label is inline markdown: it is parsed
+                            // once here, so the renderers never re-parse
+                            // it (see `lower::parse_label`).
+                            alias: raw
+                                .alias
+                                .as_deref()
+                                .map(crate::lower::parse_label)
+                                .filter(|label| !label.is_empty()),
+                        }),
                         Token::Embed(e) => Inline::Embed(e.clone()),
                         Token::Literal(s) => Inline::Text(s.clone()),
                     });
@@ -323,9 +348,9 @@ fn split_alias(inner: &str) -> (String, Option<String>) {
     (inner.to_string(), None)
 }
 
-pub fn parse_wiki(inner: &str) -> WikiLink {
+pub fn parse_wiki(inner: &str) -> RawWikiLink {
     let (t, alias) = split_alias(inner);
-    WikiLink {
+    RawWikiLink {
         target: parse_target(&t),
         alias,
     }
