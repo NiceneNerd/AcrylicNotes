@@ -77,6 +77,67 @@ pub struct AppSettings {
     /// link format" setting).
     #[serde(default)]
     pub link_path_format: LinkPathFormat,
+    /// How the file tree orders its notes. Folders always sort by name.
+    #[serde(default)]
+    pub tree_sort: TreeSort,
+}
+
+/// How the file tree orders its notes.
+///
+/// Folders always come first, sorted by name; only the notes follow the
+/// chosen order. The date orders need a modification time, which the
+/// vault keeps for notes but not for attachments — an attachment sorts
+/// last in every order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TreeSort {
+    /// Notes by name, A to Z.
+    #[default]
+    #[serde(rename = "name-asc")]
+    NameAsc,
+    /// Notes by name, Z to A.
+    #[serde(rename = "name-desc")]
+    NameDesc,
+    /// The most recently changed notes first.
+    #[serde(rename = "newest")]
+    Newest,
+    /// The least recently changed notes first.
+    #[serde(rename = "oldest")]
+    Oldest,
+}
+
+impl TreeSort {
+    /// Every order, in the order the menu lists them.
+    pub const ALL: [TreeSort; 4] = [
+        TreeSort::NameAsc,
+        TreeSort::NameDesc,
+        TreeSort::Newest,
+        TreeSort::Oldest,
+    ];
+
+    /// The user-facing name of this order.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NameAsc => "Name A–Z",
+            Self::NameDesc => "Name Z–A",
+            Self::Newest => "Newest first",
+            Self::Oldest => "Oldest first",
+        }
+    }
+
+    /// The next order in the cycle (what the sort button's click does).
+    pub fn next(self) -> Self {
+        match self {
+            Self::NameAsc => Self::NameDesc,
+            Self::NameDesc => Self::Newest,
+            Self::Newest => Self::Oldest,
+            Self::Oldest => Self::NameAsc,
+        }
+    }
+
+    /// Whether this order runs from the top down (the button's icon).
+    pub fn descending(self) -> bool {
+        matches!(self, Self::NameDesc | Self::Newest)
+    }
 }
 
 /// How generated wikilinks refer to their target, mirroring Obsidian's
@@ -144,6 +205,7 @@ impl Default for AppSettings {
             default_pane: PaneMode::default(),
             attachment_extensions: Vec::new(),
             link_path_format: LinkPathFormat::default(),
+            tree_sort: TreeSort::default(),
         }
     }
 }
@@ -213,6 +275,7 @@ mod tests {
             default_pane: PaneMode::Reading,
             attachment_extensions: vec!["png".into(), "pdf".into()],
             link_path_format: LinkPathFormat::Relative,
+            tree_sort: TreeSort::Newest,
         };
         store_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), Some(settings));
@@ -291,5 +354,56 @@ mod tests {
             PaneMode::Reading
         );
         assert_eq!(PaneMode::default(), PaneMode::Live);
+    }
+
+    #[test]
+    fn the_tree_sort_persists_as_a_word_and_defaults_to_the_name() {
+        // The persisted names are short and stable; an old settings file
+        // without the field keeps the name order.
+        assert_eq!(
+            serde_json::to_string(&TreeSort::NameAsc).unwrap(),
+            r#""name-asc""#
+        );
+        assert_eq!(
+            serde_json::from_str::<TreeSort>(r#""name-desc""#).unwrap(),
+            TreeSort::NameDesc
+        );
+        assert_eq!(
+            serde_json::from_str::<TreeSort>(r#""newest""#).unwrap(),
+            TreeSort::Newest
+        );
+        assert_eq!(
+            serde_json::from_str::<TreeSort>(r#""oldest""#).unwrap(),
+            TreeSort::Oldest
+        );
+        assert_eq!(TreeSort::default(), TreeSort::NameAsc);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{"last_vault": "/notes"}"#).unwrap();
+        assert_eq!(load_from(&path).unwrap().tree_sort, TreeSort::NameAsc);
+    }
+
+    #[test]
+    fn the_tree_sort_cycles_and_names_its_orders() {
+        // The button cycles through the four orders and comes back.
+        let mut order = TreeSort::NameAsc;
+        for _ in 0..4 {
+            order = order.next();
+        }
+        assert_eq!(order, TreeSort::NameAsc);
+        assert_eq!(TreeSort::NameAsc.next(), TreeSort::NameDesc);
+        assert_eq!(TreeSort::NameDesc.next(), TreeSort::Newest);
+        assert_eq!(TreeSort::Newest.next(), TreeSort::Oldest);
+        assert_eq!(TreeSort::Oldest.next(), TreeSort::NameAsc);
+
+        // Every order has a label, and the descending ones are marked.
+        for order in TreeSort::ALL {
+            assert!(!order.label().is_empty());
+        }
+        assert!(!TreeSort::NameAsc.descending());
+        assert!(TreeSort::NameDesc.descending());
+        assert!(TreeSort::Newest.descending());
+        assert!(!TreeSort::Oldest.descending());
     }
 }

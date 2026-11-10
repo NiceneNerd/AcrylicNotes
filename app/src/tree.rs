@@ -1,6 +1,11 @@
 //! File-tree model for the sidebar. Pure data plus a pure builder so it is
 //! unit-testable without a GUI (M4 working rules).
 
+use std::cmp::Ordering;
+use std::time::SystemTime;
+
+use crate::settings::TreeSort;
+
 /// One entry of the sidebar tree, keyed by vault-relative path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeNode {
@@ -15,22 +20,47 @@ pub enum TreeNode {
     },
 }
 
-/// Build a sorted tree from vault-relative note paths ('/'-separated).
-/// Folders come before notes; each level sorts case-insensitively by name.
-/// See [`build_with_folders`] for including empty folders.
-pub fn build_with_folders(note_paths: &[&str], folder_paths: &[&str]) -> Vec<TreeNode> {
+/// One file of the tree: a note or an attachment.
+#[derive(Debug, Clone)]
+pub struct Entry<'a> {
+    /// Vault-relative path ('/'-separated).
+    pub path: &'a str,
+    /// When the file was last changed. `None` for attachments: the
+    /// vault does not timestamp them, so they cannot join a date order.
+    pub modified: Option<SystemTime>,
+}
+
+impl<'a> Entry<'a> {
+    /// A tree entry for `path`, changed at `modified`.
+    pub fn new(path: &'a str, modified: Option<SystemTime>) -> Self {
+        Self { path, modified }
+    }
+}
+
+/// Build the sidebar tree from the vault's files.
+///
+/// Folders come before notes and always sort by name; the notes follow
+/// `sort`. The folders in `folder_paths` materialize even when they hold
+/// nothing, so they can receive new notes.
+pub fn build_with_folders(
+    entries: &[Entry<'_>],
+    folder_paths: &[&str],
+    sort: TreeSort,
+) -> Vec<TreeNode> {
     #[derive(Default)]
     struct Folder {
         folders: std::collections::BTreeMap<String, Folder>,
-        notes: Vec<String>,
+        notes: Vec<(String, Option<SystemTime>)>,
     }
 
-    fn insert(folder: &mut Folder, parts: &[&str]) {
+    fn insert(folder: &mut Folder, parts: &[&str], modified: Option<SystemTime>) {
         match parts {
-            [name] => folder.notes.push((*name).to_string()),
-            [head, rest @ ..] => {
-                insert(folder.folders.entry((*head).to_string()).or_default(), rest)
-            }
+            [name] => folder.notes.push(((*name).to_string(), modified)),
+            [head, rest @ ..] => insert(
+                folder.folders.entry((*head).to_string()).or_default(),
+                rest,
+                modified,
+            ),
             [] => {}
         }
     }
@@ -42,27 +72,30 @@ pub fn build_with_folders(note_paths: &[&str], folder_paths: &[&str]) -> Vec<Tre
         }
     }
 
-    fn convert(path: &str, folder: &Folder) -> Vec<TreeNode> {
+    fn convert(path: &str, folder: &mut Folder, sort: TreeSort) -> Vec<TreeNode> {
         let mut nodes: Vec<TreeNode> = folder
             .folders
-            .iter()
+            .iter_mut()
             .map(|(name, child)| {
                 let child_path = join(path, name);
                 TreeNode::Folder {
                     name: name.clone(),
                     path: child_path.clone(),
-                    children: convert(&child_path, child),
+                    children: convert(&child_path, child, sort),
                 }
             })
             .collect();
-        nodes.extend(folder.notes.iter().map(|name| TreeNode::Note {
+        // Folders always come first, sorted by name — the order the
+        // user picked applies to the notes only.
+        nodes.sort_by_key(|node| match node {
+            TreeNode::Folder { name, .. } => name.to_lowercase(),
+            TreeNode::Note { .. } => String::new(),
+        });
+        sort_notes(&mut folder.notes, sort);
+        nodes.extend(folder.notes.iter().map(|(name, _)| TreeNode::Note {
             name: name.clone(),
             path: join(path, name),
         }));
-        nodes.sort_by_key(|node| match node {
-            TreeNode::Folder { name, .. } => (0u8, name.to_lowercase()),
-            TreeNode::Note { name, .. } => (1u8, name.to_lowercase()),
-        });
         nodes
     }
 
@@ -75,15 +108,50 @@ pub fn build_with_folders(note_paths: &[&str], folder_paths: &[&str]) -> Vec<Tre
     }
 
     let mut root = Folder::default();
-    for path in note_paths {
-        let parts: Vec<&str> = path.split('/').collect();
-        insert(&mut root, &parts);
+    for entry in entries {
+        let parts: Vec<&str> = entry.path.split('/').collect();
+        insert(&mut root, &parts, entry.modified);
     }
     for path in folder_paths {
         let parts: Vec<&str> = path.split('/').collect();
         ensure_folder(&mut root, &parts);
     }
-    convert("", &root)
+    convert("", &mut root, sort)
+}
+
+/// Order the notes of one folder by the chosen criterion.
+fn sort_notes(notes: &mut [(String, Option<SystemTime>)], sort: TreeSort) {
+    match sort {
+        TreeSort::NameAsc => notes.sort_by_key(name_key),
+        TreeSort::NameDesc => notes.sort_by_key(|note| std::cmp::Reverse(name_key(note))),
+        // The date orders break ties by name, so the order is stable.
+        TreeSort::Newest => notes
+            .sort_by(|a, b| time_key(a.1, b.1, true).then_with(|| name_key(a).cmp(&name_key(b)))),
+        TreeSort::Oldest => notes
+            .sort_by(|a, b| time_key(a.1, b.1, false).then_with(|| name_key(a).cmp(&name_key(b)))),
+    }
+}
+
+/// The case-insensitive name of a note.
+fn name_key(note: &(String, Option<SystemTime>)) -> String {
+    note.0.to_lowercase()
+}
+
+/// Compare two modification times. A file without a timestamp (an
+/// attachment) sorts last, whichever order is chosen.
+fn time_key(a: Option<SystemTime>, b: Option<SystemTime>, newest_first: bool) -> Ordering {
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => {
+            if newest_first {
+                y.cmp(&x)
+            } else {
+                x.cmp(&y)
+            }
+        }
+    }
 }
 
 /// Every folder path in the tree, depth-first — used to start the sidebar
@@ -154,18 +222,24 @@ mod tests {
             .collect()
     }
 
+    /// The entries of a tree, without timestamps.
+    fn entries<'a>(paths: &[&'a str]) -> Vec<Entry<'a>> {
+        paths.iter().map(|path| Entry::new(path, None)).collect()
+    }
+
     #[test]
     fn nested_paths_build_a_sorted_tree() {
         let tree = build_with_folders(
-            &[
+            &entries(&[
                 "Journal/2026/04.md",
                 "Notes/Glass.md",
                 "zeta.md",
                 "Journal/index.md",
                 "Alpha.md",
                 "Notes/nested/Deep.md",
-            ],
+            ]),
             &[],
+            TreeSort::NameAsc,
         );
 
         // Folders first, then notes; case-insensitive ("Alpha.md" < "zeta.md").
@@ -185,7 +259,7 @@ mod tests {
 
     #[test]
     fn folder_paths_are_the_full_vault_relative_path() {
-        let tree = build_with_folders(&["a/b/c.md"], &[]);
+        let tree = build_with_folders(&entries(&["a/b/c.md"]), &[], TreeSort::NameAsc);
         let TreeNode::Folder { path, children, .. } = &tree[0] else {
             panic!();
         };
@@ -202,12 +276,16 @@ mod tests {
 
     #[test]
     fn empty_input_gives_an_empty_tree() {
-        assert!(build_with_folders(&[], &[]).is_empty());
+        assert!(build_with_folders(&[], &[], TreeSort::NameAsc).is_empty());
     }
 
     #[test]
     fn folder_paths_lists_every_folder_depth_first() {
-        let tree = build_with_folders(&["a/b/note.md", "a/top.md", "c.md"], &[]);
+        let tree = build_with_folders(
+            &entries(&["a/b/note.md", "a/top.md", "c.md"]),
+            &[],
+            TreeSort::NameAsc,
+        );
         assert_eq!(
             folder_paths(&tree),
             vec!["a".to_string(), "a/b".to_string()]
@@ -216,7 +294,11 @@ mod tests {
 
     #[test]
     fn empty_folders_materialize_without_note_leaves() {
-        let tree = build_with_folders(&["Notes/Glass.md", "zeta.md"], &["Notes/Empty", "Deep/a/b"]);
+        let tree = build_with_folders(
+            &entries(&["Notes/Glass.md", "zeta.md"]),
+            &["Notes/Empty", "Deep/a/b"],
+            TreeSort::NameAsc,
+        );
         assert_eq!(names(&tree), ["Deep", "Notes", "zeta.md"]);
 
         let Some(TreeNode::Folder { path, children, .. }) = tree.first() else {
@@ -235,9 +317,80 @@ mod tests {
     #[test]
     fn empty_folders_merge_with_note_folders() {
         // A folder path that already exists via notes must not duplicate.
-        let tree = build_with_folders(&["Notes/Glass.md"], &["Notes"]);
+        let tree = build_with_folders(&entries(&["Notes/Glass.md"]), &["Notes"], TreeSort::NameAsc);
         assert_eq!(names(&tree), ["Notes"]);
         assert_eq!(folder_paths(&tree), vec!["Notes".to_string()]);
+    }
+
+    /// A timestamp `seconds` after the epoch.
+    fn at(seconds: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn the_name_orders_sort_the_notes_both_ways() {
+        let paths = ["b.md", "A.md", "c.md"];
+        let tree = build_with_folders(&entries(&paths), &[], TreeSort::NameAsc);
+        assert_eq!(names(&tree), ["A.md", "b.md", "c.md"]);
+
+        let tree = build_with_folders(&entries(&paths), &[], TreeSort::NameDesc);
+        assert_eq!(names(&tree), ["c.md", "b.md", "A.md"]);
+    }
+
+    #[test]
+    fn the_date_orders_use_the_modification_time() {
+        let paths = ["old.md", "new.md", "middle.md"];
+        let entries = vec![
+            Entry::new(paths[0], Some(at(100))),
+            Entry::new(paths[1], Some(at(300))),
+            Entry::new(paths[2], Some(at(200))),
+        ];
+
+        // Newest first: the most recent change leads.
+        let tree = build_with_folders(&entries, &[], TreeSort::Newest);
+        assert_eq!(names(&tree), ["new.md", "middle.md", "old.md"]);
+
+        // Oldest first: the other way round.
+        let tree = build_with_folders(&entries, &[], TreeSort::Oldest);
+        assert_eq!(names(&tree), ["old.md", "middle.md", "new.md"]);
+    }
+
+    #[test]
+    fn the_folders_sort_by_name_whatever_the_note_order_is() {
+        let paths = ["b.md", "Folder/a.md", "a.md"];
+        for sort in TreeSort::ALL {
+            let tree = build_with_folders(&entries(&paths), &[], sort);
+            // The folder leads, whatever the notes do.
+            assert_eq!(names(&tree)[0], "Folder", "{sort:?}");
+        }
+    }
+
+    #[test]
+    fn a_file_without_a_timestamp_sorts_last() {
+        // Attachments carry no timestamp: they cannot join a date order,
+        // so they sink to the bottom.
+        let paths = ["note.md", "image.png"];
+        let entries = vec![
+            Entry::new(paths[0], Some(at(100))),
+            Entry::new(paths[1], None),
+        ];
+        for sort in [TreeSort::Newest, TreeSort::Oldest] {
+            let tree = build_with_folders(&entries, &[], sort);
+            assert_eq!(names(&tree), ["note.md", "image.png"], "{sort:?}");
+        }
+    }
+
+    #[test]
+    fn notes_of_the_same_age_keep_their_name_order() {
+        let paths = ["b.md", "a.md"];
+        let entries = vec![
+            Entry::new(paths[0], Some(at(100))),
+            Entry::new(paths[1], Some(at(100))),
+        ];
+        for sort in [TreeSort::Newest, TreeSort::Oldest] {
+            let tree = build_with_folders(&entries, &[], sort);
+            assert_eq!(names(&tree), ["a.md", "b.md"], "{sort:?}");
+        }
     }
 
     #[test]

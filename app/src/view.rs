@@ -16,9 +16,9 @@ use cosmic::Element;
 
 use crate::app::{
     editor_shortcut, find_matches, parent_of, title_of, tree_note_label, unicode_char,
-    unicode_entry_binding, LinkPathFormat, Message, Palette, PaneMode, SidePanel, TreeMenuAction,
-    VaultNotes, ATTACHMENT_INPUT, EDITOR_FONT_INPUT, EDITOR_INPUT, FIND_INPUT, SIDEBAR_OPACITY,
-    SWITCHER_INPUT, TREE_EDIT_INPUT,
+    unicode_entry_binding, LinkPathFormat, Message, Palette, PaneMode, SidePanel, SortMenuAction,
+    TreeMenuAction, TreeSort, VaultNotes, ATTACHMENT_INPUT, EDITOR_FONT_INPUT, EDITOR_INPUT,
+    FIND_INPUT, SIDEBAR_OPACITY, SWITCHER_INPUT, TREE_EDIT_INPUT,
 };
 use crate::editor_text::{
     editor_font, editor_highlight_format, editor_placeholder_color, editor_value_color,
@@ -334,12 +334,14 @@ fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
 }
 
 fn tree_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+    let mut col = column::Column::new().spacing(0).width(Length::Fill);
+    // The toolbar: the sort order and the fold controls.
+    col = col.push(tree_toolbar(app));
     if app.tree.is_empty() && app.tree_folder_edit_target().is_none() {
         return container(text("No notes.").class(palette.muted))
             .padding(12)
             .into();
     }
-    let mut col = column::Column::new().spacing(0).width(Length::Fill);
     // A root-level new-note/new-folder input renders above the tree.
     if app.tree_folder_edit_target() == Some("") {
         col = col.push(tree_edit_row(app, 4.0));
@@ -362,6 +364,72 @@ fn tree_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
             }
         })
         .into()
+}
+
+/// The Files panel's toolbar: the sort order and the fold controls.
+///
+/// The sort button shows the order in force and cycles through the four
+/// on a click; a right click opens the menu, where the order in force is
+/// checked. The two chevron buttons fold every folder away or open them
+/// all again.
+fn tree_toolbar<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
+    let sort_icon = if app.tree_sort.descending() {
+        "view-sort-descending-symbolic"
+    } else {
+        "view-sort-ascending-symbolic"
+    };
+    let sort_button = button::custom(
+        row::Row::new()
+            .push(icon::from_name(sort_icon).size(16))
+            .push(text(app.tree_sort.label()))
+            .spacing(6),
+    )
+    .class(cosmic::theme::Button::Text)
+    .on_press(Message::TreeSort(app.tree_sort.next()))
+    .height(Length::Shrink)
+    .width(Length::Shrink);
+
+    let sort: cosmic::Element<'a, Message> =
+        context_menu(sort_button, Some(sort_menu(app.tree_sort)))
+            .on_surface_action(Message::Surface)
+            .into();
+
+    row::Row::new()
+        .push(sort)
+        .push(
+            button::icon(icon::from_name("pan-end-symbolic"))
+                .on_press(Message::TreeCollapseAll)
+                .height(Length::Shrink),
+        )
+        .push(
+            button::icon(icon::from_name("pan-down-symbolic"))
+                .on_press(Message::TreeExpandAll)
+                .height(Length::Shrink),
+        )
+        .push(cosmic::iced::widget::space::horizontal())
+        .spacing(4)
+        .align_y(alignment::Vertical::Center)
+        .padding(Padding {
+            left: 6.0,
+            right: 6.0,
+            top: 4.0,
+            bottom: 4.0,
+        })
+        .width(Length::Fill)
+        .into()
+}
+
+/// The sort menu: the four orders, the one in force checked.
+fn sort_menu(current: TreeSort) -> Vec<menu::Tree<Message>> {
+    menu::items(
+        &std::collections::HashMap::new(),
+        TreeSort::ALL
+            .into_iter()
+            .map(|order| {
+                menu::Item::CheckBox(order.label(), None, order == current, SortMenuAction(order))
+            })
+            .collect(),
+    )
 }
 
 /// The style of a tree row while a drag is in flight: the hovered drop

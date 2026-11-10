@@ -33,6 +33,10 @@ pub use crate::settings::PaneMode;
 /// persists) and re-exported here.
 pub use crate::settings::LinkPathFormat;
 
+/// How the file tree orders its notes. Defined in settings (it persists)
+/// and re-exported here.
+pub use crate::settings::TreeSort;
+
 /// Which panel the sidebar shows (M4b).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SidePanel {
@@ -456,6 +460,12 @@ pub enum Message {
     EditorAutoPair(char),
     Save,
     ToggleFolder(String),
+    /// Set the file tree's sort order (persisted).
+    TreeSort(TreeSort),
+    /// Collapse every folder of the file tree.
+    TreeCollapseAll,
+    /// Expand every folder of the file tree.
+    TreeExpandAll,
     ToggleFold(u64),
     /// A link span was clicked; the URI scheme routes it.
     OpenUri(String),
@@ -570,6 +580,8 @@ pub struct VaultNotes {
     pub attachment_extensions: Vec<String>,
     /// How generated wikilinks spell their target.
     pub link_path_format: LinkPathFormat,
+    /// How the file tree orders its notes (persisted).
+    pub tree_sort: TreeSort,
     /// Draft text of the drawer's extension input.
     pub attachment_input: String,
     /// Hex digits collected so far during Unicode codepoint entry
@@ -635,6 +647,19 @@ impl cosmic::widget::menu::Action for TreeMenuAction {
 
     fn message(&self) -> Self::Message {
         Message::TreeMenu(*self)
+    }
+}
+
+/// The file tree's sort menu: pick the order the notes follow.
+/// `Copy` because cosmic's `menu::Action` requires it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortMenuAction(pub TreeSort);
+
+impl cosmic::widget::menu::Action for SortMenuAction {
+    type Message = Message;
+
+    fn message(&self) -> Self::Message {
+        Message::TreeSort(self.0)
     }
 }
 
@@ -1737,12 +1762,13 @@ impl VaultNotes {
             return;
         };
         self.index = vault.index();
-        let paths: Vec<String> = vault
+        // The notes carry their modification time, so the tree can order
+        // them by age; the attachments have none.
+        let notes: Vec<tree::Entry<'_>> = vault
             .notes_sorted()
             .iter()
-            .map(|note| note.path.clone())
+            .map(|note| tree::Entry::new(&note.path, Some(note.modified)))
             .collect();
-        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
         // Empty folders materialize too, so they can receive new notes.
         let folders: Vec<String> = vault.folders();
         let folder_refs: Vec<&str> = folders.iter().map(String::as_str).collect();
@@ -1750,13 +1776,15 @@ impl VaultNotes {
         // platform handler), filtered by the user's extension list; the
         // switcher and search stay note-only.
         let extensions = self.attachment_extensions.clone();
-        let attachments: Vec<&str> = vault
+        let attachments: Vec<tree::Entry<'_>> = vault
             .attachments_sorted()
             .into_iter()
             .filter(|path| attachment_shown(path, &extensions))
+            .map(|path| tree::Entry::new(path, None))
             .collect();
-        let entries: Vec<&str> = refs.iter().copied().chain(attachments).collect();
-        self.tree = tree::build_with_folders(&entries, &folder_refs);
+        let mut entries = notes;
+        entries.extend(attachments);
+        self.tree = tree::build_with_folders(&entries, &folder_refs, self.tree_sort);
     }
 
     fn open_tab(&mut self, path: String) -> Task<Message> {
@@ -3550,6 +3578,7 @@ impl cosmic::Application for VaultNotes {
             default_pane: persisted.default_pane,
             attachment_extensions: persisted.attachment_extensions,
             link_path_format: persisted.link_path_format,
+            tree_sort: persisted.tree_sort,
             attachment_input: String::new(),
             unicode_input: None,
             tree_edit: None,
@@ -4231,6 +4260,21 @@ impl cosmic::Application for VaultNotes {
                     self.collapsed.insert(path);
                 }
                 // Row set changed: re-measure for drag hit-testing.
+                self.measure_tree_bounds_if_needed()
+            }
+            Message::TreeSort(sort) => {
+                self.tree_sort = sort;
+                persist_setting(move |s| s.tree_sort = sort);
+                self.rebuild_index();
+                self.measure_tree_bounds_if_needed()
+            }
+            Message::TreeCollapseAll => {
+                // Every folder folds away: the tree shows its roots.
+                self.collapsed = tree::folder_paths(&self.tree).into_iter().collect();
+                self.measure_tree_bounds_if_needed()
+            }
+            Message::TreeExpandAll => {
+                self.collapsed.clear();
                 self.measure_tree_bounds_if_needed()
             }
             Message::ToggleFold(id) => {
@@ -5760,6 +5804,7 @@ mod find_tests {
             default_pane: PaneMode::default(),
             attachment_extensions: Vec::new(),
             link_path_format: LinkPathFormat::default(),
+            tree_sort: TreeSort::default(),
             attachment_input: String::new(),
             unicode_input: None,
             tree_edit: None,
@@ -7867,5 +7912,76 @@ mod live_tests {
             Some("hello there\n")
         );
         assert!(!app.tabs[0].is_dirty());
+    }
+}
+
+#[cfg(test)]
+mod tree_sort_tests {
+    use super::*;
+    use cosmic::app::Application as _;
+
+    fn app_with(files: &[(&str, &str)]) -> (tempfile::TempDir, VaultNotes) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (path, text) in files {
+            if let Some((dir, _)) = path.rsplit_once('/') {
+                std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+            }
+            std::fs::write(tmp.path().join(path), text).unwrap();
+        }
+        let mut app = find_tests::test_app_with_tab("");
+        app.vault = Some(Vault::open(tmp.path()).unwrap());
+        app.rebuild_index();
+        (tmp, app)
+    }
+
+    /// The names of the tree's rows, depth-first.
+    fn labels(app: &VaultNotes) -> Vec<String> {
+        fn walk(nodes: &[TreeNode], out: &mut Vec<String>) {
+            for node in nodes {
+                match node {
+                    TreeNode::Folder { name, children, .. } => {
+                        out.push(name.clone());
+                        walk(children, out);
+                    }
+                    TreeNode::Note { name, .. } => out.push(name.clone()),
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&app.tree, &mut out);
+        out
+    }
+
+    #[test]
+    fn the_sort_order_moves_the_notes() {
+        let (_tmp, mut app) = app_with(&[("b.md", ""), ("a.md", ""), ("Folder/c.md", "")]);
+        // The name order is the default: folders first, notes A to Z.
+        assert_eq!(labels(&app), ["Folder", "c.md", "a.md", "b.md"]);
+
+        // Keep the developer's own setting out of the test.
+        let before = crate::settings::load().tree_sort;
+        let _ = app.update(Message::TreeSort(TreeSort::NameDesc));
+        assert_eq!(app.tree_sort, TreeSort::NameDesc);
+        // The folder keeps its place; the notes turn around.
+        assert_eq!(labels(&app), ["Folder", "c.md", "b.md", "a.md"]);
+        persist_setting(move |s| s.tree_sort = before);
+    }
+
+    #[test]
+    fn every_folder_can_fold_away_and_come_back() {
+        let (_tmp, mut app) = app_with(&[("Folder/Deep/n.md", ""), ("a.md", "")]);
+        // Nothing is folded at first.
+        assert!(app.collapsed.is_empty());
+
+        let _ = app.update(Message::TreeCollapseAll);
+        assert_eq!(
+            app.collapsed,
+            ["Folder".to_string(), "Folder/Deep".to_string()]
+                .into_iter()
+                .collect()
+        );
+
+        let _ = app.update(Message::TreeExpandAll);
+        assert!(app.collapsed.is_empty());
     }
 }
