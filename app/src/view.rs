@@ -931,7 +931,7 @@ fn note_area<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
             .into(),
     };
     col = col.push(container(content).width(Length::Fill).height(Length::Fill));
-    col = col.push(status_bar(tab, palette));
+    col = col.push(status_bar(app, palette));
     col.into()
 }
 
@@ -1513,15 +1513,19 @@ pub(crate) fn live_key_binding(
 
 /// Status bar under the note area: word/character counts for the active
 /// tab (cached on the tab, refreshed with the doc — not per frame).
-fn status_bar<'a>(tab: &'a crate::app::Tab, palette: Palette) -> Element<'a, Message> {
-    container(
-        text(format!("{} words · {} characters", tab.words, tab.chars))
-            .size(12)
-            .class(palette.muted),
-    )
-    .padding([4, 12])
-    .width(Length::Fill)
-    .into()
+///
+/// A selection counts on its own too: the marked words and characters
+/// are shown next to the note's totals.
+fn status_bar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+    let Some(tab) = app.active_tab() else {
+        return container(text("")).width(Length::Fill).into();
+    };
+    let selection = app.selection_text();
+    let label = crate::app::status_label(tab, selection.as_deref());
+    container(text(label).size(12).class(palette.muted))
+        .padding([4, 12])
+        .width(Length::Fill)
+        .into()
 }
 
 fn with_alpha(color: cosmic::iced::Color, alpha: f32) -> cosmic::iced::Color {

@@ -937,8 +937,20 @@ fn word_delete_actions(has_selection: bool, right: bool) -> Vec<Action> {
 }
 
 /// Word count for the status bar: whitespace-separated runs.
-fn count_words(text: &str) -> usize {
+pub(crate) fn count_words(text: &str) -> usize {
     text.split_whitespace().count()
+}
+
+/// The status bar's label: the note's totals, and the marked words and
+/// characters when there is a selection.
+pub(crate) fn status_label(tab: &Tab, selection: Option<&str>) -> String {
+    let mut label = format!("{} words · {} characters", tab.words, tab.chars);
+    if let Some(selection) = selection.filter(|text| !text.is_empty()) {
+        let words = count_words(selection);
+        let chars = selection.chars().count();
+        label.push_str(&format!(" ({words} words · {chars} characters)"));
+    }
+    label
 }
 
 /// Whether the global keyboard subscription may act on a key event.
@@ -1675,6 +1687,23 @@ impl VaultNotes {
     /// The tab currently shown, if any.
     pub fn active_tab(&self) -> Option<&Tab> {
         self.active.and_then(|idx| self.tabs.get(idx))
+    }
+
+    /// The text the user has selected, if any.
+    ///
+    /// The live pane edits one block region at a time, so its selection
+    /// lives in the region's editor; the panes that show the source
+    /// editor read it from there. The reading pane shows no editor, so
+    /// nothing is selected there. An empty selection counts as none.
+    pub fn selection_text(&self) -> Option<String> {
+        let selection = match self.pane {
+            PaneMode::Live => self.live.as_ref().and_then(|live| live.editor.selection()),
+            PaneMode::Source | PaneMode::Split => {
+                self.active_tab().and_then(|tab| tab.content.selection())
+            }
+            PaneMode::Reading => None,
+        };
+        selection.filter(|text| !text.is_empty())
     }
 
     /// The desktop window title (what the task switcher shows): the open
@@ -5347,6 +5376,49 @@ mod editor_tests {
         assert_eq!(count_words(""), 0);
         assert_eq!(count_words("hello"), 1);
         assert_eq!(count_words("  two  words\nand more "), 4);
+    }
+
+    #[test]
+    fn the_status_bar_counts_the_note_and_the_selection() {
+        let tab = Tab::open("t.md".to_string(), "hello world\n");
+        // Without a selection, the note's totals stand alone.
+        assert_eq!(status_label(&tab, None), "2 words · 12 characters");
+        // A selection adds its own counts.
+        assert_eq!(
+            status_label(&tab, Some("hello")),
+            "2 words · 12 characters (1 words · 5 characters)"
+        );
+        // An empty selection counts as none.
+        assert_eq!(status_label(&tab, Some("")), "2 words · 12 characters");
+    }
+
+    #[test]
+    fn the_selection_comes_from_the_editor_in_front() {
+        let mut app = find_tests::test_app_with_tab("hello world\n");
+        // Select "hello" in the source editor: the caret sits at the end
+        // of the selection, the anchor at its start.
+        app.pane = PaneMode::Source;
+        app.tabs[0].content.move_to(Cursor {
+            position: Position { line: 0, column: 5 },
+            selection: Some(Position { line: 0, column: 0 }),
+        });
+        assert_eq!(app.selection_text().as_deref(), Some("hello"));
+
+        // In the live pane the focused region's editor holds it instead.
+        app.pane = PaneMode::Live;
+        app.live = Some(LiveEdit {
+            block: 0,
+            editor: Content::with_text("one two three"),
+        });
+        app.live.as_mut().unwrap().editor.move_to(Cursor {
+            position: Position { line: 0, column: 3 },
+            selection: Some(Position { line: 0, column: 0 }),
+        });
+        assert_eq!(app.selection_text().as_deref(), Some("one"));
+
+        // The reading pane shows no editor: nothing is selected there.
+        app.pane = PaneMode::Reading;
+        assert_eq!(app.selection_text(), None);
     }
 
     #[test]
