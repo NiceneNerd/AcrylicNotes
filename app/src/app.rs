@@ -762,15 +762,115 @@ fn paste_then_left(text: String, left: usize) -> Vec<Action> {
 
 /// Insert a `[^N]` reference at the cursor and a `[^N]: ` definition at
 /// the end of the document; N is the first number without a definition.
-fn footnote_actions(text: &str) -> Vec<Action> {
-    let n = next_footnote_number(text);
-    let mut actions = vec![Action::Edit(Edit::Paste(Arc::new(format!("[^{n}]"))))];
-    actions.push(Action::Move(Motion::DocumentEnd));
-    if !text.ends_with('\n') {
-        actions.push(Action::Edit(Edit::Paste(Arc::new("\n".to_string()))));
+///
+/// The definitions are normalized on the way: every top-level
+/// `[^label]:` line gets exactly one blank line before it. Markdown
+/// needs that blank line — without it the definition is a lazy
+/// continuation of the paragraph above and never becomes a footnote.
+///
+/// Returns the new text and the cursor's place in it (right after the
+/// inserted reference).
+fn insert_footnote(text: &str, cursor: Position, n: u32) -> (String, Position) {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let (mut lines, cursor_line) = normalise_footnote_definitions(lines, cursor.line);
+    // The reference goes in at the cursor.
+    let line = cursor_line.min(lines.len().saturating_sub(1));
+    let reference = format!("[^{n}]");
+    let column = char_boundary(&lines[line], cursor.column);
+    lines[line].insert_str(column, &reference);
+    let cursor = Position {
+        line,
+        column: column + reference.len(),
+    };
+    // The definition goes at the end, under one blank line.
+    if lines.last().is_some_and(|last| !last.is_empty()) {
+        lines.push(String::new());
     }
-    actions.push(Action::Edit(Edit::Paste(Arc::new(format!("[^{n}]: ")))));
-    actions
+    lines.push(format!("[^{n}]: "));
+    (lines.join("\n"), cursor)
+}
+
+/// Give every top-level footnote definition exactly one blank line
+/// before it.
+///
+/// The cursor's line is tracked: a blank line removed above it moves it
+/// up, one added moves it down.
+fn normalise_footnote_definitions(lines: Vec<&str>, cursor_line: usize) -> (Vec<String>, usize) {
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut cursor = cursor_line;
+    let mut fence: Option<(char, usize)> = None;
+    for (i, line) in lines.iter().enumerate() {
+        // A definition inside a code fence is code, not a definition.
+        let in_code = match fence_of(line) {
+            Some((character, length)) => match fence {
+                Some((open, open_len)) if open == character && length >= open_len => {
+                    // The fence closes here.
+                    fence = None;
+                    false
+                }
+                Some(_) => true,
+                None => {
+                    fence = Some((character, length));
+                    true
+                }
+            },
+            None => fence.is_some(),
+        };
+        if !in_code && is_footnote_def(line) {
+            // Drop the blank lines that are there…
+            let mut removed = 0;
+            while out.last().is_some_and(|last| last.trim().is_empty()) {
+                out.pop();
+                removed += 1;
+            }
+            // …and put exactly one back.
+            let added = usize::from(!out.is_empty());
+            if added == 1 {
+                out.push(String::new());
+            }
+            if i < cursor_line {
+                cursor = cursor + added - removed;
+            }
+        }
+        out.push((*line).to_string());
+    }
+    (out, cursor)
+}
+
+/// Whether a line starts a footnote definition: `[^label]:`.
+fn is_footnote_def(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("[^") else {
+        return false;
+    };
+    let Some(end) = rest.find(']') else {
+        return false;
+    };
+    end > 0 && rest[end + 1..].starts_with(':')
+}
+
+/// The code fence a line opens or closes, if it is one: the character
+/// and the run length.
+fn fence_of(line: &str) -> Option<(char, usize)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let character = rest.chars().next()?;
+    if character != '`' && character != '~' {
+        return None;
+    }
+    let length = rest.chars().take_while(|&c| c == character).count();
+    (length >= 3).then_some((character, length))
+}
+
+/// The largest character boundary at or before `column`.
+fn char_boundary(line: &str, column: usize) -> usize {
+    let mut at = column.min(line.len());
+    while at > 0 && !line.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
 }
 
 /// The first footnote number that has no `[^N]:` definition in `text`.
@@ -2372,6 +2472,39 @@ impl VaultNotes {
         self.update_wiki_complete();
     }
 
+    /// Insert a footnote reference at the cursor and its definition at
+    /// the end of the note (Ctrl+Alt+F), as one undoable step.
+    ///
+    /// A selection is replaced by the reference; the definitions are
+    /// normalized (one blank line before each) on the way.
+    fn insert_footnote_at_cursor(&mut self, idx: usize) {
+        let was_dirty = self.tabs[idx].is_dirty();
+        {
+            let tab = &mut self.tabs[idx];
+            push_undo(tab);
+            // The reference replaces the selection, as it did when this
+            // was a list of editor actions.
+            if tab.content.selection().is_some() {
+                tab.content.perform(Action::Edit(Edit::Delete));
+            }
+            let text = tab.content.text();
+            let cursor = tab.content.cursor().position;
+            let n = next_footnote_number(&text);
+            let (new_text, cursor) = insert_footnote(&text, cursor, n);
+            tab.content = Content::with_text(&new_text);
+            tab.content.move_to(Cursor {
+                position: cursor,
+                selection: None,
+            });
+            tab.refresh_doc();
+        }
+        self.last_edit = Some(std::time::Instant::now());
+        if self.tabs[idx].is_dirty() != was_dirty {
+            self.sync_tab_text(idx);
+        }
+        self.update_wiki_complete();
+    }
+
     /// Select find match `index` in the active tab (cursor at its end, the
     /// editor's selection highlighting it).
     fn select_match(&mut self, index: usize) -> Task<Message> {
@@ -3768,9 +3901,7 @@ impl cosmic::Application for VaultNotes {
             }
             Message::EditorFootnote => {
                 if let Some(idx) = self.active {
-                    let text = self.tabs[idx].content.text();
-                    let actions = footnote_actions(&text);
-                    self.run_editor_command(idx, actions);
+                    self.insert_footnote_at_cursor(idx);
                 }
                 self.sync_preview_scroll()
             }
@@ -5062,13 +5193,59 @@ mod editor_tests {
     }
 
     #[test]
-    fn footnote_actions_insert_reference_and_definition() {
-        let mut tab = Tab::open("t.md".to_string(), "body\n");
-        for action in footnote_actions("body\n") {
-            tab.content.perform(action);
-        }
-        // The reference lands at the cursor; the definition at the end.
-        assert_eq!(tab.content.text(), "[^1]body\n[^1]: ");
+    fn insert_footnote_puts_the_reference_and_the_definition() {
+        let (text, cursor) = insert_footnote("body\n", Position { line: 0, column: 4 }, 1);
+        // The reference lands at the cursor; the definition at the end,
+        // under a blank line.
+        assert_eq!(text, "body[^1]\n\n[^1]: ");
+        assert_eq!(cursor, Position { line: 0, column: 8 });
+    }
+
+    #[test]
+    fn the_footnote_shortcut_edits_the_note_in_one_step() {
+        let mut app = find_tests::test_app_with_tab("body\n");
+        app.tabs[0].content.move_to(Cursor {
+            position: Position { line: 0, column: 4 },
+            selection: None,
+        });
+        app.insert_footnote_at_cursor(0);
+        assert_eq!(app.tabs[0].content.text(), "body[^1]\n\n[^1]: ");
+        // The cursor sits right after the reference.
+        assert_eq!(app.tabs[0].content.cursor().position.column, 8);
+        // And it is one undo step.
+        undo_tab(&mut app.tabs[0]);
+        assert_eq!(app.tabs[0].content.text(), "body\n");
+    }
+
+    #[test]
+    fn insert_footnote_normalizes_the_blank_lines_before_the_definitions() {
+        // Two blank lines before a definition become one…
+        let (text, _) =
+            insert_footnote("body\n\n\n[^1]: note\n", Position { line: 0, column: 4 }, 2);
+        assert_eq!(text, "body[^2]\n\n[^1]: note\n\n[^2]: ");
+        // …and none becomes one.
+        let (text, _) = insert_footnote("body\n[^1]: note\n", Position { line: 0, column: 4 }, 2);
+        assert_eq!(text, "body[^2]\n\n[^1]: note\n\n[^2]: ");
+    }
+
+    #[test]
+    fn a_definition_in_a_code_block_is_left_alone() {
+        let (text, _) =
+            insert_footnote("```\n[^1]: code\n```\n", Position { line: 0, column: 0 }, 2);
+        assert_eq!(text, "[^2]```\n[^1]: code\n```\n\n[^2]: ");
+    }
+
+    #[test]
+    fn the_cursor_follows_the_lines_the_normalization_moves() {
+        let (text, cursor) = insert_footnote(
+            "body\n\n\n[^1]: note\n\nafter\n",
+            Position { line: 5, column: 0 },
+            2,
+        );
+        // The blank lines above the definition collapsed, so the cursor
+        // moved up with them.
+        assert_eq!(cursor, Position { line: 4, column: 4 });
+        assert_eq!(text, "body\n\n[^1]: note\n\n[^2]after\n\n[^2]: ");
     }
 
     #[test]
