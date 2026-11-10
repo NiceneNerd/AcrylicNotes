@@ -165,6 +165,34 @@ pub fn render_doc<'a>(doc: &Doc, ctx: &Ctx<'a>) -> Element<'a, Message> {
     col.into()
 }
 
+/// How many stop positions the fold-id cursor advances for this doc: one
+/// per callout block, in the same traversal order `render_doc` assigns
+/// ids (`Quote`, `List` items, `Callout` bodies and `FootnoteDef` bodies
+/// recurse; embeds resolve at render time and are not counted — a callout
+/// count change *inside* an embedded note isn't visible here, matching
+/// the renderer's trick that the traversal cost must stay cheap).
+///
+/// Fold ids are positional, so two docs with the same count hand out the
+/// same ids: fold state can be retained across an edit whenever the count
+/// is unchanged, and must reset when a callout is added (new ids shift
+/// the traversal) or removed.
+pub(crate) fn foldable_count(doc: &Doc) -> usize {
+    foldable_blocks(&doc.blocks)
+}
+
+fn foldable_blocks(blocks: &[Block]) -> usize {
+    blocks
+        .iter()
+        .map(|block| match block {
+            Block::Callout { body, .. } => 1 + foldable_blocks(body),
+            Block::Quote(body) => foldable_blocks(body),
+            Block::List { items, .. } => items.iter().map(|item| foldable_blocks(&item.body)).sum(),
+            Block::FootnoteDef { body, .. } => foldable_blocks(body),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// The frontmatter block under `render_doc`: foldable, code-styled;
 /// metadata, not prose. `None` when the note has no frontmatter (no
 /// empty code box is rendered). The live preview's frontmatter region

@@ -231,14 +231,21 @@ impl Tab {
     fn refresh_doc(&mut self) {
         let text = self.content.text();
         if text != self.doc_text {
-            self.doc = parse_note(&text);
+            let new_doc = parse_note(&text);
+            // Fold ids are positional callout indexes: they survive an
+            // edit only while the foldable inventory is unchanged (same
+            // count ⇒ same id assignment, so typing inside a callout
+            // keeps its fold). Adding or removing one shifts every later
+            // id — the set then points at different blocks and resets.
+            let old_foldables = crate::reading::foldable_count(&self.doc);
+            if crate::reading::foldable_count(&new_doc) != old_foldables {
+                self.folds.clear();
+            }
+            self.doc = new_doc;
             self.words = count_words(&text);
             self.chars = text.chars().count();
             self.doc_text = text;
             self.outline = crate::reading::outline(&self.doc);
-            // Ids are positional; after an edit they may point at different
-            // callouts, so fold state resets with the content.
-            self.folds.clear();
         }
     }
 
@@ -6808,5 +6815,97 @@ mod live_tests {
         // One undo step restores both regions at once.
         assert!(undo_tab(&mut app.tabs[0]));
         assert_eq!(app.tabs[0].content.text(), "alpha\n\nx alpha y\n");
+    }
+
+    #[test]
+    fn folds_survive_edits_inside_the_foldable() {
+        // Block 0 is the callout (fold id 1 — frontmatter owns 0), block 1
+        // the paragraph. The ids come from traversal order, so they stay
+        // valid as long as the callout count is unchanged.
+        let mut app = find_tests::test_app_with_tab("> [!note] T\n> body\n\nafter\n");
+        app.live_focus(0);
+        app.update(Message::ToggleFold(1));
+        assert!(app.tabs[0].folds.contains(&1));
+        // Typing inside the callout body: count unchanged, fold stays.
+        aim(&mut app, 1, 6);
+        app.live_run(vec![Action::Edit(Edit::Insert('x'))]);
+        assert_eq!(
+            app.tabs[0].content.text(),
+            "> [!note] T\n> bodyx\n\nafter\n"
+        );
+        assert!(app.tabs[0].folds.contains(&1));
+    }
+
+    #[test]
+    fn folds_reset_when_a_foldable_is_added_or_removed() {
+        let mut app = find_tests::test_app_with_tab("> [!note] T\n> body\n\nafter\n");
+        app.live_focus(0);
+        app.update(Message::ToggleFold(1));
+        // Adding a callout below shifts the positional ids: folds reset.
+        app.live_focus(1);
+        aim(&mut app, 0, 5);
+        app.live_run(vec![Action::Edit(Edit::Paste(Arc::new(
+            "\n> [!warn] W\n> w".to_string(),
+        )))]);
+        // Two callouts now (the count changed), and the stale fold went
+        // with the shifted ids.
+        assert_eq!(crate::reading::foldable_count(&app.tabs[0].doc), 2);
+        assert!(app.tabs[0].folds.is_empty());
+        // Removing one must reset again too: two callouts folded, then
+        // the first demoted back to a paragraph by replacing its region.
+        app.live_focus(0);
+        app.update(Message::ToggleFold(1));
+        app.update(Message::ToggleFold(2));
+        assert_eq!(app.tabs[0].folds.len(), 2);
+        if let Some(live) = app.live.as_mut() {
+            live.editor.move_to(Cursor {
+                position: Position { line: 2, column: 0 },
+                selection: Some(Position { line: 0, column: 0 }),
+            });
+        }
+        app.live_run(vec![Action::Edit(Edit::Insert('x'))]);
+        assert!(app.tabs[0].folds.is_empty());
+    }
+
+    #[test]
+    fn live_edits_refresh_the_status_counts() {
+        let mut app = find_tests::test_app_with_tab("one\n");
+        app.live_focus(0);
+        aim(&mut app, 0, 3);
+        app.live_run(vec![
+            Action::Edit(Edit::Insert(' ')),
+            Action::Edit(Edit::Paste(Arc::new("two three".to_string()))),
+        ]);
+        assert_eq!(app.tabs[0].content.text(), "one two three\n");
+        assert_eq!(app.tabs[0].words, 3);
+        assert_eq!(app.tabs[0].chars, "one two three\n".chars().count());
+    }
+
+    #[test]
+    fn live_edits_restart_the_autosave_idle_and_save() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("n.md"), "hello\n").unwrap();
+        let mut app = find_tests::test_app_with_tab("");
+        app.vault = Some(Vault::open(tmp.path()).unwrap());
+        app.rebuild_index();
+        app.tabs.clear();
+        app.tabs.push(Tab::open("n.md".to_string(), "hello\n"));
+        app.active = Some(0);
+        app.live_focus(0);
+        assert!(app.last_edit.is_none());
+        // Editing from the live pane restarts the idle timer.
+        aim(&mut app, 0, 5);
+        app.live_run(vec![Action::Edit(Edit::Paste(Arc::new(
+            " there".to_string(),
+        )))]);
+        assert!(app.last_edit.is_some());
+        // Idling past the window fires the guarded save to disk.
+        app.last_edit = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        app.autosave_tick();
+        assert_eq!(
+            app.vault.as_ref().unwrap().note_source("n.md").as_deref(),
+            Some("hello there\n")
+        );
+        assert!(!app.tabs[0].is_dirty());
     }
 }
