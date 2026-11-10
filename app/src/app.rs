@@ -1589,12 +1589,14 @@ impl VaultNotes {
     }
 
     /// Focus the live editor's text input once the view has rebuilt with
-    /// it mounted at the focused region's (possibly new) position.
-    fn live_editor_focus() -> Task<Message> {
+    /// it mounted at the focused region's (possibly new) position. The
+    /// target id is per-region (`scroll::live_editor_id`), matching the
+    /// id the view tags the focused editor with.
+    fn live_editor_focus(region: usize) -> Task<Message> {
         cosmic::iced::runtime::task::widget::<Message>(
-            cosmic::iced::core::widget::operation::focusable::focus::<Message>(Id::new(
-                EDITOR_INPUT,
-            )),
+            cosmic::iced::core::widget::operation::focusable::focus::<Message>(
+                crate::scroll::live_editor_id(region),
+            ),
         )
         .map(cosmic::Action::from)
     }
@@ -1686,7 +1688,7 @@ impl VaultNotes {
         // measure op sees the region mounted in the fresh tree (the same
         // ordering the reading pane's `to_block` relies on).
         let scroll = crate::scroll::to_live_region::<Message>(idx, 12.0);
-        let focus = Self::live_editor_focus();
+        let focus = Self::live_editor_focus(idx);
         Task::batch([scroll, focus])
     }
 

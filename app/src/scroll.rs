@@ -40,6 +40,28 @@ pub fn live_region_id(index: usize) -> Id {
     Id::from(format!("live-region-{index}"))
 }
 
+/// The Id of the focused region's block editor in the live preview.
+///
+/// This is *not* a shared constant on purpose. This build of iced
+/// persists named-widget state in a global map and restores it by id
+/// when the view is diffed, matching tree children by id — so an editor
+/// id that stays constant while the editor hops between sibling
+/// positions (clicking from one block into another) restores the
+/// editor's state into the *old* tree node and leaves the node the
+/// editor actually renders in holding the neighbouring region's state.
+/// The next layout then downcasts the wrong state type and panics
+/// ("Downcast widget state").
+///
+/// Per-region ids sidestep that: when focus moves, the old id vanishes
+/// and the region falls back to positional diffing, where the
+/// editor/mouse-area widget-type change forces a clean subtree rebuild.
+/// While a region stays focused, its id and tree index are both
+/// stable, so the normal by-id state persistence (cursor, focus)
+/// still applies.
+pub fn live_editor_id(region: usize) -> Id {
+    Id::from(format!("live-editor-{region}"))
+}
+
 /// Measures the anchor's position inside the scrollable.
 struct Measure {
     scrollable: Id,
@@ -133,7 +155,11 @@ mod tests {
         // measure op looks them up by string equality.
         assert_eq!(block_id(2), Id::new("block-2"));
         assert_eq!(live_region_id(3), Id::new("live-region-3"));
-        // Region ids never collide with block ids.
+        assert_eq!(live_editor_id(1), Id::new("live-editor-1"));
+        // Region ids never collide with block ids, and editor ids never
+        // collide with either.
         assert_ne!(block_id(1).clone(), live_region_id(1));
+        assert_ne!(live_editor_id(1), live_region_id(1));
+        assert_ne!(live_editor_id(1), block_id(1));
     }
 }

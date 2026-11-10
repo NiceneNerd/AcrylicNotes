@@ -1205,8 +1205,7 @@ fn live_pane<'a>(
             region,
             &mut fold_id,
         ));
-    }
-    // The id anchors the scroll-into-view work (R3).
+    } // The id anchors the scroll-into-view work (R3).
     let scroll = scrollable::scrollable(col)
         .id(Id::new(crate::scroll::LIVE_SCROLL))
         .width(Length::Fill)
@@ -1242,7 +1241,7 @@ fn live_region<'a>(
 ) -> cosmic::Element<'a, Message> {
     let inner: cosmic::Element<'a, Message> =
         if app.live.as_ref().is_some_and(|state| state.block == region) {
-            focused_block_editor(app, palette)
+            focused_block_editor(app, palette, region)
         } else if let Some(block) = slice.block.and_then(|b| tab.doc.blocks.get(b)) {
             // The block list guards embed cycles (`stack`); the region's own
             // source line mapping is `slice`, not the block's, because the
@@ -1279,7 +1278,8 @@ fn live_region<'a>(
         };
     // The transparent wrapper carries the region anchor used by the
     // scroll-into-view op (`to_live_region`). Inner ids (the focused
-    // editor's EDITOR_INPUT, heading anchors) piggyback inside it.
+    // editor's per-region `live_editor_id`, heading anchors) piggyback
+    // inside it.
     container(inner)
         .id(crate::scroll::live_region_id(region))
         .width(Length::Fill)
@@ -1294,7 +1294,11 @@ fn stack_from<'a>(ctx: &reading::Ctx<'a>) -> Vec<String> {
 /// The focused region's raw-source editor: one buffer, one keystroke
 /// from the note text (see `live_action`). `Shrink` height lets the
 /// buffer grow with its content while the surrounding blocks re-render.
-fn focused_block_editor<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+fn focused_block_editor<'a>(
+    app: &'a VaultNotes,
+    palette: Palette,
+    region: usize,
+) -> Element<'a, Message> {
     let live = app
         .live
         .as_ref()
@@ -1310,7 +1314,11 @@ fn focused_block_editor<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a
         cosmic::iced::highlighter::Theme::InspiredGitHub
     };
     text_editor(&live.editor)
-        .id(Id::new(EDITOR_INPUT))
+        // Per-region id (see `scroll::live_editor_id`): a constant id
+        // here panics when focus hops between regions, because iced's
+        // by-id state restore would resurrect the old node at the old
+        // index while the editor renders at the new one.
+        .id(crate::scroll::live_editor_id(region))
         // The widget auto-fits: `min_bounds()` tracks the buffer.
         .height(Length::Shrink)
         .on_action(Message::EditorAction)
