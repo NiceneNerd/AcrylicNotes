@@ -49,6 +49,56 @@ impl Effect {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effects_and_events_round_trip_through_the_wire_format() {
+        // The Windows bridge serializes effects and events the same way
+        // the cosmic runner passes them in-process; both must round trip.
+        let effect = Effect::new(
+            EffectId::new(9),
+            EffectKind::SearchVault {
+                request: crate::ids::SearchRequestId::new(3),
+                query: "needle".into(),
+            },
+        );
+        let json = serde_json::to_string(&effect).unwrap();
+        assert_eq!(serde_json::from_str::<Effect>(&json).unwrap(), effect);
+
+        let events = vec![
+            AppEvent::SaveCompleted {
+                effect: EffectId::new(1),
+            },
+            AppEvent::SaveFailed {
+                effect: EffectId::new(2),
+                error: "changed on disk".into(),
+            },
+            AppEvent::ReloadCompleted {
+                effect: EffectId::new(3),
+                text: "fresh".into(),
+            },
+            AppEvent::SearchCompleted {
+                request: crate::ids::SearchRequestId::new(3),
+                hits: vec![crate::search::SearchHitView {
+                    path: "a.md".into(),
+                    line_no: 4,
+                    line: "needle".into(),
+                }],
+            },
+        ];
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(
+                serde_json::from_str::<AppEvent>(&json).unwrap(),
+                event,
+                "round trip failed for {json}"
+            );
+        }
+    }
+}
+
 /// Results of executed effects, fed back into the reducer by the frontend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AppEvent {

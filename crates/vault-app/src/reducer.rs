@@ -33,15 +33,15 @@ impl App {
     /// Apply a user intent, returning the effects the frontend must run.
     pub fn dispatch(&mut self, command: UiCommand) -> Vec<Effect> {
         match command {
-            UiCommand::SetPaneMode(mode) => {
+            UiCommand::SetPaneMode { mode } => {
                 self.state.pane = mode;
                 Vec::new()
             }
-            UiCommand::SetSidebarVisible(open) => {
+            UiCommand::SetSidebarVisible { open } => {
                 self.state.sidebar_open = open;
                 Vec::new()
             }
-            UiCommand::SetNavSection(section) => {
+            UiCommand::SetNavSection { section } => {
                 self.state.panel = section;
                 Vec::new()
             }
@@ -175,16 +175,21 @@ mod tests {
     fn pane_sidebar_and_section_commands_update_the_state() {
         let mut app = App::new();
         assert_eq!(
-            app.dispatch(UiCommand::SetPaneMode(crate::settings::PaneMode::Split)),
+            app.dispatch(UiCommand::SetPaneMode {
+                mode: crate::settings::PaneMode::Split
+            }),
             vec![]
         );
         assert_eq!(app.state.pane, crate::settings::PaneMode::Split);
-        assert_eq!(app.dispatch(UiCommand::SetSidebarVisible(false)), vec![]);
+        assert_eq!(
+            app.dispatch(UiCommand::SetSidebarVisible { open: false }),
+            vec![]
+        );
         assert!(!app.state.sidebar_open);
         assert_eq!(
-            app.dispatch(UiCommand::SetNavSection(
-                crate::navigation::NavSection::Tags
-            )),
+            app.dispatch(UiCommand::SetNavSection {
+                section: crate::navigation::NavSection::Tags
+            }),
             vec![]
         );
         assert_eq!(app.state.panel, crate::navigation::NavSection::Tags);

@@ -1936,12 +1936,14 @@ impl VaultNotes {
 
     /// Show or hide the sidebar through the shared reducer.
     pub(crate) fn set_sidebar_open(&mut self, open: bool) {
-        let _ = self.shared.dispatch(UiCommand::SetSidebarVisible(open));
+        let _ = self.shared.dispatch(UiCommand::SetSidebarVisible { open });
     }
 
     /// Switch the sidebar panel through the shared reducer.
     pub(crate) fn set_panel(&mut self, panel: SidePanel) {
-        let _ = self.shared.dispatch(UiCommand::SetNavSection(panel));
+        let _ = self
+            .shared
+            .dispatch(UiCommand::SetNavSection { section: panel });
     }
 
     /// Whether any open tab for `path` has unsaved edits.
@@ -2102,7 +2104,7 @@ impl VaultNotes {
     /// the highlighted button must always name the pane on screen.
     fn set_pane(&mut self, mode: PaneMode) {
         // The shared kernel owns the pane state (restructure commit 05).
-        let _ = self.shared.dispatch(UiCommand::SetPaneMode(mode));
+        let _ = self.shared.dispatch(UiCommand::SetPaneMode { mode });
         let target = self
             .pane_model
             .iter()

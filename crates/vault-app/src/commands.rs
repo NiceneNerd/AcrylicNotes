@@ -13,17 +13,23 @@ use crate::persistence::ConflictDecision;
 use crate::settings::PaneMode;
 
 /// One user intent.
+///
+/// Internally tagged (`{"type": "save-active-tab"}`) so the wire format is
+/// self-describing: the Windows bridge can log, forward, and inspect
+/// commands without matching every variant. Every variant is a struct
+/// variant (serde's internal tag cannot wrap bare primitives).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum UiCommand {
     /// Choose the pane layout (header segmented control).
     #[serde(rename = "set-pane-mode")]
-    SetPaneMode(PaneMode),
+    SetPaneMode { mode: PaneMode },
     /// Show or hide the sidebar.
     #[serde(rename = "set-sidebar-visible")]
-    SetSidebarVisible(bool),
+    SetSidebarVisible { open: bool },
     /// Switch the sidebar's active panel.
     #[serde(rename = "set-nav-section")]
-    SetNavSection(NavSection),
+    SetNavSection { section: NavSection },
     /// Open a note (focuses its existing tab instead of duplicating it).
     #[serde(rename = "open-note")]
     OpenNote { path: String },
@@ -51,4 +57,48 @@ pub enum UiCommand {
     /// scan and reports `AppEvent::SearchCompleted`).
     #[serde(rename = "search-vault")]
     SearchVault { query: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_command_round_trips_through_its_persisted_names() {
+        let commands = vec![
+            UiCommand::SetPaneMode {
+                mode: crate::settings::PaneMode::Split,
+            },
+            UiCommand::SetSidebarVisible { open: false },
+            UiCommand::SetNavSection {
+                section: crate::navigation::NavSection::Outline,
+            },
+            UiCommand::OpenNote {
+                path: "notes/a.md".into(),
+            },
+            UiCommand::ActivateTab { position: 2 },
+            UiCommand::CloseTab { position: 0 },
+            UiCommand::SaveActiveTab,
+            UiCommand::ResolveConflict {
+                tab: crate::ids::TabId::new(4),
+                decision: crate::persistence::ConflictDecision::ReloadFromDisk,
+            },
+            UiCommand::SetSearchQuery {
+                query: "needle".into(),
+            },
+            UiCommand::SearchVault {
+                query: "needle".into(),
+            },
+        ];
+        for command in commands {
+            let json = serde_json::to_string(&command).unwrap();
+            assert_eq!(
+                serde_json::from_str::<UiCommand>(&json).unwrap(),
+                command,
+                "round trip failed for {json}"
+            );
+            // The wire names are kebab-case tags, not enum variant names.
+            assert!(json.starts_with('{'), "tagged enum shape expected: {json}");
+        }
+    }
 }
