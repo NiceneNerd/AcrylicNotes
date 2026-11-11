@@ -33,9 +33,9 @@ use crate::tree::TreeNode;
 /// margin choice.
 const READING_VERTICAL_PADDING: f32 = 8.0;
 
-/// Width of the scrollbar drawn by the cosmic scrollable, so the right
-/// margin can make room for it and avoid overlaying the text.
-const SCROLLBAR_WIDTH: f32 = 8.0;
+/// Space between the vertical scrollbar and the content so the scrollbar
+/// never overlays the text.
+const SCROLLBAR_SPACING: f32 = 8.0;
 
 pub fn view(app: &VaultNotes) -> Element<'_, Message> {
     if app.vault.is_none() {
@@ -1316,34 +1316,37 @@ fn reading_pane<'a>(
     // Padding goes on the wrapping container: a Scrollable's own
     // `padding` only insets its scrollbar, not its content. The margin
     // around the column is the user's choice (None / Compact /
-    // Comfortable / Spacious) plus a fixed vertical space; the right side
-    // also makes room for the scrollbar so it never overlays the text.
+    // Comfortable / Spacious) plus a fixed vertical space. The right side
+    // uses the scrollable's `spacing` to keep the vertical scrollbar from
+    // overlaying the text.
     //
     // A click in the reading view marks it as the pane in focus, so the
     // zoom shortcuts act on its font size.
     container(
         cosmic::iced::widget::mouse_area(
-            scrollable::scrollable(
+            cosmic::iced::widget::scrollable(
                 container(reading::render_doc(&tab.doc, &ctx))
                     .width(Length::Fill)
                     .align_x(alignment::Horizontal::Center),
             )
             .id(Id::new(READING_SCROLL))
             .width(Length::Fill)
-            .height(Length::Fill),
+            .height(Length::Fill)
+            // Space between the vertical scrollbar and the content so
+            // the scrollbar never overlays the text.
+            .spacing(SCROLLBAR_SPACING),
         )
         .on_press(Message::ReadingClicked),
     )
     .width(Length::Fill)
     .height(Length::Fill)
     // Padding around the text column: a fixed small vertical space plus
-    // the configurable horizontal margin. The right side also makes room
-    // for the scrollbar so it never overlays the text.
+    // the configurable horizontal margin.
     .padding([
         READING_VERTICAL_PADDING,
         app.reading_margin.padding(),
         READING_VERTICAL_PADDING,
-        app.reading_margin.padding() + SCROLLBAR_WIDTH,
+        app.reading_margin.padding(),
     ])
     .into()
 }
@@ -1389,10 +1392,13 @@ fn live_pane<'a>(
             &mut fold_id,
         ));
     } // The id anchors the scroll-into-view work (R3).
-    let scroll = scrollable::scrollable(col)
+    let scroll = cosmic::iced::widget::scrollable(col)
         .id(Id::new(crate::scroll::LIVE_SCROLL))
         .width(Length::Fill)
-        .height(Length::Fill);
+        .height(Length::Fill)
+        // Space between the vertical scrollbar and the content so
+        // the scrollbar never overlays the text.
+        .spacing(SCROLLBAR_SPACING);
     // The wiki dropdown is ALWAYS the stack's second child, even closed
     // (an empty placeholder takes its slot) — a structural change would
     // rebuild the subtree and drop the focused editor's key state, the
@@ -1407,13 +1413,12 @@ fn live_pane<'a>(
         .width(Length::Fill)
         .height(Length::Fill)
         // Padding around the preview column: fixed vertical space plus
-        // the configurable horizontal margin, with room on the right for
-        // the scrollbar.
+        // the configurable horizontal margin.
         .padding([
             READING_VERTICAL_PADDING,
             app.reading_margin.padding(),
             READING_VERTICAL_PADDING,
-            app.reading_margin.padding() + SCROLLBAR_WIDTH,
+            app.reading_margin.padding(),
         ])
         .into()
 }
