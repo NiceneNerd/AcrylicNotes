@@ -64,6 +64,33 @@ impl LinkUpdateDecision {
     }
 }
 
+/// What the watcher poll decides to do about one externally changed tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExternalChangeAction {
+    /// Content-identical change (e.g. an mtime-only `touch`): nothing to do.
+    #[serde(rename = "none")]
+    None,
+    /// Real content change with no local edits: auto-reload + info banner.
+    #[serde(rename = "reloaded")]
+    Reloaded,
+    /// Real content change with unsaved edits: conflict banner.
+    #[serde(rename = "conflict")]
+    Conflict,
+}
+
+/// Classify an external change against a tab's base text: identical
+/// content is silent; otherwise dirty tabs conflict and clean tabs reload.
+#[must_use]
+pub fn classify_external_change(disk: &str, base: &str, tab_dirty: bool) -> ExternalChangeAction {
+    if disk == base {
+        ExternalChangeAction::None
+    } else if tab_dirty {
+        ExternalChangeAction::Conflict
+    } else {
+        ExternalChangeAction::Reloaded
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +110,16 @@ mod tests {
             serde_json::to_string(&LinkUpdateDecision::LeaveAsIs).unwrap(),
             r#""leave-as-is""#
         );
+    }
+
+    #[test]
+    fn external_changes_classify_by_content_and_dirtiness() {
+        use ExternalChangeAction::{Conflict, None as Silent, Reloaded};
+        // Identical content is always silent (an mtime-only touch).
+        assert_eq!(classify_external_change("same", "same", false), Silent);
+        assert_eq!(classify_external_change("same", "same", true), Silent);
+        // Real change: clean tabs reload, dirty tabs conflict.
+        assert_eq!(classify_external_change("disk", "base", false), Reloaded);
+        assert_eq!(classify_external_change("disk", "base", true), Conflict);
     }
 }

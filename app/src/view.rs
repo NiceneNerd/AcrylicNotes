@@ -827,7 +827,7 @@ fn links_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message
 
 /// Headings of the active note; a click scrolls the reading view to it.
 fn outline_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
-    let Some(idx) = app.active else {
+    let Some(idx) = app.active_idx() else {
         return panel_hint("Open a note to see its outline.", palette);
     };
     let tab = &app.tabs[idx];
@@ -942,7 +942,7 @@ fn switcher_overlay<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Me
 // --- note area -------------------------------------------------------------
 
 fn note_area<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
-    let Some(idx) = app.active else {
+    let Some(idx) = app.active_idx() else {
         return container(
             text("Open a note from the sidebar, or click a link in reading view.")
                 .class(Palette::from(&cosmic::theme::active()).muted),
@@ -995,7 +995,12 @@ fn tab_bar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
         .spacing(2)
         .align_y(alignment::Vertical::Center);
     for (idx, tab) in app.tabs.iter().enumerate() {
-        strip = strip.push(tab_button(tab, idx, app.active == Some(idx), palette));
+        strip = strip.push(tab_button(
+            tab,
+            idx,
+            app.tab_ids.active() == Some(tab.id),
+            palette,
+        ));
     }
     // More tabs than fit: the strip scrolls sideways.
     scrollable::horizontal(strip)

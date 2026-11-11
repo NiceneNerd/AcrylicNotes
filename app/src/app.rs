@@ -18,6 +18,7 @@ use cosmic::iced::Color;
 use cosmic::widget::{icon, nav_bar, segmented_button};
 use unicode_segmentation::UnicodeSegmentation;
 
+use vault_app::ids::TabId;
 use vault_core::vault::VaultError;
 use vault_core::{NoteSource, ObsidianSettings, Vault, VaultIndex};
 use vault_md::{parse_note, Doc};
@@ -158,6 +159,8 @@ impl Palette {
 
 /// One open note: editor buffer plus its derived reading document.
 pub struct Tab {
+    /// The tab's stable identity in the shared tab bar.
+    pub id: TabId,
     pub path: String,
     pub content: Content<cosmic::Renderer>,
     /// The text as loaded from / saved to disk; the dirty test compares
@@ -184,8 +187,9 @@ pub struct Tab {
 }
 
 impl Tab {
-    fn open(path: String, source: &str) -> Self {
+    fn open(id: TabId, path: String, source: &str) -> Self {
         let mut tab = Self {
+            id,
             content: Content::with_text(source),
             base_text: source.to_string(),
             path,
@@ -546,7 +550,9 @@ pub struct VaultNotes {
     pub tree: Vec<TreeNode>,
     pub collapsed: HashSet<String>,
     pub tabs: Vec<Tab>,
-    pub active: Option<usize>,
+    /// Shared tab-bar state: ids, order, active tab (restructure commit 04).
+    /// The `tabs` payload vector stays aligned with `tab_ids.order()`.
+    pub tab_ids: vault_app::tabs::Tabs,
     pub pane: PaneMode,
     /// Paths of open tabs that changed on disk while dirty.
     pub banner: Option<Banner>,
@@ -1798,7 +1804,7 @@ impl VaultNotes {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
                 self.tabs.clear();
-                self.active = None;
+                self.tab_ids.clear();
                 self.banner = None;
                 self.error = None;
                 self.vault = Some(vault);
@@ -1821,7 +1827,15 @@ impl VaultNotes {
 
     /// The tab currently shown, if any.
     pub fn active_tab(&self) -> Option<&Tab> {
-        self.active.and_then(|idx| self.tabs.get(idx))
+        self.active_idx().and_then(|idx| self.tabs.get(idx))
+    }
+
+    /// The display position of the active tab. The `tabs` payload vector
+    /// stays aligned with the shared tab order, so this indexes into it.
+    pub fn active_idx(&self) -> Option<usize> {
+        self.tab_ids
+            .active()
+            .and_then(|id| self.tab_ids.position(id))
     }
 
     /// The text the user has selected, if any.
@@ -1893,9 +1907,7 @@ impl VaultNotes {
 
     /// Path of the tab currently shown, if any.
     pub fn active_tab_path(&self) -> Option<&str> {
-        self.active
-            .and_then(|idx| self.tabs.get(idx))
-            .map(|tab| tab.path.as_str())
+        self.tab_ids.active_path()
     }
 
     /// Whether any open tab for `path` has unsaved edits.
@@ -1953,26 +1965,27 @@ impl VaultNotes {
 
     fn open_tab(&mut self, path: String) -> Task<Message> {
         self.dismiss_editor_overlays();
-        let was = self.active;
-        if let Some(i) = self.tabs.iter().position(|tab| tab.path == path) {
-            self.active = Some(i);
-            if was != self.active {
-                // Live-editing state belongs to the previous tab's text.
-                self.live = None;
+        match self.tab_ids.open_or_focus(&path) {
+            vault_app::tabs::TabOpenOutcome::Focused(id) => {
+                if self.tab_ids.activate(id).is_some() {
+                    // Live-editing state belongs to the previous tab's text.
+                    self.live = None;
+                }
+                let focus = self.ensure_live_focus();
+                Task::batch([self.sync_window_title(), focus])
             }
-            let focus = self.ensure_live_focus();
-            return Task::batch([self.sync_window_title(), focus]);
+            vault_app::tabs::TabOpenOutcome::Opened(id) => {
+                let source = self
+                    .vault
+                    .as_ref()
+                    .and_then(|vault| vault.note_source(&path))
+                    .unwrap_or_default();
+                self.tabs.push(Tab::open(id, path, &source));
+                self.live = None;
+                let focus = self.ensure_live_focus();
+                Task::batch([self.sync_window_title(), focus])
+            }
         }
-        let source = self
-            .vault
-            .as_ref()
-            .and_then(|vault| vault.note_source(&path))
-            .unwrap_or_default();
-        self.tabs.push(Tab::open(path, &source));
-        self.active = Some(self.tabs.len() - 1);
-        self.live = None;
-        let focus = self.ensure_live_focus();
-        Task::batch([self.sync_window_title(), focus])
     }
 
     /// Create a note for an unresolved link and open it.
@@ -2137,7 +2150,7 @@ impl VaultNotes {
     fn jump_to_block(&mut self, idx: usize) -> Task<Message> {
         // Live preview focuses the block instead of scrolling a pane.
         if self.pane == PaneMode::Live {
-            let Some(tab_idx) = self.active else {
+            let Some(tab_idx) = self.active_idx() else {
                 return Task::none();
             };
             let region = self
@@ -2196,7 +2209,7 @@ impl VaultNotes {
         if self.pane != PaneMode::Live || self.live.is_some() {
             return Task::none();
         }
-        let Some(tab_idx) = self.active else {
+        let Some(tab_idx) = self.active_idx() else {
             return Task::none();
         };
         if !self.tabs[tab_idx].doc.blocks.is_empty() {
@@ -2220,7 +2233,7 @@ impl VaultNotes {
         if self.live.as_ref().is_some_and(|state| state.block == idx) {
             return Task::none();
         }
-        let Some(tab_idx) = self.active else {
+        let Some(tab_idx) = self.active_idx() else {
             return Task::none();
         };
         let slices = self.live_slices(tab_idx);
@@ -2249,7 +2262,7 @@ impl VaultNotes {
         column: usize,
         selection: Option<Position>,
     ) -> Task<Message> {
-        let Some(tab_idx) = self.active else {
+        let Some(tab_idx) = self.active_idx() else {
             return Task::none();
         };
         let slices = self.live_slices(tab_idx);
@@ -2300,7 +2313,7 @@ impl VaultNotes {
         if actions.is_empty() {
             return Task::none();
         }
-        let Some(tab_idx) = self.active else {
+        let Some(tab_idx) = self.active_idx() else {
             return Task::none();
         };
         let Some(live_block) = self.live.as_ref().map(|live| live.block) else {
@@ -2378,7 +2391,7 @@ impl VaultNotes {
     /// task when the buffer is rebuilt so the editor keeps focus across
     /// region boundary changes.
     fn live_aim(&mut self, line: usize, column: usize) -> Task<Message> {
-        let Some(tab_idx) = self.active else {
+        let Some(tab_idx) = self.active_idx() else {
             return Task::none();
         };
         let tab = &self.tabs[tab_idx];
@@ -2418,7 +2431,7 @@ impl VaultNotes {
     /// place, with its column preserved where the target line is long
     /// enough); inside a region they are plain motions.
     fn live_navigate(&mut self, up: bool) -> Task<Message> {
-        let Some(tab_idx) = self.active else {
+        let Some(tab_idx) = self.active_idx() else {
             return Task::none();
         };
         let motion = if up { Motion::Up } else { Motion::Down };
@@ -2473,7 +2486,7 @@ impl VaultNotes {
     /// newline before it — one character at file level — anywhere else
     /// it is a plain backspace.
     fn live_backspace(&mut self) -> Task<Message> {
-        let Some(tab_idx) = self.active else {
+        let Some(tab_idx) = self.active_idx() else {
             return Task::none();
         };
         let at_start = self.live.as_ref().is_some_and(|live| {
@@ -2511,7 +2524,7 @@ impl VaultNotes {
     /// newline after it — one character at file level — anywhere else it
     /// is a plain delete.
     fn live_delete(&mut self) -> Task<Message> {
-        let Some(tab_idx) = self.active else {
+        let Some(tab_idx) = self.active_idx() else {
             return Task::none();
         };
         let Some(live_block) = self.live.as_ref().map(|live| live.block) else {
@@ -2562,7 +2575,7 @@ impl VaultNotes {
     /// region's edge the word can live in the neighbouring region, so
     /// the motion runs over the whole note text instead.
     fn live_delete_word(&mut self, right: bool) -> Task<Message> {
-        let Some(tab_idx) = self.active else {
+        let Some(tab_idx) = self.active_idx() else {
             return Task::none();
         };
         let Some(live_block) = self.live.as_ref().map(|live| live.block) else {
@@ -2633,7 +2646,7 @@ impl VaultNotes {
         if !self.scroll_sync || self.pane != PaneMode::Split {
             return Task::none();
         }
-        let Some(idx) = self.active else {
+        let Some(idx) = self.active_idx() else {
             return Task::none();
         };
         // The editor buffer is the whole file; its 0-based cursor line + 1
@@ -2654,7 +2667,7 @@ impl VaultNotes {
     /// reuse the original frontmatter bytes verbatim; frontmatter edits go
     /// through `save_note_full` with the full text.
     fn save_active(&mut self) -> Task<Message> {
-        if let Some(idx) = self.active {
+        if let Some(idx) = self.active_idx() {
             self.save_tab(idx);
         }
         Task::none()
@@ -2698,24 +2711,17 @@ impl VaultNotes {
     /// Close a tab, saving unsaved edits first. A refused save (external
     /// change) keeps the tab open so no edits are lost.
     fn close_tab(&mut self, idx: usize) -> Task<Message> {
-        if idx >= self.tabs.len() {
+        let Some(id) = self.tab_ids.id_at(idx) else {
             return Task::none();
-        }
+        };
         if self.tabs[idx].is_dirty() && !self.save_tab(idx) {
             return Task::none();
         }
         self.dismiss_editor_overlays();
+        // The shared model decides the fallback active tab (the neighbor
+        // that took the closed tab's position); the payload vector follows.
+        let _next_active = self.tab_ids.close(id);
         self.tabs.remove(idx);
-        self.active = match self.active {
-            Some(active) if active >= self.tabs.len() => {
-                if self.tabs.is_empty() {
-                    None
-                } else {
-                    Some(self.tabs.len() - 1)
-                }
-            }
-            other => other,
-        };
         // The removed tab may have been the one being live-edited.
         self.live = None;
         let title = self.sync_window_title();
@@ -2797,7 +2803,7 @@ impl VaultNotes {
             Some(find) => (find.query.clone(), find.case_sensitive),
             None => return Task::none(),
         };
-        let Some(idx) = self.active else {
+        let Some(idx) = self.active_idx() else {
             return Task::none();
         };
         let text = self.tabs[idx].content.text();
@@ -2866,7 +2872,7 @@ impl VaultNotes {
     fn find_jump_to_cursor(&mut self) -> Task<Message> {
         let anchor = if self.pane == PaneMode::Live {
             self.live.as_ref().and_then(|live| {
-                let idx = self.active?;
+                let idx = self.active_idx()?;
                 let slices = self.live_slices(idx);
                 let slice = slices.get(live.block)?;
                 let cursor = live.editor.cursor();
@@ -2914,7 +2920,7 @@ impl VaultNotes {
             ),
             None => return Task::none(),
         };
-        let Some(idx) = self.active else {
+        let Some(idx) = self.active_idx() else {
             return Task::none();
         };
         let text = self.tabs[idx].content.text();
@@ -2971,7 +2977,7 @@ impl VaultNotes {
         if query.is_empty() {
             return Task::none();
         }
-        let Some(idx) = self.active else {
+        let Some(idx) = self.active_idx() else {
             return Task::none();
         };
         let text = self.tabs[idx].content.text();
@@ -3134,7 +3140,7 @@ impl VaultNotes {
             self.dismiss_editor_overlays();
             return;
         }
-        let Some(idx) = self.active else {
+        let Some(idx) = self.active_idx() else {
             self.dismiss_editor_overlays();
             return;
         };
@@ -3197,7 +3203,7 @@ impl VaultNotes {
         else {
             return Task::none();
         };
-        let Some(idx) = self.active else {
+        let Some(idx) = self.active_idx() else {
             return Task::none();
         };
         // The link text follows the link-path-format preference.
@@ -3454,6 +3460,7 @@ impl VaultNotes {
             .map(|vault| vault.rename_note(&old, &new));
         match outcome {
             Some(Ok(())) => {
+                self.tab_ids.rename_path(&old, &new);
                 for tab in &mut self.tabs {
                     if tab.path == old {
                         tab.path = new.clone();
@@ -3478,6 +3485,7 @@ impl VaultNotes {
         match outcome {
             Some(Ok(())) => {
                 let prefix = format!("{old}/");
+                self.tab_ids.rename_path_prefix(&prefix, &format!("{new}/"));
                 for tab in &mut self.tabs {
                     if let Some(rest) = tab.path.strip_prefix(&prefix) {
                         tab.path = format!("{new}/{rest}");
@@ -3697,18 +3705,10 @@ impl VaultNotes {
         };
         match outcome {
             Ok(()) => {
-                let active_path = self
-                    .active
-                    .and_then(|idx| self.tabs.get(idx))
-                    .map(|tab| tab.path.clone());
+                // The shared model keeps the active tab when it survives
+                // the deletion, else falls back to the last remaining one.
+                let _removed = self.tab_ids.retain_paths(|path| !affected(path));
                 self.tabs.retain(|tab| !affected(&tab.path));
-                self.active = active_path
-                    .and_then(|ap| self.tabs.iter().position(|tab| tab.path == ap))
-                    .or(if self.tabs.is_empty() {
-                        None
-                    } else {
-                        Some(self.tabs.len() - 1)
-                    });
                 self.rebuild_index();
             }
             Err(error) => self.error = Some(format!("cannot delete {path}: {error}")),
@@ -3725,7 +3725,7 @@ impl VaultNotes {
     fn autosave_tick(&mut self) -> Task<Message> {
         let idle = self.last_edit.map(|t| t.elapsed());
         if autosave_due(idle, self.autosave_secs)
-            && self.active.is_some_and(|idx| self.tabs[idx].is_dirty())
+            && self.active_tab().is_some_and(|tab| tab.is_dirty())
         {
             return self.save_active();
         }
@@ -3802,7 +3802,7 @@ impl cosmic::Application for VaultNotes {
             tree: Vec::new(),
             collapsed: HashSet::new(),
             tabs: Vec::new(),
-            active: None,
+            tab_ids: vault_app::tabs::Tabs::new(),
             pane: persisted.default_pane,
             banner: None,
             pending_links: None,
@@ -4091,12 +4091,15 @@ impl cosmic::Application for VaultNotes {
                 self.ensure_live_focus()
             }
             Message::TabActivated(idx) => {
-                let was = self.active;
-                if idx < self.tabs.len() {
-                    self.active = Some(idx);
-                }
+                // The shared model validates the position and reports the
+                // previous tab only when the active tab changed.
+                let changed = self
+                    .tab_ids
+                    .id_at(idx)
+                    .map(|id| self.tab_ids.activate(id).is_some())
+                    .unwrap_or(false);
                 // Live-editing state belongs to the previous tab's text.
-                if was != self.active {
+                if changed {
                     self.live = None;
                 }
                 self.dismiss_editor_overlays();
@@ -4115,7 +4118,7 @@ impl cosmic::Application for VaultNotes {
                 if self.pane == PaneMode::Live {
                     return self.live_action(action);
                 }
-                if let Some(idx) = self.active {
+                if let Some(idx) = self.active_idx() {
                     let is_edit = action.is_edit();
                     let tab = &mut self.tabs[idx];
                     // Snapshot before the edit so undo can restore it.
@@ -4157,7 +4160,7 @@ impl cosmic::Application for VaultNotes {
                 self.live_run(actions)
             }
             Message::EditorUndo => {
-                if let Some(idx) = self.active {
+                if let Some(idx) = self.active_idx() {
                     // Where the live caret is, so it can re-aim after the
                     // text is restored.
                     let aim = self.live_aim_marker(idx);
@@ -4179,7 +4182,7 @@ impl cosmic::Application for VaultNotes {
                 }
             }
             Message::EditorRedo => {
-                if let Some(idx) = self.active {
+                if let Some(idx) = self.active_idx() {
                     let aim = self.live_aim_marker(idx);
                     let tab = &mut self.tabs[idx];
                     if redo_tab(tab) {
@@ -4199,7 +4202,7 @@ impl cosmic::Application for VaultNotes {
                 }
             }
             Message::EditorFormat(format) => {
-                if let Some(idx) = self.active {
+                if let Some(idx) = self.active_idx() {
                     let selection = self.tabs[idx].content.selection();
                     let actions = format_actions(selection, format);
                     self.run_editor_command(idx, actions);
@@ -4207,13 +4210,13 @@ impl cosmic::Application for VaultNotes {
                 self.sync_preview_scroll()
             }
             Message::EditorFootnote => {
-                if let Some(idx) = self.active {
+                if let Some(idx) = self.active_idx() {
                     self.insert_footnote_at_cursor(idx);
                 }
                 self.sync_preview_scroll()
             }
             Message::EditorDeleteWord(right) => {
-                if let Some(idx) = self.active {
+                if let Some(idx) = self.active_idx() {
                     let has_selection = self.tabs[idx].content.selection().is_some();
                     let actions = word_delete_actions(has_selection, right);
                     self.run_editor_command(idx, actions);
@@ -4228,7 +4231,7 @@ impl cosmic::Application for VaultNotes {
                     if self.pane == PaneMode::Live {
                         return self.live_run(actions);
                     }
-                    if let Some(idx) = self.active {
+                    if let Some(idx) = self.active_idx() {
                         self.run_editor_command(idx, actions);
                     }
                     return Task::none();
@@ -4246,7 +4249,7 @@ impl cosmic::Application for VaultNotes {
                     }
                     return self.live_run_with(pair.actions, pair.select);
                 }
-                if let Some(idx) = self.active {
+                if let Some(idx) = self.active_idx() {
                     let text = self.tabs[idx].content.text();
                     let cursor = self.tabs[idx].content.cursor();
                     let pair = autopair_actions(&text, cursor, typed);
@@ -4344,7 +4347,7 @@ impl cosmic::Application for VaultNotes {
             }
             Message::EditorCut => {
                 let selection = self.active_tab().and_then(|tab| tab.content.selection());
-                match (self.active, selection) {
+                match (self.active_idx(), selection) {
                     (Some(idx), Some(selection)) => {
                         {
                             let tab = &mut self.tabs[idx];
@@ -4366,7 +4369,7 @@ impl cosmic::Application for VaultNotes {
                 .map(cosmic::Action::App),
             Message::EditorPasteText(maybe_text) => {
                 if let Some(text) = maybe_text {
-                    if let Some(idx) = self.active {
+                    if let Some(idx) = self.active_idx() {
                         {
                             let tab = &mut self.tabs[idx];
                             push_undo(tab);
@@ -4381,7 +4384,7 @@ impl cosmic::Application for VaultNotes {
                 self.sync_preview_scroll()
             }
             Message::EditorSelectAll => {
-                if let Some(idx) = self.active {
+                if let Some(idx) = self.active_idx() {
                     self.tabs[idx].content.perform(Action::SelectAll);
                 }
                 self.sync_preview_scroll()
@@ -4501,7 +4504,7 @@ impl cosmic::Application for VaultNotes {
                 Task::none()
             }
             Message::UnicodeStart => {
-                if self.active.is_some() {
+                if self.active_idx().is_some() {
                     self.dismiss_editor_overlays();
                     self.unicode_input = Some(String::new());
                 }
@@ -4529,7 +4532,7 @@ impl cosmic::Application for VaultNotes {
             }
             Message::UnicodeCommit => {
                 let hex = self.unicode_input.take();
-                if let (Some(idx), Some(hex)) = (self.active, hex) {
+                if let (Some(idx), Some(hex)) = (self.active_idx(), hex) {
                     if let Some(ch) = unicode_char(&hex) {
                         self.run_editor_command(idx, vec![Action::Edit(Edit::Insert(ch))]);
                         return self.sync_preview_scroll();
@@ -4599,7 +4602,7 @@ impl cosmic::Application for VaultNotes {
                 Task::batch([scroll, self.measure_tree_bounds_if_needed()])
             }
             Message::ToggleFold(id) => {
-                if let Some(idx) = self.active {
+                if let Some(idx) = self.active_idx() {
                     let folds = &mut self.tabs[idx].folds;
                     if !folds.remove(&id) {
                         folds.insert(id);
@@ -4850,7 +4853,7 @@ impl cosmic::Application for VaultNotes {
                             self.update(Message::SidePanel(SidePanel::Search))
                         }
                         Key::Character(c) if c == "f" => self.update(Message::FindOpen),
-                        Key::Character(c) if c == "w" => match self.active {
+                        Key::Character(c) if c == "w" => match self.active_idx() {
                             Some(idx) => self.update(Message::TabClose(idx)),
                             None => Task::none(),
                         },
@@ -5006,28 +5009,15 @@ fn released_modifier(held: Modifiers, key: &Key) -> Modifiers {
     }
 }
 
-/// What the watcher poll decides to do about one externally changed tab.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExternalAction {
-    /// Content-identical change (e.g. an mtime-only `touch`): nothing to do.
-    None,
-    /// Real content change with no local edits: auto-reload + info banner.
-    Reloaded,
-    /// Real content change with unsaved edits: conflict banner.
-    Conflict,
-}
+/// What the watcher poll decides to do about one externally changed tab —
+/// shared classification in `vault_app::persistence`.
+pub(crate) use vault_app::persistence::ExternalChangeAction as ExternalAction;
 
 /// Classify an external change against the tab's base text (M4 decision 7):
 /// identical content is silent; otherwise dirty tabs conflict and clean
 /// tabs reload.
 pub(crate) fn external_action(disk: &str, base: &str, tab_dirty: bool) -> ExternalAction {
-    if disk == base {
-        ExternalAction::None
-    } else if tab_dirty {
-        ExternalAction::Conflict
-    } else {
-        ExternalAction::Reloaded
-    }
+    vault_app::persistence::classify_external_change(disk, base, tab_dirty)
 }
 
 /// The non-blocking external-change banner: what was reloaded under us, and
@@ -5225,7 +5215,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("n.md"), "hello\n").unwrap();
         let mut vault = Vault::open(tmp.path()).unwrap();
-        let mut tab = Tab::open("n.md".to_string(), "hello\n");
+        let mut tab = Tab::open(TabId::new(0), "n.md".to_string(), "hello\n");
 
         // Local edit + save against our base: goes through the safe path.
         tab.content.perform(Action::Edit(Edit::Insert('X')));
@@ -5383,7 +5373,7 @@ mod chrome_model_tests {
 
     #[test]
     fn tab_labels_show_the_title_and_the_folder_beside_it() {
-        let tab = Tab::open("Journal/2026/D.md".to_string(), "written");
+        let tab = Tab::open(TabId::new(0), "Journal/2026/D.md".to_string(), "written");
         // The title is the file stem; the folder rides along dimmed, so
         // two notes with the same name can be told apart.
         let (title, folder) = tab_label_parts(&tab);
@@ -5391,13 +5381,13 @@ mod chrome_model_tests {
         assert_eq!(folder, "Journal/2026");
 
         // A note at the vault root has no folder to show.
-        let root = Tab::open("D.md".to_string(), "written");
+        let root = Tab::open(TabId::new(0), "D.md".to_string(), "written");
         assert_eq!(tab_label_parts(&root), ("D".to_string(), String::new()));
     }
 
     #[test]
     fn tab_labels_mark_dirty_tabs() {
-        let mut tab = Tab::open("D.md".to_string(), "written");
+        let mut tab = Tab::open(TabId::new(0), "D.md".to_string(), "written");
         assert_eq!(tab_label_parts(&tab).0, "D");
         // Same-module test: force dirtiness by diverging base from content.
         tab.base_text = String::new();
@@ -5536,7 +5526,7 @@ mod editor_tests {
 
     #[test]
     fn undo_redo_round_trips_edits() {
-        let mut tab = Tab::open("t.md".to_string(), "hello\n");
+        let mut tab = Tab::open(TabId::new(0), "t.md".to_string(), "hello\n");
         // An edit: snapshot first, then the change.
         push_undo(&mut tab);
         tab.content
@@ -5567,7 +5557,7 @@ mod editor_tests {
 
     #[test]
     fn undo_limit_bounded() {
-        let mut tab = Tab::open("t.md".to_string(), "");
+        let mut tab = Tab::open(TabId::new(0), "t.md".to_string(), "");
         for i in 0..(UNDO_LIMIT + 10) {
             push_undo(&mut tab);
             tab.content
@@ -5699,7 +5689,7 @@ mod editor_tests {
 
     #[test]
     fn word_delete_deletes_a_word_end_to_end() {
-        let mut tab = Tab::open("t.md".to_string(), "hello world\n");
+        let mut tab = Tab::open(TabId::new(0), "t.md".to_string(), "hello world\n");
         // Park the cursor at the end of "world" (line 0, column 11).
         tab.content.perform(Action::Move(Motion::DocumentStart));
         for _ in 0..11 {
@@ -5721,7 +5711,7 @@ mod editor_tests {
 
     #[test]
     fn the_status_bar_counts_the_note_and_the_selection() {
-        let tab = Tab::open("t.md".to_string(), "hello world\n");
+        let tab = Tab::open(TabId::new(0), "t.md".to_string(), "hello world\n");
         // Without a selection, the note's totals stand alone.
         assert_eq!(status_label(&tab, None), "2 words · 12 characters");
         // A selection adds its own counts.
@@ -5931,7 +5921,7 @@ mod autopair_tests {
 
     #[test]
     fn typing_a_pair_end_to_end_does_not_duplicate_closers() {
-        let mut tab = Tab::open("t.md".to_string(), "");
+        let mut tab = Tab::open(TabId::new(0), "t.md".to_string(), "");
         // Type "(" → "()" with the cursor in the middle.
         for action in actions("", tab.content.cursor(), '(') {
             tab.content.perform(action);
@@ -5960,7 +5950,7 @@ mod autopair_tests {
         // Select "My Link", pair it with "[", then pair it again: the
         // selection survives the first pair, so the second one wraps it
         // a second time.
-        let mut tab = Tab::open("t.md".to_string(), "My Link\n");
+        let mut tab = Tab::open(TabId::new(0), "t.md".to_string(), "My Link\n");
         tab.content.move_to(cursor_selecting(0, 7, 0, 0));
         let pair = autopair_actions(&tab.content.text(), tab.content.cursor(), '[');
         for action in pair.actions {
@@ -6281,7 +6271,7 @@ mod find_tests {
             tree: Vec::new(),
             collapsed: HashSet::new(),
             tabs: Vec::new(),
-            active: None,
+            tab_ids: vault_app::tabs::Tabs::new(),
             pane: PaneMode::default(),
             banner: None,
             pending_links: None,
@@ -6331,8 +6321,8 @@ mod find_tests {
             nav_model: build_nav_model(),
             pane_model: build_pane_model(PaneMode::default()),
         };
-        app.tabs.push(Tab::open("t.md".to_string(), text));
-        app.active = Some(0);
+        let tab_id = app.tab_ids.open("t.md");
+        app.tabs.push(Tab::open(tab_id, "t.md".to_string(), text));
         app
     }
 }
@@ -7407,7 +7397,9 @@ mod link_update_tests {
     #[test]
     fn open_tab_buffers_are_rewritten_not_the_disk_file() {
         let (tmp, mut app) = app_with(&[("a.md", "see [[b]]"), ("b.md", "b")]);
-        app.tabs.push(Tab::open("a.md".to_string(), "see [[b]]"));
+        let tab_id = app.tab_ids.open("a.md");
+        app.tabs
+            .push(Tab::open(tab_id, "a.md".to_string(), "see [[b]]"));
         let _ = app.rename_tree_note("b.md".into(), "c.md".into());
         let _ = app.update(Message::LinkUpdatesApply);
         // The buffer is the live truth for an open note.
@@ -8696,8 +8688,10 @@ mod live_tests {
         app.vault = Some(Vault::open(tmp.path()).unwrap());
         app.rebuild_index();
         app.tabs.clear();
-        app.tabs.push(Tab::open("n.md".to_string(), "hello\n"));
-        app.active = Some(0);
+        app.tab_ids.clear();
+        let tab_id = app.tab_ids.open("n.md");
+        app.tabs
+            .push(Tab::open(tab_id, "n.md".to_string(), "hello\n"));
         app.live_focus(0);
         assert!(app.last_edit.is_none());
         // Editing from the live pane restarts the idle timer.
@@ -8796,6 +8790,7 @@ mod tree_sort_tests {
             ("Folder/Deep/deep.md", ""),
             ("Other/o.md", ""),
         ]);
+        app.tab_ids.rename_path("t.md", "Folder/Deep/deep.md");
         app.tabs[0].path = "Folder/Deep/deep.md".to_string();
         (tmp, app)
     }
@@ -8826,7 +8821,7 @@ mod tree_sort_tests {
     #[test]
     fn without_an_open_note_there_is_no_path_to_work_from() {
         let (_tmp, mut app) = app_with_current_note();
-        app.active = None;
+        app.tab_ids.clear();
 
         // No path to keep open, so everything folds away.
         let _ = app.update(Message::TreeCollapseOthers);
