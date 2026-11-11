@@ -276,12 +276,14 @@ fn foldable_blocks(blocks: &[Block]) -> usize {
         .sum()
 }
 
-/// The frontmatter block under `render_doc`: foldable, code-styled;
-/// metadata, not prose. `None` when the note has no frontmatter (no
-/// empty code box is rendered). The live preview's frontmatter region
-/// reuses this.
+/// The frontmatter block under `render_doc`: foldable, rendered as
+/// structured YAML instead of raw text. Nested maps and sequences are
+/// indented so the metadata is readable at a glance. `None` when the note
+/// has no frontmatter (no empty code box is rendered). The live preview's
+/// frontmatter region reuses this.
 pub(crate) fn render_frontmatter<'a>(doc: &Doc, ctx: &Ctx<'a>) -> Option<Element<'a, Message>> {
     let frontmatter = doc.frontmatter_raw.as_ref()?;
+    let yaml = frontmatter_yaml(frontmatter)?;
     let palette = ctx.palette;
     let mut fm_col = column::Column::new().spacing(6);
     {
@@ -291,16 +293,29 @@ pub(crate) fn render_frontmatter<'a>(doc: &Doc, ctx: &Ctx<'a>) -> Option<Element
         let open = !ctx.folds.contains(&FRONTMATTER_FOLD);
         let chevron = if open { "▾ " } else { "▸ " };
         fm_col = fm_col.push(
-            button::text(format!("{chevron}Frontmatter"))
-                .on_press(Message::ToggleFold(FRONTMATTER_FOLD)),
+            button::custom(
+                text(format!("{chevron}Frontmatter"))
+                    .font(ctx.font)
+                    .size(ctx.size)
+                    .class(palette.accent),
+            )
+            .on_press(Message::ToggleFold(FRONTMATTER_FOLD)),
         );
         if open {
-            fm_col = fm_col.push(
-                text(frontmatter.trim_end().to_string())
-                    .font(cosmic::font::mono())
-                    .size(12.0)
-                    .class(ctx.palette.muted),
-            );
+            match serde_norway::from_str::<serde_norway::Value>(yaml) {
+                Ok(value) => {
+                    fm_col = fm_col.push(render_yaml_value(&value, 0, ctx));
+                }
+                Err(_) => {
+                    // Invalid YAML: fall back to showing the raw text.
+                    fm_col = fm_col.push(
+                        text(yaml.trim_end().to_string())
+                            .font(cosmic::font::mono())
+                            .size(12.0)
+                            .class(palette.muted),
+                    );
+                }
+            }
         }
     }
     Some(
@@ -308,6 +323,122 @@ pub(crate) fn render_frontmatter<'a>(doc: &Doc, ctx: &Ctx<'a>) -> Option<Element
             .style(move |_| code_block_style(&palette))
             .into(),
     )
+}
+
+/// Extract the YAML content between the `---` delimiters from a raw
+/// frontmatter block like `"---\ntitle: Test\n---\n"`.
+fn frontmatter_yaml(raw: &str) -> Option<&str> {
+    // Skip the opening `---` line.
+    let start = raw.find('\n')? + 1;
+    // Find the closing delimiter (`---` or `...` on its own line).
+    let end = raw.rfind("\n---")?;
+    if end <= start {
+        return None;
+    }
+    Some(&raw[start..end])
+}
+
+/// Render one YAML value with the given indentation depth (in spaces).
+fn render_yaml_value<'a>(
+    value: &serde_norway::Value,
+    indent: u16,
+    ctx: &Ctx<'a>,
+) -> Element<'a, Message> {
+    let pad = " ".repeat(indent as usize);
+    match value {
+        serde_norway::Value::Null => text(format!("{pad}null"))
+            .font(cosmic::font::mono())
+            .size(12.0)
+            .class(ctx.palette.muted)
+            .into(),
+        serde_norway::Value::Bool(b) => text(format!("{pad}{b}"))
+            .font(ctx.font)
+            .size(12.0)
+            .class(ctx.palette.text)
+            .into(),
+        serde_norway::Value::Number(n) => {
+            let s = if let Some(i) = n.as_i64() {
+                i.to_string()
+            } else {
+                n.as_f64().map(|f| f.to_string()).unwrap_or_default()
+            };
+            text(format!("{pad}{s}"))
+                .font(cosmic::font::mono())
+                .size(12.0)
+                .class(ctx.palette.text)
+                .into()
+        }
+        serde_norway::Value::String(s) => {
+            // Quote strings that look like they could be confused with
+            // other YAML types, but keep plain strings unquoted.
+            let displayed = if s.is_empty() || s.starts_with(' ') || s.ends_with(' ') {
+                format!("{:?}", s)
+            } else {
+                s.clone()
+            };
+            text(format!("{pad}{displayed}"))
+                .font(ctx.font)
+                .size(12.0)
+                .class(ctx.palette.text)
+                .into()
+        }
+        serde_norway::Value::Sequence(seq) => {
+            let mut col = column::Column::new().spacing(2);
+            for item in seq.iter() {
+                col = col.push(
+                    row::Row::new()
+                        .spacing(4)
+                        .push(
+                            text("• ")
+                                .font(ctx.font)
+                                .size(12.0)
+                                .class(ctx.palette.muted),
+                        )
+                        .push(render_yaml_value(item, indent + 2, ctx)),
+                );
+            }
+            col.into()
+        }
+        serde_norway::Value::Mapping(map) => {
+            if map.is_empty() {
+                return text(format!("{pad}{{}}"))
+                    .font(cosmic::font::mono())
+                    .size(12.0)
+                    .class(ctx.palette.muted)
+                    .into();
+            }
+            let mut col = column::Column::new().spacing(2);
+            for (key, val) in map.iter() {
+                // Frontmatter keys are almost always strings; fall back to
+                // the Debug representation for anything else.
+                let key_str = match key {
+                    serde_norway::Value::String(s) => s.clone(),
+                    _ => format!("{key:?}"),
+                };
+                let child = render_yaml_value(val, indent + 2, ctx);
+                col = col.push(
+                    row::Row::new()
+                        .spacing(4)
+                        .push(
+                            text(format!("{pad}{key_str}: "))
+                                .font(ctx.font)
+                                .size(12.0)
+                                .class(ctx.palette.accent),
+                        )
+                        .push(child),
+                );
+            }
+            col.into()
+        }
+        serde_norway::Value::Tagged(tagged) => {
+            // Tag implements Display: "!tagname"
+            text(format!("{pad}!{}", tagged.tag))
+                .font(cosmic::font::mono())
+                .size(12.0)
+                .class(ctx.palette.muted)
+                .into()
+        }
+    }
 }
 
 fn render_blocks<'a>(

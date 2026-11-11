@@ -1328,7 +1328,15 @@ fn reading_pane<'a>(
     )
     .width(Length::Fill)
     .height(Length::Fill)
-    .padding(app.reading_margin.padding())
+    // Horizontal margin only: left and right. Vertical padding would
+    // push the document away from the pane's top and bottom edges for
+    // no reading benefit.
+    .padding([
+        0.0,
+        app.reading_margin.padding(),
+        0.0,
+        app.reading_margin.padding(),
+    ])
     .into()
 }
 
@@ -1390,7 +1398,13 @@ fn live_pane<'a>(
     container(pane)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(app.reading_margin.padding())
+        // Horizontal margin only: left and right (see reading_pane).
+        .padding([
+            0.0,
+            app.reading_margin.padding(),
+            0.0,
+            app.reading_margin.padding(),
+        ])
         .into()
 }
 

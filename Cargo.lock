@@ -204,6 +204,7 @@ dependencies = [
  "palette",
  "serde",
  "serde_json",
+ "serde_norway",
  "tempfile",
  "unicode-segmentation",
  "vault-core",
