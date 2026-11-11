@@ -17,6 +17,10 @@ palette = "0.7"
 nucleo = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The same word segmentation cosmic-text uses, so the live editor's
+# word delete finds the same word boundaries the editor's own motion
+# finds. Already in the tree through cosmic-text.
+unicode-segmentation = "1"
 
 # libcosmic (and its vendored iced submodule) come from git so the build does
 # not depend on a local checkout. Pinned libcosmic commit:

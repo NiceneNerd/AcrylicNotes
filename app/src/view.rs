@@ -1440,8 +1440,9 @@ pub(crate) fn editor_key_binding(
 /// Ctrl+Shift+X/H) become `LiveFormat` messages applied to the live
 /// buffer, the four boundary keys — arrows, backspace, delete — are
 /// intercepted so `app.rs` can decide between a plain motion and
-/// crossing into a neighboring region, and typed brackets/quotes route
-/// through the auto-pair table.
+/// crossing into a neighboring region, Ctrl+Backspace / Ctrl+Delete
+/// delete a word like they do in the source editor, and typed
+/// brackets/quotes route through the auto-pair table.
 /// Everything else (typing, Enter, copy/paste, selection) falls back to
 /// the editor's own bindings — including Ctrl combos the formatting map
 /// does not claim, so copy/cut/paste/select-all keep working.
@@ -1502,6 +1503,15 @@ pub(crate) fn live_key_binding(
         }
         Key::Named(Named::Delete) if plain => {
             Some(text_editor::Binding::Custom(Message::LiveDelete))
+        }
+        // Ctrl+Backspace / Ctrl+Delete delete a word, like in the source
+        // editor. Without this the widget's own binding matches the
+        // modified key and drops one character instead.
+        Key::Named(Named::Backspace) if ctrl => {
+            Some(text_editor::Binding::Custom(Message::LiveDeleteWord(false)))
+        }
+        Key::Named(Named::Delete) if ctrl => {
+            Some(text_editor::Binding::Custom(Message::LiveDeleteWord(true)))
         }
         Key::Named(Named::ArrowUp) if plain => Some(text_editor::Binding::Custom(Message::LiveUp)),
         Key::Named(Named::ArrowDown) if plain => {

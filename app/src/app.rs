@@ -16,6 +16,7 @@ use cosmic::iced::widget::image::Handle as ImageHandle;
 use cosmic::iced::widget::text_editor::{self, Action, Content, Cursor, Edit, Motion, Position};
 use cosmic::iced::Color;
 use cosmic::widget::{icon, nav_bar, segmented_button};
+use unicode_segmentation::UnicodeSegmentation;
 
 use vault_core::vault::VaultError;
 use vault_core::{NoteSource, ObsidianSettings, Vault, VaultIndex};
@@ -491,6 +492,9 @@ pub enum Message {
     LiveBackspace,
     /// Delete at a region's end: delete the newline after it.
     LiveDelete,
+    /// Ctrl+Backspace / Ctrl+Delete: delete the word before (or after)
+    /// the caret.
+    LiveDeleteWord(bool),
     /// Commit the open region and let the blocks render again (Escape).
     LiveDismiss,
     /// Apply markdown formatting to the focused region's selection.
@@ -934,6 +938,86 @@ fn word_delete_actions(has_selection: bool, right: bool) -> Vec<Action> {
             Action::Edit(edit),
         ]
     }
+}
+
+/// The byte range of the word before the caret, the way the editor's own
+/// word motion finds it: from the start of the last word before the
+/// caret up to the caret, or — when the caret sits at the start of a
+/// line — the line break.
+///
+/// The live editor needs this at file level: its buffer holds one
+/// region, so the word can live in the neighbouring one.
+fn word_before(text: &str, offset: usize) -> Option<(usize, usize)> {
+    let before = &text[..offset];
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let prefix = &before[line_start..];
+    if !prefix.is_empty() {
+        // The last word that starts before the caret; without one, the
+        // whole prefix goes (the whitespace in front of the caret).
+        let start = prefix
+            .unicode_word_indices()
+            .rev()
+            .map(|(i, _)| i)
+            .find(|&i| i < prefix.len())
+            .unwrap_or(0);
+        return Some((line_start + start, offset));
+    }
+    // The caret is at the start of a line: the motion reaches back to
+    // the end of the line before it.
+    let previous_end = line_start.checked_sub(1)?;
+    Some((previous_end, offset))
+}
+
+/// The byte range of the word after the caret: the word's characters
+/// (with the whitespace in front of them), or — at the end of a line —
+/// the line break.
+fn word_after(text: &str, offset: usize) -> Option<(usize, usize)> {
+    let rest = &text[offset..];
+    let line_end = rest.find('\n').map_or(text.len(), |i| offset + i);
+    let suffix = &text[offset..line_end];
+    if !suffix.is_empty() {
+        // The first word that ends after the caret; without one, the
+        // rest of the line goes.
+        let end = suffix
+            .unicode_word_indices()
+            .map(|(i, word)| i + word.len())
+            .find(|&i| i > 0)
+            .unwrap_or(suffix.len());
+        return Some((offset, offset + end));
+    }
+    // The caret is at the end of a line: the motion steps over the line
+    // break.
+    (line_end < text.len()).then_some((offset, line_end + 1))
+}
+
+/// The byte offset of a caret position (0-based line, byte column) in
+/// the note text.
+fn offset_of(text: &str, line: usize, column: usize) -> usize {
+    let mut offset = 0;
+    for (i, current) in text.split('\n').enumerate() {
+        if i == line {
+            let mut at = offset + column.min(current.len());
+            while at > offset && !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            return at;
+        }
+        offset += current.len() + 1;
+    }
+    text.len()
+}
+
+/// The caret position (0-based line, byte column) of a byte offset in
+/// the note text.
+fn position_of(text: &str, offset: usize) -> (usize, usize) {
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let before = &text[..offset];
+    let line = before.matches('\n').count();
+    let column = offset - before.rfind('\n').map_or(0, |i| i + 1);
+    (line, column)
 }
 
 /// Word count for the status bar: whitespace-separated runs.
@@ -2361,6 +2445,78 @@ impl VaultNotes {
         // The newline is deleted after the caret: its absolute file line
         // and column are unchanged, and the region still starts here.
         self.live_aim(current.start_line - 1 + line, column);
+        Task::none()
+    }
+
+    /// Ctrl+Backspace / Ctrl+Delete in the live editor: delete the word
+    /// before (or after) the caret, the way the source editor does.
+    ///
+    /// Inside a region the editor's own word motion does the work. At a
+    /// region's edge the word can live in the neighbouring region, so
+    /// the motion runs over the whole note text instead.
+    fn live_delete_word(&mut self, right: bool) -> Task<Message> {
+        let Some(tab_idx) = self.active else {
+            return Task::none();
+        };
+        let Some(live_block) = self.live.as_ref().map(|live| live.block) else {
+            return Task::none();
+        };
+        let Some(cursor) = self.live.as_ref().map(|live| live.editor.cursor()) else {
+            return Task::none();
+        };
+        // A selection is deleted as it is.
+        if cursor.selection.is_some() {
+            return self.live_run(word_delete_actions(true, right));
+        }
+        let slices = self.live_slices(tab_idx);
+        let Some(current) = slices.get(live_block).copied() else {
+            return Task::none();
+        };
+        let text = self.tabs[tab_idx].content.text();
+        let source = current.source(&text);
+        let (line, column) = (cursor.position.line, cursor.position.column);
+        // The region's last line and its end: the caret there can only
+        // reach the next region at file level. The column is a byte
+        // offset, so the line's end is measured in bytes too.
+        let lines: Vec<&str> = source.split('\n').collect();
+        let last_line = lines.len() - 1;
+        let last_column = lines[last_line].len();
+        let at_edge = if right {
+            line == last_line && column >= last_column
+        } else {
+            line == 0 && column == 0
+        };
+        if !at_edge {
+            return self.live_run(word_delete_actions(false, right));
+        }
+        // File level: the word motion runs over the whole note, so the
+        // word can come from the neighbouring region.
+        let offset = offset_of(&text, current.start_line - 1 + line, column);
+        let word = if right {
+            word_after(&text, offset)
+        } else {
+            word_before(&text, offset)
+        };
+        let Some((start, end)) = word else {
+            return Task::none();
+        };
+        let mut new_text = String::with_capacity(text.len());
+        new_text.push_str(&text[..start]);
+        new_text.push_str(&text[end..]);
+        let tab = &mut self.tabs[tab_idx];
+        push_undo(tab);
+        let was_dirty = tab.is_dirty();
+        tab.content = Content::with_text(&new_text);
+        tab.refresh_doc();
+        self.last_edit = Some(std::time::Instant::now());
+        if tab.is_dirty() != was_dirty {
+            self.sync_tab_text(tab_idx);
+        }
+        // The caret lands where the deleted word started.
+        let (line, column) = position_of(&new_text, start);
+        self.live_aim(line, column);
+        // A word can carry an unclosed `[[` with it.
+        self.update_wiki_complete();
         Task::none()
     }
 
@@ -3895,6 +4051,7 @@ impl cosmic::Application for VaultNotes {
             Message::LiveDown => self.live_navigate(false),
             Message::LiveBackspace => self.live_backspace(),
             Message::LiveDelete => self.live_delete(),
+            Message::LiveDeleteWord(right) => self.live_delete_word(right),
             Message::LiveDismiss => {
                 self.live = None;
                 Task::none()
@@ -5644,6 +5801,103 @@ mod autopair_tests {
 }
 
 #[cfg(test)]
+mod word_motion_tests {
+    use super::*;
+
+    /// The bytes a word delete would remove, the way the editor's own
+    /// word motion finds them.
+    fn before(text: &str, offset: usize) -> Option<String> {
+        word_before(text, offset).map(|(start, end)| text[start..end].to_string())
+    }
+
+    fn after(text: &str, offset: usize) -> Option<String> {
+        word_after(text, offset).map(|(start, end)| text[start..end].to_string())
+    }
+
+    #[test]
+    fn the_word_before_the_caret_is_the_word_it_starts() {
+        let text = "alpha beta";
+        // The caret in the middle of "beta": the word part before it.
+        assert_eq!(before(text, 8).as_deref(), Some("be"));
+        // The caret before the word's last letter: the part before it.
+        assert_eq!(before(text, 9).as_deref(), Some("bet"));
+        // The caret at the end of the line: the whole word.
+        assert_eq!(before(text, 10).as_deref(), Some("beta"));
+        // The caret at the start of the line: nothing before it.
+        assert_eq!(before(text, 0), None);
+    }
+
+    #[test]
+    fn whitespace_before_the_caret_goes_with_the_word() {
+        // The motion finds the start of the last word before the caret,
+        // so the spaces between it and the caret go too.
+        assert_eq!(before("alpha   beta", 8).as_deref(), Some("alpha   "));
+        // A line with no word at all: only the spaces go.
+        assert_eq!(before("   ", 3).as_deref(), Some("   "));
+    }
+
+    #[test]
+    fn a_caret_at_a_line_start_reaches_the_line_break() {
+        let text = "alpha beta\ngamma";
+        // The caret at the start of the second line: the motion jumps to
+        // the end of the line before it, so the break is what goes.
+        assert_eq!(before(text, 11).as_deref(), Some("\n"));
+        // The very start of the text: there is nothing to delete.
+        assert_eq!(before(text, 0), None);
+    }
+
+    #[test]
+    fn the_word_after_the_caret_is_the_word_it_ends() {
+        let text = "alpha beta";
+        // The caret at the start of the line: the whole word.
+        assert_eq!(after(text, 0).as_deref(), Some("alpha"));
+        // The caret inside the word: the rest of it.
+        assert_eq!(after(text, 2).as_deref(), Some("pha"));
+        // The caret before the word's last letter: that letter.
+        assert_eq!(after(text, 9).as_deref(), Some("a"));
+        // The caret at the end of the text: nothing after it.
+        assert_eq!(after(text, 10), None);
+    }
+
+    #[test]
+    fn a_caret_at_a_line_end_reaches_the_line_break() {
+        let text = "alpha beta\ngamma";
+        // The caret at the end of the first line: the motion steps over
+        // the break.
+        assert_eq!(after(text, 10).as_deref(), Some("\n"));
+        // The end of the text: nothing follows.
+        assert_eq!(after(text, text.len()), None);
+    }
+
+    #[test]
+    fn offsets_and_positions_round_trip() {
+        let text = "alpha beta\ngamma\n";
+        assert_eq!(offset_of(text, 0, 6), 6);
+        assert_eq!(offset_of(text, 1, 0), 11);
+        assert_eq!(offset_of(text, 1, 3), 14);
+        // A column past the line's end is clamped to it.
+        assert_eq!(offset_of(text, 0, 99), 10);
+        // A line past the text's end is clamped to the text's end.
+        assert_eq!(offset_of(text, 9, 0), text.len());
+        assert_eq!(position_of(text, 6), (0, 6));
+        assert_eq!(position_of(text, 11), (1, 0));
+        assert_eq!(position_of(text, 14), (1, 3));
+        assert_eq!(position_of(text, text.len()), (2, 0));
+    }
+
+    #[test]
+    fn multi_byte_text_keeps_the_columns_on_character_boundaries() {
+        let text = "äöü x";
+        // The caret cannot sit inside a character: the offset snaps back
+        // to the character's start.
+        assert_eq!(offset_of(text, 0, 1), 0);
+        assert_eq!(offset_of(text, 0, 2), 2);
+        assert_eq!(offset_of(text, 0, 5), 4);
+        assert_eq!(position_of(text, 5), (0, 4));
+    }
+}
+
+#[cfg(test)]
 mod find_tests {
     use super::*;
 
@@ -7379,6 +7633,61 @@ mod live_tests {
     }
 
     #[test]
+    fn live_ctrl_backspace_deletes_the_word_before_the_caret() {
+        let mut app = find_tests::test_app_with_tab("alpha beta\n\ngamma");
+        app.live_focus(0);
+        // The caret at the end of "alpha beta".
+        aim(&mut app, 0, 10);
+        app.update(Message::LiveDeleteWord(false));
+        // The word goes, the rest of the line stays.
+        assert_eq!(app.tabs[0].content.text(), "alpha \n\ngamma");
+        // The caret lands where the word began.
+        assert_eq!(caret(&app), (0, 6));
+    }
+
+    #[test]
+    fn live_ctrl_backspace_at_a_region_start_reaches_the_line_before() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta\n\ngamma");
+        app.live_focus(1);
+        // The caret at the region's start: the word before it lives in the
+        // region above, so the motion runs over the whole note.
+        aim(&mut app, 0, 0);
+        app.update(Message::LiveDeleteWord(false));
+        // The line break before the region goes, exactly like a plain
+        // backspace there: the blank line above "beta" is gone and the
+        // two paragraphs become one.
+        assert_eq!(app.tabs[0].content.text(), "alpha\nbeta\n\ngamma");
+        assert_eq!(app.live.as_ref().unwrap().editor.text(), "alpha\nbeta\n");
+        // The caret stays where "beta" began.
+        assert_eq!(caret(&app), (1, 0));
+    }
+
+    #[test]
+    fn live_ctrl_delete_deletes_the_word_after_the_caret() {
+        let mut app = find_tests::test_app_with_tab("alpha beta\n\ngamma");
+        app.live_focus(0);
+        // The caret right after "alpha".
+        aim(&mut app, 0, 5);
+        app.update(Message::LiveDeleteWord(true));
+        // The word and the space before it go.
+        assert_eq!(app.tabs[0].content.text(), "alpha\n\ngamma");
+        assert_eq!(caret(&app), (0, 5));
+    }
+
+    #[test]
+    fn live_ctrl_delete_at_a_region_end_reaches_the_next_region() {
+        let mut app = find_tests::test_app_with_tab("alpha beta\n\ngamma");
+        app.live_focus(0);
+        // The caret at the very end of the region's buffer: what follows
+        // lives in the next region.
+        aim(&mut app, 1, 0);
+        app.update(Message::LiveDeleteWord(true));
+        // The line break after the region goes: the blank line between
+        // the two blocks is gone.
+        assert_eq!(app.tabs[0].content.text(), "alpha beta\ngamma");
+    }
+
+    #[test]
     fn live_backspace_inside_a_region_is_a_plain_backspace() {
         let mut app = find_tests::test_app_with_tab("alpha\n\nbeta");
         app.live_focus(1);
@@ -7522,6 +7831,16 @@ mod live_tests {
         assert!(matches!(
             crate::view::live_key_binding(press(Key::Named(Named::Delete), plain), false),
             Some(text_editor::Binding::Custom(Message::LiveDelete))
+        ));
+        // Ctrl+Backspace / Ctrl+Delete delete a word, not one character.
+        let ctrl = Modifiers::CTRL;
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Named(Named::Backspace), ctrl), false),
+            Some(text_editor::Binding::Custom(Message::LiveDeleteWord(false)))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Named(Named::Delete), ctrl), false),
+            Some(text_editor::Binding::Custom(Message::LiveDeleteWord(true)))
         ));
         // Escape commits the region instead of unfocusing.
         assert!(matches!(

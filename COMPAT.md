@@ -727,7 +727,8 @@ All chord changes below supersede the M4c follow-up section above.
 
 ## Wikilinks, footnotes and the file tree (follow-up rounds)
 
-Nine small rounds, each one a commit of its own (A–C).
+Nine small rounds, each one a commit of its own (A–C), then a fix from
+the user's first look at them (D).
 
 ### Phase A — wikilinks read like links
 
@@ -819,3 +820,14 @@ Nine small rounds, each one a commit of its own (A–C).
   source editor in the source and split panes, the focused block's
   editor in the live pane. The reading pane shows no editor, so nothing
   is selected there.
+
+### Phase D — the live editor's word delete
+
+- **The live editor deletes a word** (D2): Ctrl+Backspace in the live
+  preview dropped a single character — the widget's own binding matches
+  the modified key and ignores the modifier. It now deletes a word,
+  exactly like the source editor: inside a block the editor's own word
+  motion does the work, and at a block's edge — where the word can live
+  in the neighbouring block — the motion runs over the whole note
+  (`word_before` / `word_after`, mirroring cosmic-text's own word
+  motion). Ctrl+Delete deletes the word after the caret the same way.
