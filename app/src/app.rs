@@ -34,43 +34,22 @@ pub use crate::settings::PaneMode;
 /// persists) and re-exported here.
 pub use crate::settings::LinkPathFormat;
 
-/// How the file tree orders its notes. Defined in settings (it persists)
+/// How the file tree orders its notes. Defined in `vault-app` (it persists)
 /// and re-exported here.
 pub use crate::settings::TreeSort;
 
-/// Which panel the sidebar shows (M4b).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SidePanel {
-    #[default]
-    Files,
-    Search,
-    Tags,
-    Links,
-    Outline,
+/// Which panel the sidebar shows. The shared enum lives in `vault-app`;
+/// this alias keeps the app's historical name at every call site.
+pub use vault_app::navigation::NavSection as SidePanel;
+
+/// XDG icon names for the nav bar (verified present in the Cosmic/Pop icon
+/// themes). Native presentation detail — shared types carry no icon names.
+pub trait SidePanelIcon {
+    fn icon(self) -> &'static str;
 }
 
-impl SidePanel {
-    pub const ALL: [SidePanel; 5] = [
-        SidePanel::Files,
-        SidePanel::Search,
-        SidePanel::Tags,
-        SidePanel::Links,
-        SidePanel::Outline,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            SidePanel::Files => "Files",
-            SidePanel::Search => "Search",
-            SidePanel::Tags => "Tags",
-            SidePanel::Links => "Links",
-            SidePanel::Outline => "Outline",
-        }
-    }
-
-    /// XDG icon name for the nav bar (verified present in the Cosmic/Pop
-    /// icon themes).
-    pub fn icon(self) -> &'static str {
+impl SidePanelIcon for SidePanel {
+    fn icon(self) -> &'static str {
         match self {
             SidePanel::Files => "folder-symbolic",
             SidePanel::Search => "edit-find-symbolic",
@@ -7627,9 +7606,9 @@ mod editor_font_tests {
         // The ends are held, so a runaway shortcut cannot make the text
         // vanish.
         let _ = app.update(Message::SettingsEditorFontSize(1000));
-        assert_eq!(app.editor_font_size, crate::settings::MAX_FONT_SIZE);
+        assert_eq!(app.editor_font_size, vault_app::settings::MAX_FONT_SIZE);
         let _ = app.update(Message::SettingsReadingFontSize(-1000));
-        assert_eq!(app.reading_font_size, crate::settings::MIN_FONT_SIZE);
+        assert_eq!(app.reading_font_size, vault_app::settings::MIN_FONT_SIZE);
 
         persist_setting(move |s| {
             s.editor_font_size = editor;

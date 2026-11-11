@@ -224,6 +224,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "unicode-segmentation",
+ "vault-app",
  "vault-core",
  "vault-glass",
  "vault-md",

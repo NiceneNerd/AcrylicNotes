@@ -10,3 +10,6 @@
 //! message enum.
 
 pub mod ids;
+pub mod navigation;
+pub mod persistence;
+pub mod settings;
