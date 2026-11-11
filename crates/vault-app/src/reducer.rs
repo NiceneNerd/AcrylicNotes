@@ -45,6 +45,18 @@ impl App {
                 self.state.panel = section;
                 Vec::new()
             }
+            UiCommand::SetSearchQuery { query } => {
+                self.state.search.set_query(query);
+                Vec::new()
+            }
+            UiCommand::SearchVault { query } => {
+                self.state.search.set_query(query.clone());
+                let request = self.state.search.begin_request();
+                // The search completion is keyed by the request id inside
+                // the effect; the session itself rejects stale requests.
+                let id = self.effect_ids.allocate();
+                vec![Effect::new(id, EffectKind::SearchVault { request, query })]
+            }
             UiCommand::OpenNote { path } => {
                 self.state.tabs.open_or_focus(&path);
                 Vec::new()
@@ -93,6 +105,13 @@ impl App {
     /// Consume an executed effect's result. Events for unknown (stale or
     /// already-completed) effect ids are ignored.
     pub fn handle(&mut self, event: AppEvent) {
+        // Search completions are keyed by the session's request id: the
+        // session itself drops stale requests, so there is nothing for
+        // the in-flight table to check here.
+        if let AppEvent::SearchCompleted { request, hits } = event {
+            let _applied = self.state.search.complete(request, hits);
+            return;
+        }
         let (effect_id, tab) = match &event {
             AppEvent::SaveCompleted { effect }
             | AppEvent::SaveFailed { effect, .. }
@@ -100,6 +119,8 @@ impl App {
                 Some(&tab) => (*effect, tab),
                 None => return, // stale or duplicate completion
             },
+            // Handled above.
+            AppEvent::SearchCompleted { .. } => return,
         };
         match event {
             AppEvent::SaveCompleted { .. } => {
@@ -119,6 +140,8 @@ impl App {
                 // frontend applies the returned text to its payload).
                 self.state.conflicts.retain(|&candidate| candidate != tab);
             }
+            // Handled above.
+            AppEvent::SearchCompleted { .. } => {}
         }
         self.in_flight.remove(&effect_id);
     }
@@ -317,5 +340,65 @@ mod tests {
             text: "fresh".into(),
         });
         assert!(!app.is_in_flight(effects[0].id));
+    }
+
+    #[test]
+    fn search_commands_update_the_query_and_run_tracked_requests() {
+        use crate::effects::EffectKind as Kind;
+        let mut app = App::new();
+        // Typing only records the query.
+        assert_eq!(
+            app.dispatch(UiCommand::SetSearchQuery {
+                query: "needle".into()
+            }),
+            vec![]
+        );
+        assert_eq!(app.state.search.query(), "needle");
+        assert!(app.state.search.hits().is_empty());
+
+        // Submitting begins a request and emits one search effect.
+        let effects = app.dispatch(UiCommand::SearchVault {
+            query: "needle".into(),
+        });
+        assert_eq!(effects.len(), 1);
+        let request = match &effects[0].kind {
+            Kind::SearchVault { request, query } => {
+                assert_eq!(query, "needle");
+                *request
+            }
+            other => panic!("unexpected effect: {other:?}"),
+        };
+        assert!(app.state.search.is_current(request));
+
+        // The completion replaces the hits.
+        let hits = vec![crate::search::SearchHitView {
+            path: "a.md".into(),
+            line_no: 2,
+            line: "needle here".into(),
+        }];
+        app.handle(AppEvent::SearchCompleted {
+            request,
+            hits: hits.clone(),
+        });
+        assert_eq!(app.state.search.hits(), hits.as_slice());
+
+        // A newer request makes the first completion stale.
+        let effects = app.dispatch(UiCommand::SearchVault {
+            query: "needle".into(),
+        });
+        let newer = match &effects[0].kind {
+            Kind::SearchVault { request, .. } => *request,
+            other => panic!("unexpected effect: {other:?}"),
+        };
+        app.handle(AppEvent::SearchCompleted {
+            request,
+            hits: vec![],
+        });
+        assert_eq!(app.state.search.hits().len(), 1, "stale completion dropped");
+        app.handle(AppEvent::SearchCompleted {
+            request: newer,
+            hits: vec![],
+        });
+        assert!(app.state.search.hits().is_empty());
     }
 }

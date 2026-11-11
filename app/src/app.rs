@@ -19,10 +19,21 @@ use cosmic::widget::{icon, nav_bar, segmented_button};
 use unicode_segmentation::UnicodeSegmentation;
 
 use vault_app::commands::UiCommand;
+use vault_app::ids::SearchRequestId;
 use vault_app::ids::TabId;
+use vault_app::search::SearchHitView;
 use vault_core::vault::VaultError;
 use vault_core::{NoteSource, ObsidianSettings, Vault, VaultIndex};
 use vault_md::{parse_note, Doc};
+
+/// A vault-core search hit as the shared session stores it.
+fn hit_view(hit: vault_core::search::SearchHit) -> SearchHitView {
+    SearchHitView {
+        path: hit.path,
+        line_no: hit.line_no,
+        line: hit.line,
+    }
+}
 
 use crate::live;
 use crate::settings;
@@ -485,7 +496,7 @@ pub enum Message {
     SidePanel(SidePanel),
     SearchInput(String),
     SearchSubmitted,
-    SearchDone(Vec<vault_core::search::SearchHit>),
+    SearchDone(Vec<SearchHitView>, SearchRequestId),
     /// Open search hit `i` and scroll its reading view to the match.
     SearchOpen(usize),
     TagSelected(String),
@@ -567,8 +578,6 @@ pub struct VaultNotes {
     /// Shared application state + reducer (restructure commit 05). The
     /// sidebar section, and later slices, are owned by the kernel.
     pub shared: vault_app::App,
-    pub search_query: String,
-    pub search_hits: Vec<vault_core::search::SearchHit>,
     pub selected_tag: Option<String>,
     pub switcher: Switcher,
     // --- M4c ---
@@ -1804,6 +1813,7 @@ impl VaultNotes {
                     .unwrap_or_else(|| path.display().to_string());
                 self.tabs.clear();
                 self.tab_ids.clear();
+                self.shared.state.search.clear();
                 self.banner = None;
                 self.error = None;
                 self.vault = Some(vault);
@@ -3837,8 +3847,6 @@ impl cosmic::Application for VaultNotes {
             strict_breaks: false,
             images: RefCell::new(std::collections::HashMap::new()),
             shared: vault_app::App::new(),
-            search_query: String::new(),
-            search_hits: Vec::new(),
             selected_tag: None,
             switcher: Switcher::default(),
             last_edit: None,
@@ -4707,7 +4715,8 @@ impl cosmic::Application for VaultNotes {
                 Task::none()
             }
             Message::SearchInput(query) => {
-                self.search_query = query;
+                // Recorded in the shared search session.
+                let _ = self.shared.dispatch(UiCommand::SetSearchQuery { query });
                 Task::none()
             }
             Message::SearchSubmitted => {
@@ -4715,7 +4724,19 @@ impl cosmic::Application for VaultNotes {
                     return Task::none();
                 };
                 let root = vault.root().to_path_buf();
-                let query = self.search_query.clone();
+                let query = self.shared.state.search.query().to_string();
+                // The shared reducer opens a tracked request; its id rides
+                // along so stale completions can be rejected (plan §5.3).
+                let effects = self.shared.dispatch(UiCommand::SearchVault {
+                    query: query.clone(),
+                });
+                let Some(vault_app::effects::Effect {
+                    kind: vault_app::effects::EffectKind::SearchVault { request, .. },
+                    ..
+                }) = effects.first().cloned()
+                else {
+                    return Task::none();
+                };
                 // Off the UI thread (tokio worker): keeps typing responsive
                 // on large vaults. Sync file IO inside is fine at vault scale.
                 Task::perform(
@@ -4723,19 +4744,25 @@ impl cosmic::Application for VaultNotes {
                         vault_core::search::search(&root, &query, SEARCH_MAX_HITS)
                             .unwrap_or_default()
                     },
-                    |hits| cosmic::Action::App(Message::SearchDone(hits)),
+                    move |hits| {
+                        cosmic::Action::App(Message::SearchDone(
+                            hits.into_iter().map(hit_view).collect(),
+                            request,
+                        ))
+                    },
                 )
             }
-            Message::SearchDone(hits) => {
-                self.search_hits = hits;
+            Message::SearchDone(hits, request) => {
+                self.shared
+                    .handle(vault_app::effects::AppEvent::SearchCompleted { request, hits });
                 Task::none()
             }
             Message::SearchOpen(i) => {
-                let Some(hit) = self.search_hits.get(i) else {
+                let Some(hit) = self.shared.state.search.hits().get(i) else {
                     return Task::none();
                 };
                 let path = hit.path.clone();
-                let query = self.search_query.clone();
+                let query = self.shared.state.search.query().to_string();
                 let open_task = self.open_tab(path);
                 if self.pane() == PaneMode::Source {
                     self.set_pane(PaneMode::Split);
@@ -6311,8 +6338,6 @@ mod find_tests {
             strict_breaks: false,
             images: RefCell::new(std::collections::HashMap::new()),
             shared: vault_app::App::new(),
-            search_query: String::new(),
-            search_hits: Vec::new(),
             selected_tag: None,
             switcher: Switcher::default(),
             last_edit: None,

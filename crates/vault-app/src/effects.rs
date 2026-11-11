@@ -26,6 +26,14 @@ pub enum EffectKind {
     /// the tab still exists).
     #[serde(rename = "reload-tab")]
     ReloadTab { tab: TabId },
+    /// Execute the vault-wide search for `query`, reporting the hit list
+    /// with `AppEvent::SearchCompleted` keyed by `request`. Stale
+    /// requests are rejected by the shared session, not the runner.
+    #[serde(rename = "search-vault")]
+    SearchVault {
+        request: crate::ids::SearchRequestId,
+        query: String,
+    },
 }
 
 /// One requested side effect, identified so late completions are checkable.
@@ -54,4 +62,11 @@ pub enum AppEvent {
     /// The reload for `effect` read the note's current disk text.
     #[serde(rename = "reload-completed")]
     ReloadCompleted { effect: EffectId, text: String },
+    /// A vault-wide search finished. Keyed by the search request (not an
+    /// effect id): the session drops results from older requests.
+    #[serde(rename = "search-completed")]
+    SearchCompleted {
+        request: crate::ids::SearchRequestId,
+        hits: Vec<crate::search::SearchHitView>,
+    },
 }

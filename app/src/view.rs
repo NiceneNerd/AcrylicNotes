@@ -716,19 +716,21 @@ fn search_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Messag
         .padding(8)
         .width(Length::Fill);
     col = col.push(
-        text_input("Search notes…", &app.search_query)
+        text_input("Search notes…", app.shared.state.search.query())
             .on_input(Message::SearchInput)
             .on_submit(|_| Message::SearchSubmitted)
             .width(Length::Fill),
     );
     col = col.push(button::suggested("Search").on_press(Message::SearchSubmitted));
-    if app.search_hits.is_empty() {
-        if !app.search_query.trim().is_empty() {
+    if app.shared.state.search.hits().is_empty() {
+        if !app.shared.state.search.query().trim().is_empty() {
             col = col.push(text("No matches.").class(palette.muted));
         }
     } else {
-        col = col.push(text(format!("{} matches", app.search_hits.len())).class(palette.muted));
-        for (i, hit) in app.search_hits.iter().enumerate() {
+        col = col.push(
+            text(format!("{} matches", app.shared.state.search.hits().len())).class(palette.muted),
+        );
+        for (i, hit) in app.shared.state.search.hits().iter().enumerate() {
             col = col.push(
                 button::text(title_of(&hit.path))
                     .on_press(Message::SearchOpen(i))

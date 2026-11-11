@@ -44,4 +44,11 @@ pub enum UiCommand {
         tab: TabId,
         decision: ConflictDecision,
     },
+    /// Record the vault-wide search query being typed.
+    #[serde(rename = "set-search-query")]
+    SetSearchQuery { query: String },
+    /// Run the vault-wide search for a query (the runner executes the
+    /// scan and reports `AppEvent::SearchCompleted`).
+    #[serde(rename = "search-vault")]
+    SearchVault { query: String },
 }

@@ -7,6 +7,7 @@
 
 use crate::ids::TabId;
 use crate::navigation::NavSection;
+use crate::search::SearchSession;
 use crate::settings::PaneMode;
 use crate::tabs::Tabs;
 
@@ -21,6 +22,8 @@ pub struct AppState {
     pub sidebar_open: bool,
     /// Which sidebar panel is active.
     pub panel: NavSection,
+    /// The vault-wide search session (query, hits, current request).
+    pub search: SearchSession,
     /// Tabs whose note changed on disk while they had unsaved edits
     /// (conflict banner instances).
     pub conflicts: Vec<TabId>,
@@ -35,6 +38,7 @@ impl Default for AppState {
             pane: PaneMode::default(),
             sidebar_open: true,
             panel: NavSection::default(),
+            search: SearchSession::default(),
             conflicts: Vec::new(),
             last_error: None,
         }

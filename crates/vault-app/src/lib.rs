@@ -16,6 +16,7 @@ pub mod ids;
 pub mod navigation;
 pub mod persistence;
 pub mod reducer;
+pub mod search;
 pub mod settings;
 pub mod tabs;
 
