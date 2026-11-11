@@ -1428,8 +1428,7 @@ mod tests {
             "{author: Caleb, year: 2024}"
         );
         // serde-saphyr doesn't expose YAML tags as a distinct type in the
-        // data model; they're handled at the deserialization level. This
-        // test was specific to serde_norway's Tagged representation.
+        // data model; they're handled at the deserialization level.
     }
 
     #[test]
