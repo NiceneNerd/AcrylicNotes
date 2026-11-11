@@ -4,9 +4,9 @@
 //! for metadata (tags, aliases, cssclasses); the original is never
 //! re-serialized on save.
 
-use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_norway::{Mapping, Value};
+use serde_json::Value;
+use serde_saphyr::from_str;
 use thiserror::Error;
 
 /// Result of splitting a Markdown document into frontmatter and body.
@@ -129,7 +129,8 @@ fn next_line_start(bytes: &[u8], mut pos: usize) -> usize {
 ///
 /// Returns `None` if the YAML is invalid or not a mapping.
 pub fn parse_frontmatter_meta(content: &str) -> Result<FrontmatterMeta, FrontmatterError> {
-    let mapping: Mapping = serde_norway::from_str(content)?;
+    let value: Value = from_str(content)?;
+    let mapping = value.as_object().ok_or(FrontmatterError::NotMapping)?;
     let mut meta = FrontmatterMeta {
         title: mapping
             .get("title")
@@ -181,31 +182,41 @@ where
     deserialize_string_or_vec(deserializer)
 }
 
-fn deserialize_tags_value(val: &Value) -> Result<Vec<String>, serde_norway::Error> {
+fn deserialize_tags_value(val: &Value) -> Result<Vec<String>, FrontmatterError> {
     match val {
-        Value::Sequence(seq) => seq
-            .iter()
-            .map(|v| {
-                v.as_str()
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| DeError::custom("tag must be string"))
-            })
-            .collect(),
+        Value::Array(seq) => {
+            let mut tags = Vec::with_capacity(seq.len());
+            for v in seq {
+                if let Some(s) = v.as_str() {
+                    tags.push(s.to_string());
+                } else {
+                    return Err(FrontmatterError::ValueError(
+                        "tag must be string".to_string(),
+                    ));
+                }
+            }
+            Ok(tags)
+        }
         Value::String(s) => Ok(vec![s.clone()]),
         _ => Ok(Vec::new()),
     }
 }
 
-fn deserialize_string_or_vec_value(val: &Value) -> Result<Vec<String>, serde_norway::Error> {
+fn deserialize_string_or_vec_value(val: &Value) -> Result<Vec<String>, FrontmatterError> {
     match val {
-        Value::Sequence(seq) => seq
-            .iter()
-            .map(|v| {
-                v.as_str()
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| DeError::custom("value must be string"))
-            })
-            .collect(),
+        Value::Array(seq) => {
+            let mut items = Vec::with_capacity(seq.len());
+            for v in seq {
+                if let Some(s) = v.as_str() {
+                    items.push(s.to_string());
+                } else {
+                    return Err(FrontmatterError::ValueError(
+                        "value must be string".to_string(),
+                    ));
+                }
+            }
+            Ok(items)
+        }
         Value::String(s) => Ok(vec![s.clone()]),
         _ => Ok(Vec::new()),
     }
@@ -215,9 +226,11 @@ fn deserialize_string_or_vec_value(val: &Value) -> Result<Vec<String>, serde_nor
 #[derive(Debug, Error)]
 pub enum FrontmatterError {
     #[error("YAML parse error: {0}")]
-    Yaml(#[from] serde_norway::Error),
+    Yaml(#[from] serde_saphyr::Error),
     #[error("Frontmatter is not a YAML mapping")]
     NotMapping,
+    #[error("Frontmatter value error: {0}")]
+    ValueError(String),
 }
 
 #[cfg(test)]
