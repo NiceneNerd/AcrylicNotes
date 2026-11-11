@@ -338,20 +338,24 @@ fn frontmatter_yaml(raw: &str) -> Option<&str> {
     Some(&raw[start..end])
 }
 
-/// Render one YAML value with the given indentation depth (in spaces).
+/// Render one YAML value at the given nesting depth.
+///
+/// Indentation is done through layout (container padding), not through
+/// space-prefixed text — proportional fonts make space-based indentation
+/// misalign, so padding on the wrapping container keeps everything lined
+/// up regardless of the font.
 fn render_yaml_value<'a>(
     value: &serde_norway::Value,
-    indent: u16,
+    depth: u16,
     ctx: &Ctx<'a>,
 ) -> Element<'a, Message> {
-    let pad = " ".repeat(indent as usize);
     match value {
-        serde_norway::Value::Null => text(format!("{pad}null"))
+        serde_norway::Value::Null => text("null")
             .font(cosmic::font::mono())
             .size(12.0)
             .class(ctx.palette.muted)
             .into(),
-        serde_norway::Value::Bool(b) => text(format!("{pad}{b}"))
+        serde_norway::Value::Bool(b) => text(format!("{b}"))
             .font(ctx.font)
             .size(12.0)
             .class(ctx.palette.text)
@@ -362,7 +366,7 @@ fn render_yaml_value<'a>(
             } else {
                 n.as_f64().map(|f| f.to_string()).unwrap_or_default()
             };
-            text(format!("{pad}{s}"))
+            text(s)
                 .font(cosmic::font::mono())
                 .size(12.0)
                 .class(ctx.palette.text)
@@ -376,32 +380,42 @@ fn render_yaml_value<'a>(
             } else {
                 s.clone()
             };
-            text(format!("{pad}{displayed}"))
+            text(displayed)
                 .font(ctx.font)
                 .size(12.0)
                 .class(ctx.palette.text)
                 .into()
         }
         serde_norway::Value::Sequence(seq) => {
+            if seq.is_empty() {
+                return text("[]")
+                    .font(cosmic::font::mono())
+                    .size(12.0)
+                    .class(ctx.palette.muted)
+                    .into();
+            }
             let mut col = column::Column::new().spacing(2);
             for item in seq.iter() {
                 col = col.push(
-                    row::Row::new()
-                        .spacing(4)
-                        .push(
-                            text("• ")
-                                .font(ctx.font)
-                                .size(12.0)
-                                .class(ctx.palette.muted),
-                        )
-                        .push(render_yaml_value(item, indent + 2, ctx)),
+                    container(
+                        row::Row::new()
+                            .spacing(4)
+                            .push(
+                                text("• ")
+                                    .font(ctx.font)
+                                    .size(12.0)
+                                    .class(ctx.palette.muted),
+                            )
+                            .push(render_yaml_value(item, depth + 1, ctx)),
+                    )
+                    .padding([0.0, 0.0, 0.0, depth as f32 * INDENT_WIDTH]),
                 );
             }
             col.into()
         }
         serde_norway::Value::Mapping(map) => {
             if map.is_empty() {
-                return text(format!("{pad}{{}}"))
+                return text("{}")
                     .font(cosmic::font::mono())
                     .size(12.0)
                     .class(ctx.palette.muted)
@@ -415,24 +429,27 @@ fn render_yaml_value<'a>(
                     serde_norway::Value::String(s) => s.clone(),
                     _ => format!("{key:?}"),
                 };
-                let child = render_yaml_value(val, indent + 2, ctx);
+                let child = render_yaml_value(val, depth + 1, ctx);
                 col = col.push(
-                    row::Row::new()
-                        .spacing(4)
-                        .push(
-                            text(format!("{pad}{key_str}: "))
-                                .font(ctx.font)
-                                .size(12.0)
-                                .class(ctx.palette.accent),
-                        )
-                        .push(child),
+                    container(
+                        row::Row::new()
+                            .spacing(4)
+                            .push(
+                                text(format!("{key_str}: "))
+                                    .font(ctx.font)
+                                    .size(12.0)
+                                    .class(ctx.palette.accent),
+                            )
+                            .push(child),
+                    )
+                    .padding([0.0, 0.0, 0.0, depth as f32 * INDENT_WIDTH]),
                 );
             }
             col.into()
         }
         serde_norway::Value::Tagged(tagged) => {
             // Tag implements Display: "!tagname"
-            text(format!("{pad}!{}", tagged.tag))
+            text(format!("!{}", tagged.tag))
                 .font(cosmic::font::mono())
                 .size(12.0)
                 .class(ctx.palette.muted)
@@ -440,6 +457,10 @@ fn render_yaml_value<'a>(
         }
     }
 }
+
+/// Horizontal indentation width per nesting level for structured
+/// frontmatter rendering.
+const INDENT_WIDTH: f32 = 20.0;
 
 fn render_blocks<'a>(
     blocks: &[Block],
