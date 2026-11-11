@@ -1,0 +1,11 @@
+[package]
+name = "vault-app"
+version = "0.1.0"
+edition = "2021"
+description = "GUI-free application kernel: shared state, commands, effects, and view models"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0"

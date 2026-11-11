@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/vault-app",
     "vault-glass",
     "vault-core",
     "vault-md",
@@ -11,6 +12,7 @@ members = [
 # app/Cargo.toml), so the default commands build/test the UI-free layers
 # only. Use `--workspace` explicitly where the network/git deps are available.
 default-members = [
+    "crates/vault-app",
     "vault-glass",
     "vault-core",
     "vault-md",
