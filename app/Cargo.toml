@@ -17,9 +17,10 @@ palette = "0.7"
 nucleo = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# YAML frontmatter parsing (same version vault-core uses) — for rendering
-# frontmatter structurally in the reading view.
-serde_norway = "0.9"
+# YAML frontmatter parsing — serde-saphyr deserializes into
+# serde_json::Value (already in deps) for structural rendering in the
+# reading view.
+serde-saphyr = "2"
 # The same word segmentation cosmic-text uses, so the live editor's
 # word delete finds the same word boundaries the editor's own motion
 # finds. Already in the tree through cosmic-text.
