@@ -554,7 +554,6 @@ pub struct VaultNotes {
     /// Shared tab-bar state: ids, order, active tab (restructure commit 04).
     /// The `tabs` payload vector stays aligned with `tab_ids.order()`.
     pub tab_ids: vault_app::tabs::Tabs,
-    pub pane: PaneMode,
     /// Paths of open tabs that changed on disk while dirty.
     pub banner: Option<Banner>,
     /// Links invalidated by the last rename/move, awaiting the user's
@@ -615,9 +614,6 @@ pub struct VaultNotes {
     /// The split layout was folded away by a narrow window; restore it
     /// once the window grows again.
     restore_split: bool,
-    /// Whether the sidebar (file tree and other panels) is shown;
-    /// toggled from the titlebar button.
-    pub sidebar_open: bool,
     // --- tree drag-and-drop (drag.rs) ---
     /// An armed or active tree drag: press position, source row, hover
     /// target. `None` when no left-press is pending a possible drag.
@@ -1848,7 +1844,7 @@ impl VaultNotes {
     /// editor read it from there. The reading pane shows no editor, so
     /// nothing is selected there. An empty selection counts as none.
     pub fn selection_text(&self) -> Option<String> {
-        let selection = match self.pane {
+        let selection = match self.pane() {
             PaneMode::Live => self.live.as_ref().and_then(|live| live.editor.selection()),
             PaneMode::Source | PaneMode::Split => {
                 self.active_tab().and_then(|tab| tab.content.selection())
@@ -1917,6 +1913,21 @@ impl VaultNotes {
     /// frontend reads it as a view model.
     pub fn panel(&self) -> SidePanel {
         self.shared.state.panel
+    }
+
+    /// The pane layout currently rendered. The shared kernel owns it.
+    pub fn pane(&self) -> PaneMode {
+        self.shared.state.pane
+    }
+
+    /// Whether the sidebar is shown. The shared kernel owns it.
+    pub fn sidebar_open(&self) -> bool {
+        self.shared.state.sidebar_open
+    }
+
+    /// Show or hide the sidebar through the shared reducer.
+    pub(crate) fn set_sidebar_open(&mut self, open: bool) {
+        let _ = self.shared.dispatch(UiCommand::SetSidebarVisible(open));
     }
 
     /// Switch the sidebar panel through the shared reducer.
@@ -2081,7 +2092,8 @@ impl VaultNotes {
     /// Switch the rendered pane mode, keeping the pane buttons in step:
     /// the highlighted button must always name the pane on screen.
     fn set_pane(&mut self, mode: PaneMode) {
-        self.pane = mode;
+        // The shared kernel owns the pane state (restructure commit 05).
+        let _ = self.shared.dispatch(UiCommand::SetPaneMode(mode));
         let target = self
             .pane_model
             .iter()
@@ -2115,7 +2127,7 @@ impl VaultNotes {
     /// while it is being read. The split pane shows both, so it follows
     /// the last one touched (`zoom_target`).
     fn zoom_target(&self) -> ZoomTarget {
-        match self.pane {
+        match self.pane() {
             PaneMode::Reading => ZoomTarget::Reading,
             PaneMode::Source => ZoomTarget::Source,
             // In the live pane the focused block is a source editor; the
@@ -2150,10 +2162,10 @@ impl VaultNotes {
     /// unless the user picked another pane in the meantime.
     fn apply_window_width(&mut self, width: f32) {
         let narrow = width < NARROW_WINDOW_WIDTH;
-        if narrow && self.pane == PaneMode::Split {
+        if narrow && self.pane() == PaneMode::Split {
             self.restore_split = true;
             self.set_pane(PaneMode::Source);
-        } else if !narrow && self.restore_split && self.pane == PaneMode::Source {
+        } else if !narrow && self.restore_split && self.pane() == PaneMode::Source {
             self.restore_split = false;
             self.set_pane(PaneMode::Split);
         }
@@ -2163,7 +2175,7 @@ impl VaultNotes {
     /// switching out of source-only mode so the jump is visible.
     fn jump_to_block(&mut self, idx: usize) -> Task<Message> {
         // Live preview focuses the block instead of scrolling a pane.
-        if self.pane == PaneMode::Live {
+        if self.pane() == PaneMode::Live {
             let Some(tab_idx) = self.active_idx() else {
                 return Task::none();
             };
@@ -2175,7 +2187,7 @@ impl VaultNotes {
                 return self.live_focus(region);
             }
         }
-        if self.pane == PaneMode::Source {
+        if self.pane() == PaneMode::Source {
             self.set_pane(PaneMode::Split);
         }
         // No frame deferral needed even when the pane just switched: the
@@ -2220,7 +2232,7 @@ impl VaultNotes {
     /// (fresh or emptied), focus its body region so the user can just
     /// type. Anything else leaves the focus alone.
     fn ensure_live_focus(&mut self) -> Task<Message> {
-        if self.pane != PaneMode::Live || self.live.is_some() {
+        if self.pane() != PaneMode::Live || self.live.is_some() {
             return Task::none();
         }
         let Some(tab_idx) = self.active_idx() else {
@@ -2241,7 +2253,7 @@ impl VaultNotes {
     /// region's content (its trailing blank lines are the gap to the
     /// next region, not text).
     fn live_focus(&mut self, idx: usize) -> Task<Message> {
-        if self.pane != PaneMode::Live {
+        if self.pane() != PaneMode::Live {
             return Task::none();
         }
         if self.live.as_ref().is_some_and(|state| state.block == idx) {
@@ -2657,7 +2669,7 @@ impl VaultNotes {
     /// (preview click → caret) is not possible: iced's editor has no
     /// programmatic scroll API.
     fn sync_preview_scroll(&mut self) -> Task<Message> {
-        if !self.scroll_sync || self.pane != PaneMode::Split {
+        if !self.scroll_sync || self.pane() != PaneMode::Split {
             return Task::none();
         }
         let Some(idx) = self.active_idx() else {
@@ -2825,7 +2837,7 @@ impl VaultNotes {
         let Some(found) = matches.get(index).copied() else {
             return Task::none();
         };
-        if self.pane == PaneMode::Live {
+        if self.pane() == PaneMode::Live {
             // The caret and the selection live in the focused region's
             // buffer: open the region holding the match and select it
             // there (region-local coordinates).
@@ -2884,7 +2896,7 @@ impl VaultNotes {
     /// current selection anchor (or cursor). In live preview the anchor is
     /// the focused region's caret lifted to file coordinates.
     fn find_jump_to_cursor(&mut self) -> Task<Message> {
-        let anchor = if self.pane == PaneMode::Live {
+        let anchor = if self.pane() == PaneMode::Live {
             self.live.as_ref().and_then(|live| {
                 let idx = self.active_idx()?;
                 let slices = self.live_slices(idx);
@@ -2945,12 +2957,13 @@ impl VaultNotes {
         // Where the live caret is, so the buffer can re-aim after the
         // whole-text replacement (the focused region may have changed).
         let aim = self.live_aim_marker(idx);
+        let pane = self.pane();
         {
             let tab = &mut self.tabs[idx];
             push_undo(tab);
             let new_text = replace_spans(&text, &[found], &replacement);
             tab.content = Content::with_text(&new_text);
-            if self.pane != PaneMode::Live {
+            if pane != PaneMode::Live {
                 tab.content.move_to(Cursor {
                     position: Position {
                         line: found.line,
@@ -3139,7 +3152,7 @@ impl VaultNotes {
         if self.bounds_pending
             || self.vault.is_none()
             || self.panel() != SidePanel::Files
-            || !self.sidebar_open
+            || !self.sidebar_open()
         {
             return Task::none();
         }
@@ -3160,7 +3173,7 @@ impl VaultNotes {
         };
         // Live preview: the caret and the text live in the focused
         // region's buffer, not the whole-file one.
-        let (text, cursor) = if self.pane == PaneMode::Live {
+        let (text, cursor) = if self.pane() == PaneMode::Live {
             match (
                 self.live.as_ref().map(|live| live.editor.text()),
                 self.live.as_ref().map(|live| live.editor.cursor().position),
@@ -3236,7 +3249,7 @@ impl VaultNotes {
                 .unwrap_or_default();
             link_target(&from, &target, &notes, self.link_path_format)
         };
-        if self.pane == PaneMode::Live {
+        if self.pane() == PaneMode::Live {
             // Edit the region's buffer: select the partial `[[query`
             // (region-local coordinates) and paste the link, then lift
             // the buffer into the note in one batch.
@@ -3817,7 +3830,6 @@ impl cosmic::Application for VaultNotes {
             collapsed: HashSet::new(),
             tabs: Vec::new(),
             tab_ids: vault_app::tabs::Tabs::new(),
-            pane: persisted.default_pane,
             banner: None,
             pending_links: None,
             error: None,
@@ -3846,7 +3858,6 @@ impl cosmic::Application for VaultNotes {
             zoom_target: ZoomTarget::default(),
             modifiers: Modifiers::default(),
             restore_split: false,
-            sidebar_open: persisted.sidebar_open,
             tree_drag: None,
             last_cursor: None,
             tree_bounds: crate::drag::TreeBounds::default(),
@@ -3867,6 +3878,10 @@ impl cosmic::Application for VaultNotes {
             pane_model: build_pane_model(persisted.default_pane),
         };
         app.core.set_header_title("Vault Notes".to_string());
+        // The rendered pane starts at the persisted default (the shared
+        // kernel owns the pane state; this routes through the reducer).
+        app.set_pane(persisted.default_pane);
+        app.set_sidebar_open(persisted.sidebar_open);
 
         // Restore preferences (M4c): theme choice, then the glass request,
         // then the last-used vault (M4 decision 1) when it still exists.
@@ -3978,8 +3993,9 @@ impl cosmic::Application for VaultNotes {
                 Task::none()
             }
             Message::ToggleSidebar => {
-                self.sidebar_open = !self.sidebar_open;
-                persist_setting(|s| s.sidebar_open = self.sidebar_open);
+                let open = !self.sidebar_open();
+                self.set_sidebar_open(open);
+                persist_setting(|s| s.sidebar_open = open);
                 Task::none()
             }
             Message::MouseMoved(pos) => {
@@ -4011,7 +4027,8 @@ impl cosmic::Application for VaultNotes {
                 // tree is actually on screen: other panels have no rows,
                 // a collapsed sidebar hides the tree, and stale bounds
                 // would misidentify sources.
-                if self.vault.is_none() || self.panel() != SidePanel::Files || !self.sidebar_open {
+                if self.vault.is_none() || self.panel() != SidePanel::Files || !self.sidebar_open()
+                {
                     return Task::none();
                 }
                 let Some(pos) = self.last_cursor else {
@@ -4129,7 +4146,7 @@ impl cosmic::Application for VaultNotes {
                 self.zoom_target = ZoomTarget::Source;
                 // In live preview the action edits the focused region's
                 // buffer and splices back into the note (live_action).
-                if self.pane == PaneMode::Live {
+                if self.pane() == PaneMode::Live {
                     return self.live_action(action);
                 }
                 if let Some(idx) = self.active_idx() {
@@ -4242,7 +4259,7 @@ impl cosmic::Application for VaultNotes {
                     // Pairing is off, but the keystroke must still land:
                     // the binding replaced the widget's own insert.
                     let actions = vec![Action::Edit(Edit::Insert(typed))];
-                    if self.pane == PaneMode::Live {
+                    if self.pane() == PaneMode::Live {
                         return self.live_run(actions);
                     }
                     if let Some(idx) = self.active_idx() {
@@ -4250,7 +4267,7 @@ impl cosmic::Application for VaultNotes {
                     }
                     return Task::none();
                 }
-                if self.pane == PaneMode::Live {
+                if self.pane() == PaneMode::Live {
                     // The buffer is the region source; the karat is its
                     // caret. The same decision table applies.
                     let (text, cursor) = {
@@ -4720,7 +4737,7 @@ impl cosmic::Application for VaultNotes {
                 let path = hit.path.clone();
                 let query = self.search_query.clone();
                 let open_task = self.open_tab(path);
-                if self.pane == PaneMode::Source {
+                if self.pane() == PaneMode::Source {
                     self.set_pane(PaneMode::Split);
                 }
                 // Scroll to the first block whose text contains the query.
@@ -5377,7 +5394,7 @@ mod chrome_model_tests {
             PaneMode::Live,
         ] {
             app.set_pane(mode);
-            assert_eq!(app.pane, mode);
+            assert_eq!(app.pane(), mode);
             assert_eq!(
                 app.pane_model.data::<PaneMode>(app.pane_model.active()),
                 Some(&mode),
@@ -5743,7 +5760,7 @@ mod editor_tests {
         let mut app = find_tests::test_app_with_tab("hello world\n");
         // Select "hello" in the source editor: the caret sits at the end
         // of the selection, the anchor at its start.
-        app.pane = PaneMode::Source;
+        app.set_pane(PaneMode::Source);
         app.tabs[0].content.move_to(Cursor {
             position: Position { line: 0, column: 5 },
             selection: Some(Position { line: 0, column: 0 }),
@@ -5751,7 +5768,7 @@ mod editor_tests {
         assert_eq!(app.selection_text().as_deref(), Some("hello"));
 
         // In the live pane the focused region's editor holds it instead.
-        app.pane = PaneMode::Live;
+        app.set_pane(PaneMode::Live);
         app.live = Some(LiveEdit {
             block: 0,
             editor: Content::with_text("one two three"),
@@ -5763,7 +5780,7 @@ mod editor_tests {
         assert_eq!(app.selection_text().as_deref(), Some("one"));
 
         // The reading pane shows no editor: nothing is selected there.
-        app.pane = PaneMode::Reading;
+        app.set_pane(PaneMode::Reading);
         assert_eq!(app.selection_text(), None);
     }
 
@@ -6248,7 +6265,7 @@ mod find_tests {
         let mut app = find_tests::test_app_with_tab("one two one\n");
         // Source-editor cursor semantics (the live pane selects its own
         // region buffer — see live_tests).
-        app.pane = PaneMode::Source;
+        app.set_pane(PaneMode::Source);
         app.find = Some(Find {
             query: "one".to_string(),
             ..Find::default()
@@ -6287,7 +6304,6 @@ mod find_tests {
             collapsed: HashSet::new(),
             tabs: Vec::new(),
             tab_ids: vault_app::tabs::Tabs::new(),
-            pane: PaneMode::default(),
             banner: None,
             pending_links: None,
             error: None,
@@ -6316,7 +6332,6 @@ mod find_tests {
             zoom_target: ZoomTarget::default(),
             modifiers: Modifiers::default(),
             restore_split: false,
-            sidebar_open: true,
             tree_drag: None,
             last_cursor: None,
             tree_bounds: crate::drag::TreeBounds::default(),
@@ -6392,7 +6407,7 @@ mod wiki_tests {
         // front of the bar: accepting a suggestion fills in the target
         // and leaves the label alone.
         let mut app = find_tests::test_app_with_tab("see [[|]]\n");
-        app.pane = PaneMode::Source;
+        app.set_pane(PaneMode::Source);
         app.tabs[0].content.move_to(Cursor {
             position: Position { line: 0, column: 6 },
             selection: None,
@@ -6410,7 +6425,7 @@ mod wiki_tests {
     #[test]
     fn wiki_accept_keeps_a_written_label() {
         let mut app = find_tests::test_app_with_tab("see [[|some label]]\n");
-        app.pane = PaneMode::Source;
+        app.set_pane(PaneMode::Source);
         app.tabs[0].content.move_to(Cursor {
             position: Position { line: 0, column: 6 },
             selection: None,
@@ -6495,7 +6510,7 @@ mod wiki_tests {
         let mut app = find_tests::test_app_with_tab("see [[no\n");
         // Source-editor path (the live-buffer path is covered in
         // live_tests::wiki_accept_in_live_mode_splices_the_link).
-        app.pane = PaneMode::Source;
+        app.set_pane(PaneMode::Source);
         // Cursor right after "[[no" (byte column 8).
         app.tabs[0].content.move_to(Cursor {
             position: Position { line: 0, column: 8 },
@@ -6571,7 +6586,7 @@ mod wiki_tests {
         // behind the caret. Accepting the completion must consume them
         // with the rest, or the link ends up with four brackets.
         let mut app = find_tests::test_app_with_tab("see [[My Link]]\n");
-        app.pane = PaneMode::Source;
+        app.set_pane(PaneMode::Source);
         // The caret sits right after "My Link", in front of the "]]".
         app.tabs[0].content.move_to(Cursor {
             position: Position {
@@ -6700,7 +6715,7 @@ mod scroll_sync_tests {
     fn sync_records_the_caret_line_and_targets_its_block() {
         let mut app = find_tests::test_app_with_tab("# Head\n\nPara one.\ncontinues\n\n- item\n");
         // Spans: heading 1-2, paragraph 3-5, list 6-6.
-        app.pane = PaneMode::Split;
+        app.set_pane(PaneMode::Split);
         app.scroll_sync = true;
         // Cursor on "continues" (0-based line 3 = file line 4) → block 1.
         app.tabs[0].content.move_to(Cursor {
@@ -6725,16 +6740,16 @@ mod scroll_sync_tests {
     fn sync_is_gated_by_pane_mode_and_setting() {
         let mut app = find_tests::test_app_with_tab("# Head\n\ntext\n");
         // Source mode: no preview to follow.
-        app.pane = PaneMode::Source;
+        app.set_pane(PaneMode::Source);
         app.scroll_sync = true;
         app.sync_preview_scroll();
         assert_eq!(app.tabs[0].synced_line, None);
         // Reading mode: the editor is not visible, nothing to follow.
-        app.pane = PaneMode::Reading;
+        app.set_pane(PaneMode::Reading);
         app.sync_preview_scroll();
         assert_eq!(app.tabs[0].synced_line, None);
         // Setting off: no sync even in Split.
-        app.pane = PaneMode::Split;
+        app.set_pane(PaneMode::Split);
         app.scroll_sync = false;
         app.sync_preview_scroll();
         assert_eq!(app.tabs[0].synced_line, None);
@@ -7164,7 +7179,7 @@ mod editor_focus_tests {
             PaneMode::Reading,
             PaneMode::Split,
         ] {
-            app.pane = mode;
+            app.set_pane(mode);
             let _ = crate::view::view(&app);
         }
     }
@@ -7486,12 +7501,12 @@ mod sidebar_collapse_tests {
     fn toggling_the_sidebar_flips_state_and_persists() {
         let _guard = settings_guard();
         let mut app = find_tests::test_app_with_tab("");
-        assert!(app.sidebar_open, "starts open");
+        assert!(app.sidebar_open(), "starts open");
         let _ = app.update(Message::ToggleSidebar);
-        assert!(!app.sidebar_open);
+        assert!(!app.sidebar_open());
         assert!(!crate::settings::load().sidebar_open, "persisted closed");
         let _ = app.update(Message::ToggleSidebar);
-        assert!(app.sidebar_open);
+        assert!(app.sidebar_open());
         assert!(crate::settings::load().sidebar_open, "persisted open");
         // Leave the developer's settings file as it was.
         persist_setting(|s| s.sidebar_open = true);
@@ -7501,7 +7516,7 @@ mod sidebar_collapse_tests {
     fn the_view_builds_with_the_sidebar_open_and_closed() {
         let mut app = find_tests::test_app_with_tab("");
         let _ = crate::view::view(&app);
-        app.sidebar_open = false;
+        app.set_sidebar_open(false);
         let _ = crate::view::view(&app);
     }
 
@@ -7519,7 +7534,7 @@ mod sidebar_collapse_tests {
             rows: vec![("a.md".into(), false, rect(0.0, 0.0, 200.0, 24.0))],
             area: Some(rect(0.0, 0.0, 200.0, 300.0)),
         };
-        app.sidebar_open = false;
+        app.set_sidebar_open(false);
         app.last_cursor = Some(cosmic::iced::Point::new(10.0, 10.0));
         let _ = app.update(Message::MousePressed);
         let _ = app.update(Message::MouseMoved(cosmic::iced::Point::new(10.0, 300.0)));
@@ -7536,7 +7551,7 @@ mod sidebar_collapse_tests {
         app.vault = Some(Vault::open(tmp.path()).unwrap());
         app.rebuild_index();
         app.set_panel(SidePanel::Files);
-        app.sidebar_open = false;
+        app.set_sidebar_open(false);
         let _ = app.measure_tree_bounds_if_needed();
         assert!(!app.bounds_pending, "no measure while the tree is hidden");
     }
@@ -7678,7 +7693,7 @@ mod zoom_tests {
         let _guard = settings_guard();
         let mut app = find_tests::test_app_with_tab("");
         // In the source pane the editor's size moves.
-        app.pane = PaneMode::Source;
+        app.set_pane(PaneMode::Source);
         let editor = app.editor_font_size;
         let reading = app.reading_font_size;
         let _ = app.update(Message::ZoomIn);
@@ -7689,7 +7704,7 @@ mod zoom_tests {
         );
 
         // In the reading pane the reading size moves instead.
-        app.pane = PaneMode::Reading;
+        app.set_pane(PaneMode::Reading);
         let _ = app.update(Message::ZoomIn);
         assert_eq!(app.reading_font_size, reading + 1);
         assert_eq!(app.editor_font_size, editor + 1, "the editor size stays");
@@ -7701,7 +7716,7 @@ mod zoom_tests {
     fn the_split_pane_zooms_the_pane_that_was_touched_last() {
         let _guard = settings_guard();
         let mut app = find_tests::test_app_with_tab("");
-        app.pane = PaneMode::Split;
+        app.set_pane(PaneMode::Split);
         // The editor is the target until the reading view is touched.
         let _ = app.update(Message::ZoomIn);
         assert_eq!(app.editor_font_size, 15);
@@ -7720,7 +7735,7 @@ mod zoom_tests {
     fn ctrl_scroll_zooms_and_a_plain_wheel_does_not() {
         let _guard = settings_guard();
         let mut app = find_tests::test_app_with_tab("");
-        app.pane = PaneMode::Reading;
+        app.set_pane(PaneMode::Reading);
 
         // A wheel without Ctrl belongs to the scrollable under the
         // pointer: nothing is zoomed.
@@ -7746,24 +7761,24 @@ mod zoom_tests {
     #[test]
     fn a_narrow_window_folds_the_split_pane_away() {
         let mut app = find_tests::test_app_with_tab("");
-        app.pane = PaneMode::Split;
+        app.set_pane(PaneMode::Split);
 
         // Below the threshold two panes do not fit: the split view
         // collapses to the source pane.
         let _ = app.update(Message::WindowResized(NARROW_WINDOW_WIDTH - 1.0));
-        assert_eq!(app.pane, PaneMode::Source);
+        assert_eq!(app.pane(), PaneMode::Source);
 
         // Wide enough again: the split layout comes back.
         let _ = app.update(Message::WindowResized(NARROW_WINDOW_WIDTH + 1.0));
-        assert_eq!(app.pane, PaneMode::Split);
+        assert_eq!(app.pane(), PaneMode::Split);
     }
 
     #[test]
     fn a_pane_the_user_picks_is_not_overridden_by_the_window_width() {
         let mut app = find_tests::test_app_with_tab("");
-        app.pane = PaneMode::Split;
+        app.set_pane(PaneMode::Split);
         let _ = app.update(Message::WindowResized(NARROW_WINDOW_WIDTH - 1.0));
-        assert_eq!(app.pane, PaneMode::Source);
+        assert_eq!(app.pane(), PaneMode::Source);
 
         // The user asks for the reading view while the window is narrow.
         let reading = app
@@ -7772,11 +7787,11 @@ mod zoom_tests {
             .find(|id| app.pane_model.data::<PaneMode>(*id) == Some(&PaneMode::Reading))
             .expect("the reading pane button exists");
         let _ = app.update(Message::PaneActivated(reading));
-        assert_eq!(app.pane, PaneMode::Reading);
+        assert_eq!(app.pane(), PaneMode::Reading);
 
         // Widening the window must not undo that choice.
         let _ = app.update(Message::WindowResized(NARROW_WINDOW_WIDTH + 1.0));
-        assert_eq!(app.pane, PaneMode::Reading);
+        assert_eq!(app.pane(), PaneMode::Reading);
     }
 }
 
@@ -8209,7 +8224,7 @@ mod live_tests {
             .find(|id| app.pane_model.data::<PaneMode>(*id) == Some(&PaneMode::Source))
             .unwrap();
         app.update(Message::PaneActivated(source_entity));
-        assert_eq!(app.pane, PaneMode::Source);
+        assert_eq!(app.pane(), PaneMode::Source);
         assert!(app.live.is_none());
     }
 

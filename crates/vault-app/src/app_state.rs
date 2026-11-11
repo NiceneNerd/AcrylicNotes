@@ -11,13 +11,13 @@ use crate::settings::PaneMode;
 use crate::tabs::Tabs;
 
 /// The kernel's application state.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AppState {
     /// The ordered open tabs with one active tab.
     pub tabs: Tabs,
     /// The pane layout currently rendered (not the startup default).
     pub pane: PaneMode,
-    /// Whether the sidebar is shown.
+    /// Whether the sidebar is shown. The default matches `AppSettings`.
     pub sidebar_open: bool,
     /// Which sidebar panel is active.
     pub panel: NavSection,
@@ -26,6 +26,19 @@ pub struct AppState {
     pub conflicts: Vec<TabId>,
     /// The last error to surface on the dismissible error line.
     pub last_error: Option<String>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            tabs: Tabs::new(),
+            pane: PaneMode::default(),
+            sidebar_open: true,
+            panel: NavSection::default(),
+            conflicts: Vec::new(),
+            last_error: None,
+        }
+    }
 }
 
 impl AppState {

@@ -63,12 +63,12 @@ pub fn header_start(app: &VaultNotes) -> Vec<Element<'_, Message>> {
         // The icon mirrors libcosmic's nav_bar_toggle: it shows the
         // current state (sidebar open -> open-navbar icon), and the
         // button reads selected while the sidebar is visible.
-        button::icon(icon::from_name(if app.sidebar_open {
+        button::icon(icon::from_name(if app.sidebar_open() {
             "navbar-open-symbolic"
         } else {
             "navbar-closed-symbolic"
         }))
-        .selected(app.sidebar_open)
+        .selected(app.sidebar_open())
         .on_press(Message::ToggleSidebar)
         .into(),
         button::icon(icon::from_name("document-save-symbolic"))
@@ -165,7 +165,7 @@ fn main_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
         .height(Length::Fill);
     col = col.push(
         row::Row::new()
-            .push_maybe(app.sidebar_open.then(|| sidebar(app, palette)))
+            .push_maybe(app.sidebar_open().then(|| sidebar(app, palette)))
             .push(note),
     );
     col.into()
@@ -962,7 +962,7 @@ fn note_area<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
     if app.find.is_some() {
         col = col.push(find_bar(app, palette));
     }
-    let content: Element<'_, Message> = match app.pane {
+    let content: Element<'_, Message> = match app.pane() {
         PaneMode::Live => live_pane(app, tab, palette),
         PaneMode::Source => editor_pane(app, tab, palette, app.wiki_complete.as_ref()),
         PaneMode::Reading => reading_pane(app, tab, palette),
