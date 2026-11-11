@@ -318,11 +318,9 @@ pub(crate) fn render_frontmatter<'a>(doc: &Doc, ctx: &Ctx<'a>) -> Option<Element
             }
         }
     }
-    Some(
-        container(fm_col)
-            .style(move |_| code_block_style(&palette))
-            .into(),
-    )
+    // No code-block chrome: the table stands on its own, without a
+    // shaded panel behind it.
+    Some(container(fm_col).into())
 }
 
 /// Extract the YAML content between the `---` delimiters from a raw
