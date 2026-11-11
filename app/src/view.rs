@@ -377,6 +377,9 @@ fn tree_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
 /// label, and the fold controls pushed to the far right, away from the
 /// order they act on.
 fn tree_toolbar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+    // The path-aware controls need a note to work from: with none open,
+    // they have no path to keep open.
+    let has_note = app.active_tab_path().is_some();
     let sort_icon = if app.tree_sort.descending() {
         "view-sort-descending-symbolic"
     } else {
@@ -416,11 +419,27 @@ fn tree_toolbar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Messag
                 .height(Length::Shrink),
         )
         .push(
+            button::icon(icon::from_name("object-select-symbolic"))
+                .icon_size(14)
+                .class(cosmic::theme::Button::Icon)
+                .tooltip("Collapse all but the current note's path")
+                .on_press_maybe(has_note.then_some(Message::TreeCollapseOthers))
+                .height(Length::Shrink),
+        )
+        .push(
             button::icon(icon::from_name("pan-down-symbolic"))
                 .icon_size(14)
                 .class(cosmic::theme::Button::Icon)
                 .tooltip("Expand all folders")
                 .on_press(Message::TreeExpandAll)
+                .height(Length::Shrink),
+        )
+        .push(
+            button::icon(icon::from_name("go-jump-symbolic"))
+                .icon_size(14)
+                .class(cosmic::theme::Button::Icon)
+                .tooltip("Open the current note's path")
+                .on_press_maybe(has_note.then_some(Message::TreeRevealCurrent))
                 .height(Length::Shrink),
         )
         .spacing(2)

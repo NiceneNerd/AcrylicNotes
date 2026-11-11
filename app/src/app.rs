@@ -467,6 +467,11 @@ pub enum Message {
     TreeCollapseAll,
     /// Expand every folder of the file tree.
     TreeExpandAll,
+    /// Fold every folder away except the ones on the current note's
+    /// path, which stay open so the note remains visible.
+    TreeCollapseOthers,
+    /// Open the folders on the current note's path, if they are folded.
+    TreeRevealCurrent,
     ToggleFold(u64),
     /// A link span was clicked; the URI scheme routes it.
     OpenUri(String),
@@ -3030,6 +3035,18 @@ impl VaultNotes {
         }
     }
 
+    /// Scroll the file tree so the current note's row sits in view.
+    ///
+    /// The row only exists once the folders on its path are open, so
+    /// this runs after the fold state changed: the measuring task waits
+    /// for the next layout pass.
+    fn scroll_tree_to_current_note(&self) -> Task<Message> {
+        match self.active_tab_path() {
+            Some(path) => crate::scroll::to_tree_note::<Message>(path, 4.0),
+            None => Task::none(),
+        }
+    }
+
     /// Queue a bounds-measure task unless one is already in flight.
     fn measure_tree_bounds_if_needed(&mut self) -> Task<Message> {
         // Only measure while the tree is on screen: on other panels (or
@@ -4462,6 +4479,37 @@ impl cosmic::Application for VaultNotes {
             Message::TreeExpandAll => {
                 self.collapsed.clear();
                 self.measure_tree_bounds_if_needed()
+            }
+            Message::TreeCollapseOthers => {
+                // The current note's own folders stay open; every other
+                // folder folds away.
+                let keep: HashSet<String> = self
+                    .active_tab_path()
+                    .map(tree::ancestor_paths)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                self.collapsed = tree::folder_paths(&self.tree)
+                    .into_iter()
+                    .filter(|path| !keep.contains(path))
+                    .collect();
+                // The tree just changed shape: bring the note it is now
+                // about into view.
+                let scroll = self.scroll_tree_to_current_note();
+                Task::batch([scroll, self.measure_tree_bounds_if_needed()])
+            }
+            Message::TreeRevealCurrent => {
+                // Open the path to the current note, if it is folded. The
+                // other folders keep whatever state they were in.
+                let folders: Vec<String> = self
+                    .active_tab_path()
+                    .map(tree::ancestor_paths)
+                    .unwrap_or_default();
+                for folder in folders {
+                    self.collapsed.remove(&folder);
+                }
+                let scroll = self.scroll_tree_to_current_note();
+                Task::batch([scroll, self.measure_tree_bounds_if_needed()])
             }
             Message::ToggleFold(id) => {
                 if let Some(idx) = self.active {
@@ -8374,5 +8422,54 @@ mod tree_sort_tests {
 
         let _ = app.update(Message::TreeExpandAll);
         assert!(app.collapsed.is_empty());
+    }
+
+    /// A vault with a current note in "Folder/Deep".
+    fn app_with_current_note() -> (tempfile::TempDir, VaultNotes) {
+        let (tmp, mut app) = app_with(&[
+            ("a.md", ""),
+            ("Folder/n.md", ""),
+            ("Folder/Deep/deep.md", ""),
+            ("Other/o.md", ""),
+        ]);
+        app.tabs[0].path = "Folder/Deep/deep.md".to_string();
+        (tmp, app)
+    }
+
+    #[test]
+    fn collapsing_the_others_keeps_the_current_notes_path_open() {
+        let (_tmp, mut app) = app_with_current_note();
+
+        let _ = app.update(Message::TreeCollapseOthers);
+        // "Folder" and "Folder/Deep" stay open, so the note stays
+        // visible; every other folder folds away.
+        assert_eq!(app.collapsed, ["Other".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn revealing_the_current_note_opens_its_path_and_leaves_the_rest() {
+        let (_tmp, mut app) = app_with_current_note();
+
+        // Everything folds away first.
+        let _ = app.update(Message::TreeCollapseAll);
+        assert_eq!(app.collapsed.len(), 3);
+
+        // Revealing opens the path to the current note — and only that.
+        let _ = app.update(Message::TreeRevealCurrent);
+        assert_eq!(app.collapsed, ["Other".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn without_an_open_note_there_is_no_path_to_work_from() {
+        let (_tmp, mut app) = app_with_current_note();
+        app.active = None;
+
+        // No path to keep open, so everything folds away.
+        let _ = app.update(Message::TreeCollapseOthers);
+        assert_eq!(app.collapsed.len(), 3);
+
+        // Nothing to reveal: the tree stays as it is.
+        let _ = app.update(Message::TreeRevealCurrent);
+        assert_eq!(app.collapsed.len(), 3);
     }
 }

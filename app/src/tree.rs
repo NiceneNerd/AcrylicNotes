@@ -170,6 +170,24 @@ pub fn folder_paths(nodes: &[TreeNode]) -> Vec<String> {
     paths
 }
 
+/// The folders that hold `path`: the chain from the vault root down to
+/// the file's own folder ("a/b/note.md" → ["a", "a/b"]).
+///
+/// These are the folders that have to stay open for the file to show.
+pub fn ancestor_paths(path: &str) -> Vec<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    let mut out = Vec::new();
+    let mut prefix = String::new();
+    for part in parts.iter().take(parts.len().saturating_sub(1)) {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(part);
+        out.push(prefix.clone());
+    }
+    out
+}
+
 /// A pending sidebar-tree edit, started from the right-click menu (M4c).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeEditKind {
@@ -290,6 +308,14 @@ mod tests {
             folder_paths(&tree),
             vec!["a".to_string(), "a/b".to_string()]
         );
+    }
+
+    #[test]
+    fn ancestor_paths_are_the_folders_that_hold_a_file() {
+        assert_eq!(ancestor_paths("a/b/note.md"), vec!["a", "a/b"]);
+        assert_eq!(ancestor_paths("a/note.md"), vec!["a"]);
+        // A file at the vault root sits in no folder at all.
+        assert_eq!(ancestor_paths("note.md"), Vec::<String>::new());
     }
 
     #[test]

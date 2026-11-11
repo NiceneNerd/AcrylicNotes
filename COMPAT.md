@@ -821,7 +821,7 @@ from the user's first look at them (D).
   editor in the live pane. The reading pane shows no editor, so nothing
   is selected there.
 
-### Phase D — the tree toolbar and the live editor's word delete
+### Phase D — the tree toolbar, the tree's path controls and the live editor's word delete
 
 - **The tree toolbar keeps quiet** (D1): the sort button and the two
   fold buttons sat side by side in the middle of the row, each one a
@@ -832,6 +832,13 @@ from the user's first look at them (D).
   as a muted 12-pixel caption on the left, the fold chevrons (14
   pixels, with tooltips naming what they do) pushed to the right edge,
   and tight padding all round.
+- **The tree folds to the current note** (D3): the tree could only fold
+  everything away or open everything again, so a deep vault meant a long
+  scroll to find the note in hand. Two more controls work on the *current
+  path* — the folders that hold the open note. One folds every other
+  folder away (the current path stays open, so the note stays visible);
+  the other opens the current path when it is folded, leaving the rest of
+  the tree as it was. Both bring the note into view in the sidebar.
 - **The live editor deletes a word** (D2): Ctrl+Backspace in the live
   preview dropped a single character — the widget's own binding matches
   the modified key and ignores the modifier. It now deletes a word,

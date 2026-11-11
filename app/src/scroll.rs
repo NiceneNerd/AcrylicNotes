@@ -144,6 +144,18 @@ pub fn to_live_region<Message: Send + 'static>(index: usize, margin: f32) -> Tas
     scroll_to_anchor::<Message>(LIVE_SCROLL, live_region_id(index), margin)
 }
 
+/// A task that scrolls the file tree so the row of the note at `path`
+/// sits near the top of the viewport. No-op when the row or the
+/// scrollable is missing (the tree is not on screen, or the note is
+/// not in it).
+pub fn to_tree_note<Message: Send + 'static>(path: &str, margin: f32) -> Task<Message> {
+    scroll_to_anchor::<Message>(
+        crate::drag::SCROLL_ID,
+        crate::drag::row_id(false, path),
+        margin,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
