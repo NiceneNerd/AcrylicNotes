@@ -2372,11 +2372,11 @@ impl VaultNotes {
                 (range.0 - 1 + cursor.line, cursor.column)
             })
             .unwrap_or((0, 0));
-        self.live_aim(line, column);
+        let aim_task = self.live_aim(line, column);
         // A region edit can open, move through, or close an unclosed
         // `[[` in the buffer.
         self.update_wiki_complete();
-        Task::none()
+        aim_task
     }
 
     /// One action on the live editor: perform it on the focused region's
@@ -2395,27 +2395,29 @@ impl VaultNotes {
     /// Re-aim the live editor at the region containing `line` (0-based
     /// file line): re-slice the note text, and when the buffer no longer
     /// matches its region's source (the edit split or merged blocks),
-    /// rebuild the buffer with the caret clamped inside.
-    fn live_aim(&mut self, line: usize, column: usize) {
+    /// rebuild the buffer with the caret clamped inside. Returns a focus
+    /// task when the buffer is rebuilt so the editor keeps focus across
+    /// region boundary changes.
+    fn live_aim(&mut self, line: usize, column: usize) -> Task<Message> {
         let Some(tab_idx) = self.active else {
-            return;
+            return Task::none();
         };
         let tab = &self.tabs[tab_idx];
         let text = tab.content.text();
         let slices = live::slices(&text, &tab.doc);
         if slices.is_empty() {
-            return;
+            return Task::none();
         }
         let idx = live::block_containing(&slices, line);
         let source = slices[idx].source(&text);
         let Some(live) = self.live.as_mut() else {
-            return;
+            return Task::none();
         };
         if live.editor.text() == source {
             // Content identical (the common case: the region's source
             // simply re-tiled): keep the buffer, keep the caret.
             live.block = idx;
-            return;
+            return Task::none();
         }
         let (line, column) = live::clamp_position(
             &source,
@@ -2428,6 +2430,8 @@ impl VaultNotes {
             selection: None,
         });
         live.block = idx;
+        // Buffer rebuilt: request focus on the new region's editor id.
+        Self::live_editor_focus(idx)
     }
 
     /// Arrow keys in the live editor. At a region's boundary they cross
@@ -2521,8 +2525,7 @@ impl VaultNotes {
         self.last_edit = Some(std::time::Instant::now());
         // One newline before the caret is gone: the caret absolute file
         // line moves up by one while its column stays at the line start.
-        self.live_aim(current.start_line - 2, 0);
-        Task::none()
+        self.live_aim(current.start_line - 2, 0)
     }
 
     /// Delete in the live editor. At a region's end it deletes the
@@ -2570,8 +2573,7 @@ impl VaultNotes {
         self.last_edit = Some(std::time::Instant::now());
         // The newline is deleted after the caret: its absolute file line
         // and column are unchanged, and the region still starts here.
-        self.live_aim(current.start_line - 1 + line, column);
-        Task::none()
+        self.live_aim(current.start_line - 1 + line, column)
     }
 
     /// Ctrl+Backspace / Ctrl+Delete in the live editor: delete the word
@@ -2636,10 +2638,10 @@ impl VaultNotes {
         self.last_edit = Some(std::time::Instant::now());
         // The caret lands where the deleted word started.
         let (line, column) = position_of(&new_text, start);
-        self.live_aim(line, column);
+        let aim_task = self.live_aim(line, column);
         // A word can carry an unclosed `[[` with it.
         self.update_wiki_complete();
-        Task::none()
+        aim_task
     }
 
     /// Scroll-sync (Phase F): in Split mode, follow the editor caret — the
@@ -2961,9 +2963,11 @@ impl VaultNotes {
             tab.refresh_doc();
         }
         self.last_edit = Some(std::time::Instant::now());
-        if let Some((line, column)) = aim {
-            self.live_aim(line, column);
-        }
+        let aim_task = if let Some((line, column)) = aim {
+            self.live_aim(line, column)
+        } else {
+            Task::none()
+        };
         // The next match (if any) now sits at the same index.
         let text = self.tabs[idx].content.text();
         let len = find_matches(&text, &query, case).len();
@@ -2972,7 +2976,7 @@ impl VaultNotes {
         }
         let task = self.select_match(self.find.as_ref().map_or(0, |f| f.current));
         self.update_wiki_complete();
-        task
+        Task::batch([aim_task, task])
     }
 
     /// Replace every match in the active tab (one undoable step).
@@ -3007,14 +3011,16 @@ impl VaultNotes {
             tab.refresh_doc();
         }
         self.last_edit = Some(std::time::Instant::now());
-        if let Some((line, column)) = aim {
-            self.live_aim(line, column);
-        }
+        let aim_task = if let Some((line, column)) = aim {
+            self.live_aim(line, column)
+        } else {
+            Task::none()
+        };
         if let Some(find) = self.find.as_mut() {
             find.current = 0;
         }
         self.update_wiki_complete();
-        Task::none()
+        aim_task
     }
 
     /// Re-evaluate the wikilink dropdown against the active tab's text and
@@ -4181,12 +4187,17 @@ impl cosmic::Application for VaultNotes {
                         tab.refresh_doc();
                         self.last_edit = Some(std::time::Instant::now());
                     }
-                    if let Some((line, column)) = aim {
-                        self.live_aim(line, column);
-                    }
+                    let aim_task = if let Some((line, column)) = aim {
+                        self.live_aim(line, column)
+                    } else {
+                        Task::none()
+                    };
+                    self.update_wiki_complete();
+                    Task::batch([aim_task, self.sync_preview_scroll()])
+                } else {
+                    self.update_wiki_complete();
+                    self.sync_preview_scroll()
                 }
-                self.update_wiki_complete();
-                self.sync_preview_scroll()
             }
             Message::EditorRedo => {
                 if let Some(idx) = self.active {
@@ -4196,12 +4207,17 @@ impl cosmic::Application for VaultNotes {
                         tab.refresh_doc();
                         self.last_edit = Some(std::time::Instant::now());
                     }
-                    if let Some((line, column)) = aim {
-                        self.live_aim(line, column);
-                    }
+                    let aim_task = if let Some((line, column)) = aim {
+                        self.live_aim(line, column)
+                    } else {
+                        Task::none()
+                    };
+                    self.update_wiki_complete();
+                    Task::batch([aim_task, self.sync_preview_scroll()])
+                } else {
+                    self.update_wiki_complete();
+                    self.sync_preview_scroll()
                 }
-                self.update_wiki_complete();
-                self.sync_preview_scroll()
             }
             Message::EditorFormat(format) => {
                 if let Some(idx) = self.active {
