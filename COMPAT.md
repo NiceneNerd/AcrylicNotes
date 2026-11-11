@@ -847,3 +847,48 @@ from the user's first look at them (D).
   in the neighbouring block — the motion runs over the whole note
   (`word_before` / `word_after`, mirroring cosmic-text's own word
   motion). Ctrl+Delete deletes the word after the caret the same way.
+
+### Phase E — typography, tabs, margins, narrow windows
+
+- **Custom reading font family** (E1): the reading view now has its own
+  font setting, separate from the source editor's. The settings drawer
+  gains a "Reading" section with a custom font family input (empty =
+  system font), a font-size stepper (±1 px, arbitrary integers in the
+  8–72 px range), and a margin choice (None / Compact / Comfortable /
+  Spacious). Bold and italic spans keep the custom family — only weight
+  and slant change; code, math, headings and callout titles all scale
+  from the reading size. Headings use `heading_size(level, base)` with
+  factors 1.6 / 1.35 / 1.2 / 1.1 / 1.0 (26/22/19/18/16 px at a 16 px
+  base).
+- **Independent font sizes** (E2): the source editor and the reading
+  view each have their own persisted font size, so they can be set
+  independently. The font-size range widened to 8–72 px
+  (`MIN_FONT_SIZE` / `MAX_FONT_SIZE` / `clamp_font_size`), and steppers
+  now move by ±1 px.
+- **Zoom shortcuts** (E3): Ctrl+= / Ctrl+- and Ctrl+scroll zoom the pane
+  in focus. The wheel event carries no modifiers, so Ctrl is tracked from
+  key events (a `KeyReleased` message clears the released modifier).
+  The zoom target follows interaction: the source editor while editing,
+  the reading view while reading, and the last-touched pane in split
+  (`zoom_target`, set to Source on editor action, to Reading on a
+  reading-view click).
+- **Dimmed folder path in tab titles** (E4): libcosmic's segmented-button
+  tab bar was replaced with a custom horizontal strip — its model was
+  text-only and cannot dim part of a label. Each tab now shows the note's
+  title with the folder path beside it, dimmed at 12 px. Short folders
+  take their natural width; long ones get a fixed 120 px column and are
+  cut off with an end ellipsis (`tab_label_parts` returns `(title,
+  folder)`). The active tab gets an accent-tinted container background,
+  and close buttons are always visible; the strip scrolls horizontally
+  when tabs don't fit.
+- **Configurable reading margins** (E5): the reading pane (and the live
+  pane's preview area) now leaves a margin around its text column: None
+  (0 px), Compact (16 px), Comfortable (32 px, the default), Spacious
+  (56 px). Padding goes on the wrapping container, not the scrollable
+  itself (a scrollable's padding only insets its scrollbar, not its
+  content).
+- **Narrow-window split fold** (E6): below 480 px window width
+  (`NARROW_WINDOW_WIDTH`) the split layout folds down to the source
+  pane — two panes side by side don't fit. The split comes back when the
+  window grows again (`restore_split`), unless the user picked another
+  pane in the meantime (`restore_split` is cleared in `PaneActivated`).

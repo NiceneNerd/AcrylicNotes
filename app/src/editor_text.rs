@@ -191,6 +191,23 @@ pub fn editor_font(mono: bool, custom_family: &str) -> cosmic::iced::Font {
     }
 }
 
+/// The reading view's font: the custom family when one is set, else the
+/// system UI font. An unknown family name falls back to the default
+/// font at render time, so a typo degrades instead of breaking.
+///
+/// The reading view has its own family: the editor's monospace toggle
+/// says nothing about how a note should read.
+pub fn reading_font(custom_family: &str) -> cosmic::iced::Font {
+    let family = custom_family.trim();
+    if family.is_empty() {
+        return cosmic::font::default();
+    }
+    cosmic::iced::Font {
+        family: Family::Name(intern_family(family)),
+        ..cosmic::iced::Font::DEFAULT
+    }
+}
+
 /// `Family::Name` holds a `&'static str`, so a family typed at runtime
 /// is interned once and leaked; libcosmic's own `FontConfig` conversion
 /// interns font names the same way. Typing in the settings field leaks
@@ -481,5 +498,28 @@ mod tests {
         // Interning is stable: the same name resolves to the same
         // leaked static on repeated calls.
         assert_eq!(editor_font(false, "Fira Code").family, custom.family);
+    }
+
+    #[test]
+    fn the_reading_font_is_the_system_font_unless_a_family_is_named() {
+        // The reading view has its own family: the editor's monospace
+        // toggle says nothing about how a note should read.
+        assert_eq!(
+            reading_font("").family,
+            cosmic::font::default().family,
+            "no custom family follows the system font"
+        );
+        assert_eq!(
+            reading_font("   ").family,
+            cosmic::font::default().family,
+            "a blank family is no family"
+        );
+        let custom = reading_font(" Iowan Old Style ");
+        assert_eq!(
+            custom.family,
+            cosmic::iced::core::font::Family::Name("Iowan Old Style")
+        );
+        // Interning is stable here too.
+        assert_eq!(reading_font("Iowan Old Style").family, custom.family);
     }
 }

@@ -59,6 +59,17 @@ pub struct AppSettings {
     /// Editor font size in pixels.
     #[serde(default = "default_editor_font_size")]
     pub editor_font_size: u16,
+    /// Custom reading-view font family name; empty follows the system
+    /// font. An unknown name falls back to the default font.
+    #[serde(default)]
+    pub reading_font_family: String,
+    /// Reading-view font size in pixels. The source editor keeps its own
+    /// size, so the two panes can be sized independently.
+    #[serde(default = "default_reading_font_size")]
+    pub reading_font_size: u16,
+    /// The margin the reading view leaves around its text column.
+    #[serde(default)]
+    pub reading_margin: ReadingMargin,
     /// Whether the sidebar (file tree and other panels) is shown. A
     /// toggle button in the titlebar flips it.
     #[serde(default = "default_true")]
@@ -174,12 +185,79 @@ pub enum PaneMode {
     Reading,
 }
 
+/// How much margin the reading view leaves around its text column.
+///
+/// The margin is the space between the pane's edge and the text: a
+/// narrow column reads badly against the window edge, a wide one wastes
+/// the screen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReadingMargin {
+    /// No margin: the text runs to the pane's edges.
+    #[serde(rename = "none")]
+    None,
+    /// A tight margin (16 px).
+    #[serde(rename = "compact")]
+    Compact,
+    /// A roomy margin (32 px) — the default.
+    #[default]
+    #[serde(rename = "comfortable")]
+    Comfortable,
+    /// A wide margin (56 px).
+    #[serde(rename = "spacious")]
+    Spacious,
+}
+
+impl ReadingMargin {
+    /// Every margin, in the order the settings drawer lists them.
+    pub const ALL: [ReadingMargin; 4] = [
+        ReadingMargin::None,
+        ReadingMargin::Compact,
+        ReadingMargin::Comfortable,
+        ReadingMargin::Spacious,
+    ];
+
+    /// The user-facing name of this margin.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Compact => "Compact",
+            Self::Comfortable => "Comfortable",
+            Self::Spacious => "Spacious",
+        }
+    }
+
+    /// The padding (in pixels) the reading view leaves around its text.
+    pub fn padding(self) -> f32 {
+        match self {
+            Self::None => 0.0,
+            Self::Compact => 16.0,
+            Self::Comfortable => 32.0,
+            Self::Spacious => 56.0,
+        }
+    }
+}
+
+/// The smallest font size either pane accepts.
+pub const MIN_FONT_SIZE: u16 = 8;
+
+/// The largest font size either pane accepts.
+pub const MAX_FONT_SIZE: u16 = 72;
+
+/// Clamp a font size to the range both panes accept.
+pub fn clamp_font_size(size: i32) -> u16 {
+    size.clamp(MIN_FONT_SIZE as i32, MAX_FONT_SIZE as i32) as u16
+}
+
 fn default_true() -> bool {
     true
 }
 
 fn default_editor_font_size() -> u16 {
     14
+}
+
+fn default_reading_font_size() -> u16 {
+    16
 }
 
 fn default_autosave_secs() -> u64 {
@@ -200,6 +278,9 @@ impl Default for AppSettings {
             editor_font_mono: true,
             editor_font_family: String::new(),
             editor_font_size: default_editor_font_size(),
+            reading_font_family: String::new(),
+            reading_font_size: default_reading_font_size(),
+            reading_margin: ReadingMargin::default(),
             sidebar_open: true,
             autosave_secs: default_autosave_secs(),
             default_pane: PaneMode::default(),
@@ -270,6 +351,9 @@ mod tests {
             editor_font_mono: true,
             editor_font_family: "Fira Code".to_string(),
             editor_font_size: 18,
+            reading_font_family: "Iowan Old Style".to_string(),
+            reading_font_size: 21,
+            reading_margin: ReadingMargin::Spacious,
             sidebar_open: false,
             autosave_secs: 5,
             default_pane: PaneMode::Reading,
@@ -307,6 +391,11 @@ mod tests {
         assert!(loaded.editor_font_mono);
         assert_eq!(loaded.editor_font_size, 14);
         assert!(loaded.editor_font_family.is_empty(), "no custom font");
+        // The reading view has its own font family and size; both start
+        // out empty/default for files that predate the fields.
+        assert!(loaded.reading_font_family.is_empty());
+        assert_eq!(loaded.reading_font_size, 16);
+        assert_eq!(loaded.reading_margin, ReadingMargin::Comfortable);
         // The sidebar starts open for files that predate the field.
         assert!(loaded.sidebar_open);
         assert_eq!(loaded.autosave_secs, 2);
@@ -405,5 +494,51 @@ mod tests {
         assert!(TreeSort::NameDesc.descending());
         assert!(TreeSort::Newest.descending());
         assert!(!TreeSort::Oldest.descending());
+    }
+
+    #[test]
+    fn the_reading_margin_persists_as_a_word_and_widens_the_gutter() {
+        // The persisted names are the user-facing spokes of the margin
+        // choice; old files without the field keep the roomy default.
+        assert_eq!(
+            serde_json::to_string(&ReadingMargin::None).unwrap(),
+            r#""none""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ReadingMargin>(r#""spacious""#).unwrap(),
+            ReadingMargin::Spacious
+        );
+        assert_eq!(ReadingMargin::default(), ReadingMargin::Comfortable);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, r#"{"last_vault": "/notes"}"#).unwrap();
+        assert_eq!(
+            load_from(&path).unwrap().reading_margin,
+            ReadingMargin::Comfortable
+        );
+
+        // Each margin has a label and a padding, and the paddings grow
+        // with the room they ask for.
+        let mut previous = 0.0;
+        for margin in ReadingMargin::ALL {
+            assert!(!margin.label().is_empty());
+            assert!(margin.padding() >= previous);
+            previous = margin.padding();
+        }
+        assert_eq!(ReadingMargin::None.padding(), 0.0);
+    }
+
+    #[test]
+    fn font_sizes_are_clamped_to_the_range_both_panes_accept() {
+        // Arbitrary sizes are allowed inside the range; the ends are
+        // held so a runaway shortcut cannot make the text vanish.
+        assert_eq!(clamp_font_size(14), 14);
+        assert_eq!(clamp_font_size(MIN_FONT_SIZE as i32 - 5), MIN_FONT_SIZE);
+        assert_eq!(clamp_font_size(MAX_FONT_SIZE as i32 + 5), MAX_FONT_SIZE);
+        // Every integer inside the range survives untouched.
+        for size in MIN_FONT_SIZE..=MAX_FONT_SIZE {
+            assert_eq!(clamp_font_size(size as i32), size);
+        }
     }
 }

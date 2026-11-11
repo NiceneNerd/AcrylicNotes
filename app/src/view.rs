@@ -10,19 +10,19 @@ use cosmic::iced::widget::{opaque, stack, text_editor};
 use cosmic::iced::{alignment, border, Background, Length, Padding};
 use cosmic::widget::{
     button, column, container, context_menu, icon, menu, nav_bar, row, scrollable,
-    segmented_button, settings, tab_bar, text, text_input, toggler,
+    segmented_button, settings, text, text_input, toggler,
 };
 use cosmic::Element;
 
 use crate::app::{
-    editor_shortcut, find_matches, parent_of, title_of, tree_note_label, unicode_char,
-    unicode_entry_binding, LinkPathFormat, Message, Palette, PaneMode, SidePanel, SortMenuAction,
-    TreeMenuAction, TreeSort, VaultNotes, ATTACHMENT_INPUT, EDITOR_FONT_INPUT, EDITOR_INPUT,
-    FIND_INPUT, SIDEBAR_OPACITY, SWITCHER_INPUT, TREE_EDIT_INPUT,
+    editor_shortcut, find_matches, parent_of, tab_label_parts, title_of, tree_note_label,
+    unicode_char, unicode_entry_binding, LinkPathFormat, Message, Palette, PaneMode, SidePanel,
+    SortMenuAction, TreeMenuAction, TreeSort, VaultNotes, ATTACHMENT_INPUT, EDITOR_FONT_INPUT,
+    EDITOR_INPUT, FIND_INPUT, READING_FONT_INPUT, SIDEBAR_OPACITY, SWITCHER_INPUT, TREE_EDIT_INPUT,
 };
 use crate::editor_text::{
     editor_font, editor_highlight_format, editor_placeholder_color, editor_value_color,
-    set_editor_base_font,
+    reading_font, set_editor_base_font,
 };
 use crate::reading;
 use crate::scroll::READING_SCROLL;
@@ -970,21 +970,94 @@ fn note_area<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
     col.into()
 }
 
-fn tab_bar<'a>(app: &'a VaultNotes, _palette: Palette) -> Element<'a, Message> {
+/// The open-note tab strip.
+///
+/// Each tab shows the note's title and, dimmed beside it, the folder the
+/// note lives in — two notes with the same name are told apart at a
+/// glance. The folder is cut off with an ellipsis when it does not fit.
+fn tab_bar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
     if app.tabs.is_empty() {
-        return container(text("No open tabs").class(_palette.muted))
+        return container(text("No open tabs").class(palette.muted))
             .padding(4)
             .width(Length::Fill)
             .into();
     }
-    // The COSMIC tab strip: model-driven tabs with close buttons; entities
-    // carry the tab index (kept in sync by `sync_tab_model`). The default
-    // `button_spacing` is 0, so the label sits against the close icon.
-    tab_bar::horizontal(&app.tab_model)
-        .button_spacing(cosmic::theme::spacing().space_xxs)
-        .on_activate(Message::TabActivated)
-        .on_close(Message::TabCloseRequested)
+    let mut strip = row::Row::new()
+        .spacing(2)
+        .align_y(alignment::Vertical::Center);
+    for (idx, tab) in app.tabs.iter().enumerate() {
+        strip = strip.push(tab_button(tab, idx, app.active == Some(idx), palette));
+    }
+    // More tabs than fit: the strip scrolls sideways.
+    scrollable::horizontal(strip)
+        .width(Length::Fill)
+        .height(Length::Shrink)
         .into()
+}
+
+/// One tab: the note's title, its folder dimmed beside it, and a close
+/// button. The active tab gets a tinted background.
+fn tab_button<'a>(
+    tab: &'a crate::app::Tab,
+    idx: usize,
+    active: bool,
+    palette: Palette,
+) -> Element<'a, Message> {
+    let (title, folder) = tab_label_parts(tab);
+    let mut label = row::Row::new()
+        .spacing(6)
+        .align_y(alignment::Vertical::Center);
+    label = label.push(text(title));
+    if !folder.is_empty() {
+        label = label.push(
+            text(folder.clone())
+                .size(12)
+                .class(palette.muted)
+                .width(folder_width(&folder))
+                // A long path is cut off instead of pushing the tab off
+                // the strip.
+                .ellipsize(cosmic::iced::core::text::Ellipsize::End(
+                    cosmic::iced::core::text::EllipsizeHeightLimit::Lines(1),
+                )),
+        );
+    }
+    let label = button::custom(label)
+        .class(cosmic::theme::Button::Text)
+        .on_press(Message::TabActivated(idx))
+        .padding([4, 8])
+        .height(Length::Shrink);
+    let close = button::icon(icon::from_name("window-close-symbolic"))
+        .icon_size(12)
+        .class(cosmic::theme::Button::Icon)
+        .on_press(Message::TabCloseRequested(idx))
+        .height(Length::Shrink);
+    container(
+        row::Row::new()
+            .spacing(0)
+            .align_y(alignment::Vertical::Center)
+            .push(label)
+            .push(close),
+    )
+    .style(move |_| cosmic::widget::container::Style {
+        background: active.then(|| Background::Color(with_alpha(palette.accent, 0.14))),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The width the folder beside a tab's title may take.
+///
+/// A short folder takes its natural width, so a tab stays as narrow as
+/// its content. A long one is given a fixed column and cut off with an
+/// ellipsis, so a deep vault does not push the tab off the strip.
+fn folder_width(folder: &str) -> Length {
+    const LONG_FOLDER_CHARS: usize = 16;
+    const FOLDER_COLUMN: f32 = 120.0;
+    if folder.chars().count() > LONG_FOLDER_CHARS {
+        Length::Fixed(FOLDER_COLUMN)
+    } else {
+        Length::Shrink
+    }
 }
 
 /// The in-note find bar (Ctrl+F): query, live count, prev/next, case
@@ -1225,6 +1298,8 @@ fn reading_pane<'a>(
         from: tab.path.clone(),
         strict_breaks: app.strict_breaks,
         palette,
+        font: reading_font(&app.reading_font_family),
+        size: f32::from(app.reading_font_size),
         folds: &tab.folds,
         images: &app.images,
     };
@@ -1232,21 +1307,28 @@ fn reading_pane<'a>(
     // document column is centered at a readable measure (matching the web
     // view's ~46rem) instead of stretching edge to edge. Padding goes on
     // the wrapping container: a Scrollable's own `padding` only insets its
-    // scrollbar, not its content.
+    // scrollbar, not its content. The margin around the column is the
+    // user's choice (None / Compact / Comfortable / Spacious).
+    //
+    // A click in the reading view marks it as the pane in focus, so the
+    // zoom shortcuts act on its font size.
     container(
-        scrollable::scrollable(
-            container(reading::render_doc(&tab.doc, &ctx))
-                .max_width(736)
-                .width(Length::Fill)
-                .align_x(alignment::Horizontal::Center),
+        cosmic::iced::widget::mouse_area(
+            scrollable::scrollable(
+                container(reading::render_doc(&tab.doc, &ctx))
+                    .max_width(736)
+                    .width(Length::Fill)
+                    .align_x(alignment::Horizontal::Center),
+            )
+            .id(Id::new(READING_SCROLL))
+            .width(Length::Fill)
+            .height(Length::Fill),
         )
-        .id(Id::new(READING_SCROLL))
-        .width(Length::Fill)
-        .height(Length::Fill),
+        .on_press(Message::ReadingClicked),
     )
     .width(Length::Fill)
     .height(Length::Fill)
-    .padding(16)
+    .padding(app.reading_margin.padding())
     .into()
 }
 
@@ -1269,6 +1351,8 @@ fn live_pane<'a>(
         from: tab.path.clone(),
         strict_breaks: app.strict_breaks,
         palette,
+        font: reading_font(&app.reading_font_family),
+        size: f32::from(app.reading_font_size),
         folds: &tab.folds,
         images: &app.images,
     };
@@ -1306,7 +1390,7 @@ fn live_pane<'a>(
     container(pane)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(16)
+        .padding(app.reading_margin.padding())
         .into()
 }
 
@@ -1652,8 +1736,42 @@ pub fn settings_view<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
         .add(stepper(
             "Font size",
             format!("{} px", app.editor_font_size),
-            Message::SettingsFontSize(-2),
-            Message::SettingsFontSize(2),
+            Message::SettingsEditorFontSize(-1),
+            Message::SettingsEditorFontSize(1),
+        ));
+
+    // The reading view has its own font: a custom family (the system
+    // font when the field is empty), its own size, and a margin around
+    // the text column.
+    let margins: Vec<(&'static str, Message)> = crate::settings::ReadingMargin::ALL
+        .iter()
+        .map(|margin| (margin.label(), Message::SettingsReadingMargin(*margin)))
+        .collect();
+    let reading = settings::section().title("Reading");
+    let reading = reading
+        .add(settings::item(
+            "Custom font",
+            text_input("e.g. Iowan Old Style", &app.reading_font_family)
+                .id(Id::new(READING_FONT_INPUT))
+                .on_input(Message::SettingsReadingFontFamily)
+                .width(Length::Fixed(160.0)),
+        ))
+        .add(
+            text(
+                "The font the rendered note uses; empty follows the \
+                    system font. An uninstalled name falls back to it.",
+            )
+            .size(12),
+        )
+        .add(stepper(
+            "Font size",
+            format!("{} px", app.reading_font_size),
+            Message::SettingsReadingFontSize(-1),
+            Message::SettingsReadingFontSize(1),
+        ))
+        .add(settings::item(
+            "Margin",
+            choice(app.reading_margin.label(), &margins),
         ));
 
     let view = settings::section().title("View");
@@ -1773,6 +1891,7 @@ pub fn settings_view<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
             column::Column::new()
                 .spacing(16)
                 .push(editor)
+                .push(reading)
                 .push(view)
                 .push(files),
         )
@@ -1823,6 +1942,27 @@ fn unicode_entry_overlay<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'
         .align_y(alignment::Vertical::Bottom)
         .padding([0, 12, 4, 12])
         .into()
+}
+
+#[cfg(test)]
+mod tab_strip_tests {
+    //! The tab strip shows the note's folder beside its title. A short
+    //! folder keeps the tab narrow; a long one is given a fixed column
+    //! so the ellipsis can cut it instead of pushing the tab off the
+    //! strip.
+
+    use super::*;
+
+    #[test]
+    fn a_short_folder_takes_its_natural_width() {
+        assert_eq!(folder_width("Notes"), Length::Shrink);
+        assert_eq!(folder_width("Journal/2026"), Length::Shrink);
+        // A long path gets a fixed column, so it can be cut off.
+        assert_eq!(
+            folder_width("Journal/2026/04/14/notes"),
+            Length::Fixed(120.0)
+        );
+    }
 }
 
 #[cfg(test)]

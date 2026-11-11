@@ -347,10 +347,10 @@ pub enum Message {
     NavSelect(nav_bar::Id),
     /// A segmented-control item (Source/Reading/Split) was activated.
     PaneActivated(segmented_button::Entity),
-    /// A tab-bar tab was activated; the entity carries the tab index.
-    TabActivated(segmented_button::Entity),
-    /// A tab-bar close button was pressed; the entity carries the tab index.
-    TabCloseRequested(segmented_button::Entity),
+    /// A tab-bar tab was activated; the payload is the tab index.
+    TabActivated(usize),
+    /// A tab-bar close button was pressed; the payload is the tab index.
+    TabCloseRequested(usize),
     EditorAction(Action),
     /// Undo the last edit in the active tab (Ctrl+Z).
     EditorUndo,
@@ -407,8 +407,19 @@ pub enum Message {
     /// Set the custom editor font family (live from the settings
     /// input; empty follows the monospace toggle).
     SettingsEditorFontFamily(String),
-    /// Nudge the editor font size (clamped).
-    SettingsFontSize(i32),
+    /// Nudge the source editor's font size (clamped).
+    SettingsEditorFontSize(i32),
+    /// Set the custom reading-view font family (empty follows the
+    /// system font).
+    SettingsReadingFontFamily(String),
+    /// Nudge the reading view's font size (clamped).
+    SettingsReadingFontSize(i32),
+    /// Choose the margin the reading view leaves around its text.
+    SettingsReadingMargin(settings::ReadingMargin),
+    /// Zoom the pane in focus (Ctrl+= / Ctrl+scroll up).
+    ZoomIn,
+    /// Zoom the pane in focus out (Ctrl+- / Ctrl+scroll down).
+    ZoomOut,
     // --- link updates after rename/move ---
     /// Apply the pending wikilink rewrites (banner confirmation).
     LinkUpdatesApply,
@@ -426,6 +437,15 @@ pub enum Message {
     MouseReleased,
     /// Fresh tree-row bounds from the measure operation.
     TreeBounds(crate::drag::TreeBounds),
+    // --- window and zoom ---
+    /// The mouse wheel turned (global mouse subscription); the value is
+    /// the vertical delta in lines (up is positive).
+    MouseWheel(f32),
+    /// The window was resized (global window subscription); the value is
+    /// the new width in pixels.
+    WindowResized(f32),
+    /// The reading view was clicked: the zoom shortcuts now act on it.
+    ReadingClicked,
     SettingsTheme(settings::ThemeChoice),
     SettingsDefaultPane(PaneMode),
     SettingsHideMdExt(bool),
@@ -515,7 +535,28 @@ pub enum Message {
     /// telling whether a widget already captured it (editor-scoped
     /// bindings capture; we must not double-fire global shortcuts then).
     KeyPressed(cosmic::iced::event::Status, Modifiers, Key),
+    /// A key was released: the modifiers held are updated, so Ctrl+scroll
+    /// stops zooming once Ctrl is let go.
+    KeyReleased(Key),
 }
+
+/// Which pane the zoom shortcuts (Ctrl+= / Ctrl+scroll) act on.
+///
+/// The source editor and the rendered view have independent font sizes,
+/// so the shortcut has to pick one. It follows the pane in focus: the
+/// editor while typing, the reading view while reading.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ZoomTarget {
+    /// The source editor (and the live pane's focused block).
+    #[default]
+    Source,
+    /// The rendered reading view.
+    Reading,
+}
+
+/// The window width (in pixels) below which the split layout folds down
+/// to the source pane: two panes side by side need more room than one.
+pub const NARROW_WINDOW_WIDTH: f32 = 480.0;
 
 pub struct VaultNotes {
     core: Core,
@@ -568,6 +609,24 @@ pub struct VaultNotes {
     pub editor_font_family: String,
     /// Editor font size in pixels.
     pub editor_font_size: u16,
+    /// Custom reading-view font family name; empty follows the system
+    /// font.
+    pub reading_font_family: String,
+    /// Reading-view font size in pixels. The source editor keeps its own
+    /// size, so the two panes are sized independently.
+    pub reading_font_size: u16,
+    /// The margin the reading view leaves around its text column.
+    pub reading_margin: settings::ReadingMargin,
+    /// Which pane the zoom shortcuts act on (the source editor or the
+    /// rendered view). Tracked from the last interaction, so the split
+    /// pane zooms the pane the user is working in.
+    pub zoom_target: ZoomTarget,
+    /// The modifiers held at the last key event (Ctrl+scroll needs to
+    /// know whether Ctrl is down).
+    modifiers: Modifiers,
+    /// The split layout was folded away by a narrow window; restore it
+    /// once the window grows again.
+    restore_split: bool,
     /// Whether the sidebar (file tree and other panels) is shown;
     /// toggled from the titlebar button.
     pub sidebar_open: bool,
@@ -611,8 +670,6 @@ pub struct VaultNotes {
     pub nav_model: nav_bar::Model,
     /// Header pane-mode segmented control (Source/Reading/Split).
     pub pane_model: segmented_button::Model<segmented_button::SingleSelect>,
-    /// Open-note tab strip; entities carry the tab index as data.
-    pub tab_model: segmented_button::Model<segmented_button::SingleSelect>,
 }
 
 /// Id of the inline tree-edit text input (focused when the edit starts).
@@ -632,6 +689,9 @@ pub const ATTACHMENT_INPUT: &str = "attachment-ext-input";
 
 /// Id of the settings drawer's custom editor-font input.
 pub const EDITOR_FONT_INPUT: &str = "editor-font-input";
+
+/// Id of the settings drawer's custom reading-font input.
+pub const READING_FONT_INPUT: &str = "reading-font-input";
 
 /// Id of the note editor itself. A *custom* id makes iced persist the
 /// editor's widget state (its focus) in the UI cache and restore it by
@@ -686,6 +746,23 @@ fn persist_setting(mutate: impl FnOnce(&mut settings::AppSettings)) {
     let mut persisted = settings::load();
     mutate(&mut persisted);
     settings::store(&persisted);
+}
+
+/// A lock for the tests that write the real settings file.
+///
+/// Cargo runs the tests in parallel and the settings are stored with a
+/// load-modify-store, so two tests writing at once would lose a field.
+/// The guard is taken for the whole test.
+#[cfg(test)]
+pub(crate) static SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the settings lock, ignoring a poisoned one (a test that failed
+/// already reported itself).
+#[cfg(test)]
+pub(crate) fn settings_guard() -> std::sync::MutexGuard<'static, ()> {
+    SETTINGS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Normalize a user-typed file extension: trim, drop leading dots,
@@ -1675,28 +1752,18 @@ fn build_pane_model(active: PaneMode) -> segmented_button::Model<segmented_butto
     model
 }
 
-/// A tab strip label: the note title, prefixed with a dot while dirty.
-fn tab_label(tab: &Tab) -> String {
-    let mut label = tab.title();
+/// The two parts of an open tab's label: the note's title (with a dot
+/// in front while it has unsaved edits) and the folder the note sits in
+/// (empty for a note at the vault root).
+///
+/// The tab strip shows the folder dimmed beside the title, so two notes
+/// with the same name can be told apart at a glance.
+pub(crate) fn tab_label_parts(tab: &Tab) -> (String, String) {
+    let mut title = tab.title();
     if tab.is_dirty() {
-        label = format!("• {label}");
+        title = format!("• {title}");
     }
-    label
-}
-
-/// Fill the tab-strip model from the open tabs; the active tab (if any) is
-/// activated and every tab is closable. Entities carry the tab index.
-fn fill_tab_model(
-    model: &mut segmented_button::Model<segmented_button::SingleSelect>,
-    tabs: &[Tab],
-    active: Option<usize>,
-) {
-    for (i, tab) in tabs.iter().enumerate() {
-        model.insert().closable().text(tab_label(tab)).data(i);
-        if active == Some(i) {
-            model.activate_position(i as u16);
-        }
-    }
+    (title, parent_of(&tab.path))
 }
 
 /// Activate the model item whose data equals `data` (nav bar / segmented
@@ -1914,7 +1981,6 @@ impl VaultNotes {
                 // Live-editing state belongs to the previous tab's text.
                 self.live = None;
             }
-            self.sync_tab_model();
             let focus = self.ensure_live_focus();
             return Task::batch([self.sync_window_title(), focus]);
         }
@@ -1925,7 +1991,6 @@ impl VaultNotes {
             .unwrap_or_default();
         self.tabs.push(Tab::open(path, &source));
         self.active = Some(self.tabs.len() - 1);
-        self.sync_tab_model();
         self.live = None;
         let focus = self.ensure_live_focus();
         Task::batch([self.sync_window_title(), focus])
@@ -2017,6 +2082,74 @@ impl VaultNotes {
             .find(|id| self.pane_model.data::<PaneMode>(*id) == Some(&mode));
         if let Some(id) = target {
             self.pane_model.activate(id);
+        }
+    }
+
+    // --- font sizes and zoom ---
+
+    /// Set the source editor's font size (clamped) and persist it.
+    fn set_editor_font_size(&mut self, size: i32) {
+        let size = settings::clamp_font_size(size);
+        self.editor_font_size = size;
+        persist_setting(|s| s.editor_font_size = size);
+    }
+
+    /// Set the reading view's font size (clamped) and persist it.
+    fn set_reading_font_size(&mut self, size: i32) {
+        let size = settings::clamp_font_size(size);
+        self.reading_font_size = size;
+        persist_setting(|s| s.reading_font_size = size);
+    }
+
+    /// The pane the zoom shortcuts act on.
+    ///
+    /// The source editor and the rendered view carry independent font
+    /// sizes, so the shortcut has to pick one. It follows the pane in
+    /// focus: the editor while a note is being edited, the reading view
+    /// while it is being read. The split pane shows both, so it follows
+    /// the last one touched (`zoom_target`).
+    fn zoom_target(&self) -> ZoomTarget {
+        match self.pane {
+            PaneMode::Reading => ZoomTarget::Reading,
+            PaneMode::Source => ZoomTarget::Source,
+            // In the live pane the focused block is a source editor; the
+            // blocks around it are rendered.
+            PaneMode::Live => {
+                if self.live.is_some() {
+                    ZoomTarget::Source
+                } else {
+                    ZoomTarget::Reading
+                }
+            }
+            PaneMode::Split => self.zoom_target,
+        }
+    }
+
+    /// Zoom the pane in focus by `delta` steps (one step = one pixel).
+    fn zoom_font(&mut self, delta: i32) {
+        match self.zoom_target() {
+            ZoomTarget::Source => self.set_editor_font_size(self.editor_font_size as i32 + delta),
+            ZoomTarget::Reading => {
+                self.set_reading_font_size(self.reading_font_size as i32 + delta)
+            }
+        }
+    }
+
+    /// Fold the split layout away in a narrow window (and bring it back
+    /// when the window grows again).
+    ///
+    /// Two panes side by side need more room than one: below
+    /// `NARROW_WINDOW_WIDTH` the split view collapses to the source
+    /// pane. The layout returns when the window is wide enough again —
+    /// unless the user picked another pane in the meantime.
+    fn apply_window_width(&mut self, width: f32) {
+        let narrow = width < NARROW_WINDOW_WIDTH;
+        if narrow && self.pane == PaneMode::Split {
+            self.restore_split = true;
+            self.set_pane(PaneMode::Source);
+        } else if !narrow && self.restore_split && self.pane == PaneMode::Source {
+            self.restore_split = false;
+            self.set_pane(PaneMode::Split);
         }
     }
 
@@ -2207,7 +2340,6 @@ impl VaultNotes {
         if is_edit {
             push_undo(&mut self.tabs[tab_idx]);
         }
-        let was_dirty = self.tabs[tab_idx].is_dirty();
         if let Some(live) = self.live.as_mut() {
             for action in actions {
                 live.editor.perform(action);
@@ -2231,9 +2363,6 @@ impl VaultNotes {
             // Any editor activity resets the idle timer: the user is
             // still working here.
             self.last_edit = Some(std::time::Instant::now());
-            if tab.is_dirty() != was_dirty {
-                self.sync_tab_text(tab_idx);
-            }
         }
         let (line, column) = self
             .live
@@ -2387,13 +2516,9 @@ impl VaultNotes {
         };
         let tab = &mut self.tabs[tab_idx];
         push_undo(tab);
-        let was_dirty = tab.is_dirty();
         tab.content = Content::with_text(&new_text);
         tab.refresh_doc();
         self.last_edit = Some(std::time::Instant::now());
-        if tab.is_dirty() != was_dirty {
-            self.sync_tab_text(tab_idx);
-        }
         // One newline before the caret is gone: the caret absolute file
         // line moves up by one while its column stays at the line start.
         self.live_aim(current.start_line - 2, 0);
@@ -2440,13 +2565,9 @@ impl VaultNotes {
         };
         let tab = &mut self.tabs[tab_idx];
         push_undo(tab);
-        let was_dirty = tab.is_dirty();
         tab.content = Content::with_text(&new_text);
         tab.refresh_doc();
         self.last_edit = Some(std::time::Instant::now());
-        if tab.is_dirty() != was_dirty {
-            self.sync_tab_text(tab_idx);
-        }
         // The newline is deleted after the caret: its absolute file line
         // and column are unchanged, and the region still starts here.
         self.live_aim(current.start_line - 1 + line, column);
@@ -2510,13 +2631,9 @@ impl VaultNotes {
         new_text.push_str(&text[end..]);
         let tab = &mut self.tabs[tab_idx];
         push_undo(tab);
-        let was_dirty = tab.is_dirty();
         tab.content = Content::with_text(&new_text);
         tab.refresh_doc();
         self.last_edit = Some(std::time::Instant::now());
-        if tab.is_dirty() != was_dirty {
-            self.sync_tab_text(tab_idx);
-        }
         // The caret lands where the deleted word started.
         let (line, column) = position_of(&new_text, start);
         self.live_aim(line, column);
@@ -2575,14 +2692,10 @@ impl VaultNotes {
         let base = tab.base_text.clone();
         match write_tab(vault, tab, &base) {
             Ok(_) => {
-                let was_dirty = tab.is_dirty();
                 tab.base_text = tab.content.text();
                 tab.refresh_doc();
                 self.error = None;
                 self.rebuild_index();
-                if was_dirty {
-                    self.sync_tab_text(idx);
-                }
                 true
             }
             Err(VaultError::Write(vault_core::WriteError::ExternallyModified)) => {
@@ -2624,28 +2737,9 @@ impl VaultNotes {
         };
         // The removed tab may have been the one being live-edited.
         self.live = None;
-        self.sync_tab_model();
         let title = self.sync_window_title();
         let focus = self.ensure_live_focus();
         Task::batch([title, focus])
-    }
-
-    /// Rebuild the tab-strip model from `tabs` + `active` (after every
-    /// structural tab change: open, close, select, rename).
-    fn sync_tab_model(&mut self) {
-        self.tab_model = segmented_button::Model::default();
-        fill_tab_model(&mut self.tab_model, &self.tabs, self.active);
-    }
-
-    /// Update one tab's strip text (the dirty dot flips without a rebuild).
-    fn sync_tab_text(&mut self, idx: usize) {
-        let Some(label) = self.tabs.get(idx).map(tab_label) else {
-            return;
-        };
-        let Some(id) = self.tab_model.iter().nth(idx) else {
-            return;
-        };
-        self.tab_model.text_set(id, label);
     }
 
     /// Activate the nav-bar item for `panel` (after a programmatic switch).
@@ -2670,7 +2764,6 @@ impl VaultNotes {
         if actions.is_empty() {
             return;
         }
-        let was_dirty = self.tabs[idx].is_dirty();
         {
             let tab = &mut self.tabs[idx];
             push_undo(tab);
@@ -2683,9 +2776,6 @@ impl VaultNotes {
             tab.refresh_doc();
         }
         self.last_edit = Some(std::time::Instant::now());
-        if self.tabs[idx].is_dirty() != was_dirty {
-            self.sync_tab_text(idx);
-        }
         // A command can move the cursor into or out of an unclosed `[[`.
         self.update_wiki_complete();
     }
@@ -2696,7 +2786,6 @@ impl VaultNotes {
     /// A selection is replaced by the reference; the definitions are
     /// normalized (one blank line before each) on the way.
     fn insert_footnote_at_cursor(&mut self, idx: usize) {
-        let was_dirty = self.tabs[idx].is_dirty();
         {
             let tab = &mut self.tabs[idx];
             push_undo(tab);
@@ -2717,9 +2806,6 @@ impl VaultNotes {
             tab.refresh_doc();
         }
         self.last_edit = Some(std::time::Instant::now());
-        if self.tabs[idx].is_dirty() != was_dirty {
-            self.sync_tab_text(idx);
-        }
         self.update_wiki_complete();
     }
 
@@ -2855,7 +2941,6 @@ impl VaultNotes {
         let Some(found) = matches.get(index).copied() else {
             return Task::none();
         };
-        let was_dirty = self.tabs[idx].is_dirty();
         // Where the live caret is, so the buffer can re-aim after the
         // whole-text replacement (the focused region may have changed).
         let aim = self.live_aim_marker(idx);
@@ -2876,9 +2961,6 @@ impl VaultNotes {
             tab.refresh_doc();
         }
         self.last_edit = Some(std::time::Instant::now());
-        if self.tabs[idx].is_dirty() != was_dirty {
-            self.sync_tab_text(idx);
-        }
         if let Some((line, column)) = aim {
             self.live_aim(line, column);
         }
@@ -2914,7 +2996,6 @@ impl VaultNotes {
         if matches.is_empty() {
             return Task::none();
         }
-        let was_dirty = self.tabs[idx].is_dirty();
         // Same live-buffer rule as the single replace: re-aim after the
         // whole-text splice.
         let aim = self.live_aim_marker(idx);
@@ -2926,9 +3007,6 @@ impl VaultNotes {
             tab.refresh_doc();
         }
         self.last_edit = Some(std::time::Instant::now());
-        if self.tabs[idx].is_dirty() != was_dirty {
-            self.sync_tab_text(idx);
-        }
         if let Some((line, column)) = aim {
             self.live_aim(line, column);
         }
@@ -3202,7 +3280,6 @@ impl VaultNotes {
             self.dismiss_editor_overlays();
             return Task::none();
         };
-        let was_dirty = self.tabs[idx].is_dirty();
         {
             let tab = &mut self.tabs[idx];
             push_undo(tab);
@@ -3230,9 +3307,6 @@ impl VaultNotes {
             tab.refresh_doc();
         }
         self.last_edit = Some(std::time::Instant::now());
-        if self.tabs[idx].is_dirty() != was_dirty {
-            self.sync_tab_text(idx);
-        }
         self.dismiss_editor_overlays();
         Task::none()
     }
@@ -3401,7 +3475,6 @@ impl VaultNotes {
                     }
                 }
                 self.rebuild_index();
-                self.sync_tab_model();
                 self.pending_links = pending;
             }
             Some(Err(error)) => self.error = Some(format!("cannot rename {old}: {error}")),
@@ -3589,13 +3662,10 @@ impl VaultNotes {
         for (target, new_text) in rewrites {
             match target {
                 Target::Tab(idx) => {
-                    {
-                        let tab = &mut self.tabs[idx];
-                        push_undo(tab);
-                        tab.content = Content::with_text(&new_text);
-                        tab.refresh_doc();
-                    }
-                    self.sync_tab_text(idx);
+                    let tab = &mut self.tabs[idx];
+                    push_undo(tab);
+                    tab.content = Content::with_text(&new_text);
+                    tab.refresh_doc();
                 }
                 Target::File(path, original) => {
                     if let Some(vault) = self.vault.as_mut() {
@@ -3771,6 +3841,12 @@ impl cosmic::Application for VaultNotes {
             editor_font_mono: persisted.editor_font_mono,
             editor_font_family: persisted.editor_font_family.clone(),
             editor_font_size: persisted.editor_font_size,
+            reading_font_family: persisted.reading_font_family.clone(),
+            reading_font_size: persisted.reading_font_size,
+            reading_margin: persisted.reading_margin,
+            zoom_target: ZoomTarget::default(),
+            modifiers: Modifiers::default(),
+            restore_split: false,
             sidebar_open: persisted.sidebar_open,
             tree_drag: None,
             last_cursor: None,
@@ -3790,7 +3866,6 @@ impl cosmic::Application for VaultNotes {
             live: None,
             nav_model: build_nav_model(),
             pane_model: build_pane_model(persisted.default_pane),
-            tab_model: segmented_button::Model::default(),
         };
         app.core.set_header_title("Vault Notes".to_string());
 
@@ -3864,7 +3939,6 @@ impl cosmic::Application for VaultNotes {
                     }
                 }
                 self.error = None;
-                self.sync_tab_model();
                 Task::none()
             }
             Message::BannerOverwrite => {
@@ -3890,7 +3964,6 @@ impl cosmic::Application for VaultNotes {
                     }
                 }
                 self.rebuild_index();
-                self.sync_tab_model();
                 Task::none()
             }
             Message::BannerDismiss => {
@@ -3914,6 +3987,25 @@ impl cosmic::Application for VaultNotes {
                 self.last_cursor = Some(pos);
                 self.advance_tree_drag(pos);
                 self.measure_tree_bounds_if_needed()
+            }
+            Message::MouseWheel(delta) => {
+                // Ctrl+scroll zooms the pane in focus, like a browser.
+                // Without Ctrl the wheel belongs to the scrollable under
+                // the pointer, which handles it on its own.
+                if self.modifiers.control() && delta != 0.0 {
+                    self.zoom_font(if delta > 0.0 { 1 } else { -1 });
+                }
+                Task::none()
+            }
+            Message::WindowResized(width) => {
+                self.apply_window_width(width);
+                Task::none()
+            }
+            Message::ReadingClicked => {
+                // The reading view has the focus now: the zoom shortcuts
+                // act on its font size.
+                self.zoom_target = ZoomTarget::Reading;
+                Task::none()
             }
             Message::MousePressed => {
                 // Arm a possible tree drag at the cursor. Only when the
@@ -4002,6 +4094,9 @@ impl cosmic::Application for VaultNotes {
             Message::PaneActivated(id) => {
                 self.pane_model.activate(id);
                 if let Some(mode) = self.pane_model.data::<PaneMode>(id).copied() {
+                    // The user picked a pane: the narrow-window fold
+                    // must not undo that choice later.
+                    self.restore_split = false;
                     self.set_pane(mode);
                 }
                 // Live-editing state belongs to the pane; leaving it (or
@@ -4010,13 +4105,10 @@ impl cosmic::Application for VaultNotes {
                 self.dismiss_editor_overlays();
                 self.ensure_live_focus()
             }
-            Message::TabActivated(id) => {
+            Message::TabActivated(idx) => {
                 let was = self.active;
-                self.tab_model.activate(id);
-                if let Some(idx) = self.tab_model.data::<usize>(id).copied() {
-                    if idx < self.tabs.len() {
-                        self.active = Some(idx);
-                    }
+                if idx < self.tabs.len() {
+                    self.active = Some(idx);
                 }
                 // Live-editing state belongs to the previous tab's text.
                 if was != self.active {
@@ -4028,11 +4120,11 @@ impl cosmic::Application for VaultNotes {
                 let focus = self.ensure_live_focus();
                 Task::batch([title, scroll, focus])
             }
-            Message::TabCloseRequested(id) => match self.tab_model.data::<usize>(id).copied() {
-                Some(idx) => self.close_tab(idx),
-                None => Task::none(),
-            },
+            Message::TabCloseRequested(idx) => self.close_tab(idx),
             Message::EditorAction(action) => {
+                // The source editor has the focus: the zoom shortcuts act
+                // on its font size.
+                self.zoom_target = ZoomTarget::Source;
                 // In live preview the action edits the focused region's
                 // buffer and splices back into the note (live_action).
                 if self.pane == PaneMode::Live {
@@ -4045,7 +4137,6 @@ impl cosmic::Application for VaultNotes {
                     if is_edit {
                         push_undo(tab);
                     }
-                    let was_dirty = tab.is_dirty();
                     tab.content.perform(action);
                     if is_edit {
                         tab.refresh_doc();
@@ -4053,9 +4144,6 @@ impl cosmic::Application for VaultNotes {
                         // resets the idle timer: the user is still working
                         // here.
                         self.last_edit = Some(std::time::Instant::now());
-                    }
-                    if tab.is_dirty() != was_dirty {
-                        self.sync_tab_text(idx);
                     }
                 }
                 // Every editor interaction may open, move through, or close
@@ -4088,14 +4176,10 @@ impl cosmic::Application for VaultNotes {
                     // Where the live caret is, so it can re-aim after the
                     // text is restored.
                     let aim = self.live_aim_marker(idx);
-                    let was_dirty = self.tabs[idx].is_dirty();
                     let tab = &mut self.tabs[idx];
                     if undo_tab(tab) {
                         tab.refresh_doc();
                         self.last_edit = Some(std::time::Instant::now());
-                        if tab.is_dirty() != was_dirty {
-                            self.sync_tab_text(idx);
-                        }
                     }
                     if let Some((line, column)) = aim {
                         self.live_aim(line, column);
@@ -4107,14 +4191,10 @@ impl cosmic::Application for VaultNotes {
             Message::EditorRedo => {
                 if let Some(idx) = self.active {
                     let aim = self.live_aim_marker(idx);
-                    let was_dirty = self.tabs[idx].is_dirty();
                     let tab = &mut self.tabs[idx];
                     if redo_tab(tab) {
                         tab.refresh_doc();
                         self.last_edit = Some(std::time::Instant::now());
-                        if tab.is_dirty() != was_dirty {
-                            self.sync_tab_text(idx);
-                        }
                     }
                     if let Some((line, column)) = aim {
                         self.live_aim(line, column);
@@ -4271,7 +4351,6 @@ impl cosmic::Application for VaultNotes {
                 let selection = self.active_tab().and_then(|tab| tab.content.selection());
                 match (self.active, selection) {
                     (Some(idx), Some(selection)) => {
-                        let was_dirty = self.tabs[idx].is_dirty();
                         {
                             let tab = &mut self.tabs[idx];
                             push_undo(tab);
@@ -4279,9 +4358,6 @@ impl cosmic::Application for VaultNotes {
                             tab.refresh_doc();
                         }
                         self.last_edit = Some(std::time::Instant::now());
-                        if self.tabs[idx].is_dirty() != was_dirty {
-                            self.sync_tab_text(idx);
-                        }
                         self.update_wiki_complete();
                         let copied = cosmic::iced::clipboard::write(selection);
                         let scroll = self.sync_preview_scroll();
@@ -4296,7 +4372,6 @@ impl cosmic::Application for VaultNotes {
             Message::EditorPasteText(maybe_text) => {
                 if let Some(text) = maybe_text {
                     if let Some(idx) = self.active {
-                        let was_dirty = self.tabs[idx].is_dirty();
                         {
                             let tab = &mut self.tabs[idx];
                             push_undo(tab);
@@ -4305,9 +4380,6 @@ impl cosmic::Application for VaultNotes {
                             tab.refresh_doc();
                         }
                         self.last_edit = Some(std::time::Instant::now());
-                        if self.tabs[idx].is_dirty() != was_dirty {
-                            self.sync_tab_text(idx);
-                        }
                         self.update_wiki_complete();
                     }
                 }
@@ -4352,10 +4424,30 @@ impl cosmic::Application for VaultNotes {
                 persist_setting(|s| s.editor_font_family = self.editor_font_family.clone());
                 Task::none()
             }
-            Message::SettingsFontSize(delta) => {
-                let size = (self.editor_font_size as i32 + delta).clamp(10, 28) as u16;
-                self.editor_font_size = size;
-                persist_setting(|s| s.editor_font_size = size);
+            Message::SettingsEditorFontSize(delta) => {
+                self.set_editor_font_size(self.editor_font_size as i32 + delta);
+                Task::none()
+            }
+            Message::SettingsReadingFontFamily(family) => {
+                self.reading_font_family = family;
+                persist_setting(|s| s.reading_font_family = self.reading_font_family.clone());
+                Task::none()
+            }
+            Message::SettingsReadingFontSize(delta) => {
+                self.set_reading_font_size(self.reading_font_size as i32 + delta);
+                Task::none()
+            }
+            Message::SettingsReadingMargin(margin) => {
+                self.reading_margin = margin;
+                persist_setting(|s| s.reading_margin = margin);
+                Task::none()
+            }
+            Message::ZoomIn => {
+                self.zoom_font(1);
+                Task::none()
+            }
+            Message::ZoomOut => {
+                self.zoom_font(-1);
                 Task::none()
             }
             Message::SettingsTheme(choice) => {
@@ -4683,6 +4775,11 @@ impl cosmic::Application for VaultNotes {
                 self.open_tab(path)
             }
             Message::KeyPressed(status, modifiers, key) => {
+                // Remember the modifiers for the wheel: Ctrl+scroll zooms
+                // the text, and the wheel event itself carries no
+                // modifiers. Every key event reports the modifiers held
+                // at that moment, including the Ctrl press itself.
+                self.modifiers = modifiers;
                 // Editor-scoped bindings (and any focused widget) capture
                 // their events; a captured key must not also fire a global
                 // shortcut. Our own text inputs (switcher, tree rename) are
@@ -4762,11 +4859,23 @@ impl cosmic::Application for VaultNotes {
                             Some(idx) => self.update(Message::TabClose(idx)),
                             None => Task::none(),
                         },
+                        // Ctrl+= / Ctrl+- zoom the pane in focus. The keys
+                        // arrive unmodified ("=" is the base key, "+" is
+                        // its shifted form), so both spellings of each
+                        // step are matched.
+                        Key::Character(c) if c == "=" || c == "+" => self.update(Message::ZoomIn),
+                        Key::Character(c) if c == "-" => self.update(Message::ZoomOut),
                         _ => Task::none(),
                     }
                 } else {
                     Task::none()
                 }
+            }
+            Message::KeyReleased(key) => {
+                // A modifier that goes up is no longer held: Ctrl+scroll
+                // must stop zooming once Ctrl is let go.
+                self.modifiers = released_modifier(self.modifiers, &key);
+                Task::none()
             }
             Message::OpenExternal(url) => {
                 #[cfg(target_os = "linux")]
@@ -4822,6 +4931,12 @@ impl cosmic::Application for VaultNotes {
                 modifiers,
                 ..
             }) => Some(Message::KeyPressed(status, modifiers, key)),
+            // A released modifier key ends its hold: the wheel needs to
+            // know when Ctrl is let go.
+            cosmic::iced::Event::Keyboard(cosmic::iced::keyboard::Event::KeyReleased {
+                key,
+                ..
+            }) => Some(Message::KeyReleased(key)),
             _ => None,
         });
         let mut subs = vec![keys];
@@ -4846,11 +4961,53 @@ impl cosmic::Application for VaultNotes {
                     cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::ButtonReleased(
                         cosmic::iced::mouse::Button::Left,
                     )) => Some(Message::MouseReleased),
+                    // The wheel zooms the text when Ctrl is held; the
+                    // event itself carries no modifiers, so update reads
+                    // the ones from the last key event.
+                    cosmic::iced::Event::Mouse(cosmic::iced::mouse::Event::WheelScrolled {
+                        delta,
+                    }) => Some(Message::MouseWheel(wheel_delta(delta))),
+                    _ => None,
+                },
+            ));
+            // The window's width decides whether the split layout fits:
+            // below the threshold it folds down to the source pane.
+            subs.push(cosmic::iced::event::listen_with(
+                |event, _status, _window| match event {
+                    cosmic::iced::Event::Window(cosmic::iced::window::Event::Resized(size)) => {
+                        Some(Message::WindowResized(size.width))
+                    }
                     _ => None,
                 },
             ));
         }
         cosmic::iced::Subscription::batch(subs)
+    }
+}
+
+/// The vertical wheel movement in lines (up is positive).
+///
+/// A line-based wheel reports whole lines; a pixel-based one (touchpad
+/// or high-resolution wheel) is scaled down to something line-like, so
+/// one notch is one step either way.
+fn wheel_delta(delta: cosmic::iced::mouse::ScrollDelta) -> f32 {
+    match delta {
+        cosmic::iced::mouse::ScrollDelta::Lines { x: _, y } => y,
+        cosmic::iced::mouse::ScrollDelta::Pixels { x: _, y } => y / 40.0,
+    }
+}
+
+/// The modifiers still held after `key` is released.
+///
+/// The wheel event carries no modifiers, so the app tracks them from the
+/// key events: a modifier key that goes up is no longer held.
+fn released_modifier(held: Modifiers, key: &Key) -> Modifiers {
+    match key {
+        Key::Named(Named::Control) => held - Modifiers::CTRL,
+        Key::Named(Named::Shift) => held - Modifiers::SHIFT,
+        Key::Named(Named::Alt) => held - Modifiers::ALT,
+        Key::Named(Named::Super) => held - Modifiers::LOGO,
+        _ => held,
     }
 }
 
@@ -5230,42 +5387,26 @@ mod chrome_model_tests {
     }
 
     #[test]
-    fn tab_model_mirrors_tabs_and_marks_the_active_one() {
-        let tabs = vec![
-            Tab::open("A.md".to_string(), "a"),
-            Tab::open("B.md".to_string(), "b"),
-            Tab::open("C.md".to_string(), "c"),
-        ];
-        let mut model = segmented_button::Model::default();
-        fill_tab_model(&mut model, &tabs, Some(1));
-        assert_eq!(model.len(), 3);
-        assert_eq!(model.data::<usize>(model.active()), Some(&1));
-        // Every tab is closable.
-        for id in model.iter() {
-            assert!(model.is_closable(id));
-        }
-        // Labels are the file stems.
-        let labels: Vec<String> = model
-            .iter()
-            .map(|id| model.text(id).unwrap().to_string())
-            .collect();
-        assert_eq!(labels, ["A", "B", "C"]);
+    fn tab_labels_show_the_title_and_the_folder_beside_it() {
+        let tab = Tab::open("Journal/2026/D.md".to_string(), "written");
+        // The title is the file stem; the folder rides along dimmed, so
+        // two notes with the same name can be told apart.
+        let (title, folder) = tab_label_parts(&tab);
+        assert_eq!(title, "D");
+        assert_eq!(folder, "Journal/2026");
+
+        // A note at the vault root has no folder to show.
+        let root = Tab::open("D.md".to_string(), "written");
+        assert_eq!(tab_label_parts(&root), ("D".to_string(), String::new()));
     }
 
     #[test]
     fn tab_labels_mark_dirty_tabs() {
         let mut tab = Tab::open("D.md".to_string(), "written");
-        assert_eq!(tab_label(&tab), "D");
+        assert_eq!(tab_label_parts(&tab).0, "D");
         // Same-module test: force dirtiness by diverging base from content.
         tab.base_text = String::new();
-        assert_eq!(tab_label(&tab), "• D");
-    }
-
-    #[test]
-    fn empty_tab_list_yields_an_empty_model() {
-        let mut model = segmented_button::Model::default();
-        fill_tab_model(&mut model, &[], None);
-        assert_eq!(model.len(), 0);
+        assert_eq!(tab_label_parts(&tab).0, "• D");
     }
 }
 
@@ -6169,6 +6310,12 @@ mod find_tests {
             editor_font_mono: true,
             editor_font_family: String::new(),
             editor_font_size: 14,
+            reading_font_family: String::new(),
+            reading_font_size: 16,
+            reading_margin: settings::ReadingMargin::default(),
+            zoom_target: ZoomTarget::default(),
+            modifiers: Modifiers::default(),
+            restore_split: false,
             sidebar_open: true,
             tree_drag: None,
             last_cursor: None,
@@ -6188,7 +6335,6 @@ mod find_tests {
             live: None,
             nav_model: build_nav_model(),
             pane_model: build_pane_model(PaneMode::default()),
-            tab_model: segmented_button::Model::default(),
         };
         app.tabs.push(Tab::open("t.md".to_string(), text));
         app.active = Some(0);
@@ -7163,6 +7309,7 @@ mod link_target_tests {
 
     #[test]
     fn settings_choice_updates_the_format() {
+        let _guard = settings_guard();
         let mut app = find_tests::test_app_with_tab("");
         let _ = app.update(Message::SettingsLinkFormat(LinkPathFormat::Relative));
         assert_eq!(app.link_path_format, LinkPathFormat::Relative);
@@ -7335,6 +7482,7 @@ mod sidebar_collapse_tests {
 
     #[test]
     fn toggling_the_sidebar_flips_state_and_persists() {
+        let _guard = settings_guard();
         let mut app = find_tests::test_app_with_tab("");
         assert!(app.sidebar_open, "starts open");
         let _ = app.update(Message::ToggleSidebar);
@@ -7399,6 +7547,7 @@ mod editor_font_tests {
 
     #[test]
     fn the_custom_font_family_persists_from_the_settings_input() {
+        let _guard = settings_guard();
         let mut app = find_tests::test_app_with_tab("");
         let _ = app.update(Message::SettingsEditorFontFamily("Fira Code".into()));
         assert_eq!(app.editor_font_family, "Fira Code");
@@ -7407,6 +7556,225 @@ mod editor_font_tests {
         let _ = app.update(Message::SettingsEditorFontFamily(String::new()));
         assert!(app.editor_font_family.is_empty());
         assert!(crate::settings::load().editor_font_family.is_empty());
+    }
+
+    #[test]
+    fn the_reading_view_has_its_own_family_and_size() {
+        let _guard = settings_guard();
+        let mut app = find_tests::test_app_with_tab("");
+        let before = crate::settings::load();
+        let (family, size) = (before.reading_font_family, before.reading_font_size);
+        let reading = app.reading_font_size;
+
+        let _ = app.update(Message::SettingsReadingFontFamily("Iowan Old Style".into()));
+        assert_eq!(app.reading_font_family, "Iowan Old Style");
+        assert_eq!(
+            crate::settings::load().reading_font_family,
+            "Iowan Old Style"
+        );
+        // The source editor's own font is untouched by the reading one.
+        assert_eq!(app.editor_font_family, "");
+
+        let _ = app.update(Message::SettingsReadingFontSize(3));
+        assert_eq!(
+            app.reading_font_size,
+            crate::settings::clamp_font_size(reading as i32 + 3)
+        );
+        assert_eq!(app.editor_font_size, 14, "the source size is its own");
+
+        persist_setting(move |s| {
+            s.reading_font_family = family;
+            s.reading_font_size = size;
+        });
+    }
+
+    #[test]
+    fn font_sizes_take_any_value_inside_the_range() {
+        let _guard = settings_guard();
+        let mut app = find_tests::test_app_with_tab("");
+        let before = crate::settings::load();
+        let (editor, reading) = (before.editor_font_size, before.reading_font_size);
+        let (editor_size, reading_size) = (app.editor_font_size, app.reading_font_size);
+
+        // One pixel at a time: the sizes are arbitrary, not stepped.
+        let _ = app.update(Message::SettingsEditorFontSize(1));
+        assert_eq!(
+            app.editor_font_size,
+            crate::settings::clamp_font_size(editor_size as i32 + 1)
+        );
+        let _ = app.update(Message::SettingsReadingFontSize(-1));
+        assert_eq!(
+            app.reading_font_size,
+            crate::settings::clamp_font_size(reading_size as i32 - 1)
+        );
+
+        // The ends are held, so a runaway shortcut cannot make the text
+        // vanish.
+        let _ = app.update(Message::SettingsEditorFontSize(1000));
+        assert_eq!(app.editor_font_size, crate::settings::MAX_FONT_SIZE);
+        let _ = app.update(Message::SettingsReadingFontSize(-1000));
+        assert_eq!(app.reading_font_size, crate::settings::MIN_FONT_SIZE);
+
+        persist_setting(move |s| {
+            s.editor_font_size = editor;
+            s.reading_font_size = reading;
+        });
+    }
+
+    #[test]
+    fn the_reading_margin_persists_and_widens_the_gutter() {
+        let _guard = settings_guard();
+        let mut app = find_tests::test_app_with_tab("");
+        let before = crate::settings::load().reading_margin;
+
+        let _ = app.update(Message::SettingsReadingMargin(
+            crate::settings::ReadingMargin::Spacious,
+        ));
+        assert_eq!(app.reading_margin, crate::settings::ReadingMargin::Spacious);
+        assert_eq!(
+            crate::settings::load().reading_margin,
+            crate::settings::ReadingMargin::Spacious
+        );
+        // A wider margin leaves a wider gutter.
+        assert!(
+            crate::settings::ReadingMargin::Spacious.padding()
+                > crate::settings::ReadingMargin::Compact.padding()
+        );
+
+        persist_setting(move |s| s.reading_margin = before);
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+    use cosmic::app::Application as _;
+
+    /// A key event that only records the modifiers held (the global
+    /// handler ignores the key itself).
+    fn press_with(modifiers: Modifiers) -> Message {
+        Message::KeyPressed(
+            cosmic::iced::event::Status::Ignored,
+            modifiers,
+            Key::Character("z".into()),
+        )
+    }
+
+    /// The zoom shortcuts persist the size they change, so the tests
+    /// take the settings lock and put the stored sizes back.
+    fn restore_sizes() {
+        let before = crate::settings::load();
+        let (editor, reading) = (before.editor_font_size, before.reading_font_size);
+        persist_setting(move |s| {
+            s.editor_font_size = editor;
+            s.reading_font_size = reading;
+        });
+    }
+
+    #[test]
+    fn the_zoom_shortcut_follows_the_pane_in_focus() {
+        let _guard = settings_guard();
+        let mut app = find_tests::test_app_with_tab("");
+        // In the source pane the editor's size moves.
+        app.pane = PaneMode::Source;
+        let editor = app.editor_font_size;
+        let reading = app.reading_font_size;
+        let _ = app.update(Message::ZoomIn);
+        assert_eq!(app.editor_font_size, editor + 1);
+        assert_eq!(
+            app.reading_font_size, reading,
+            "the reading size is its own"
+        );
+
+        // In the reading pane the reading size moves instead.
+        app.pane = PaneMode::Reading;
+        let _ = app.update(Message::ZoomIn);
+        assert_eq!(app.reading_font_size, reading + 1);
+        assert_eq!(app.editor_font_size, editor + 1, "the editor size stays");
+
+        restore_sizes();
+    }
+
+    #[test]
+    fn the_split_pane_zooms_the_pane_that_was_touched_last() {
+        let _guard = settings_guard();
+        let mut app = find_tests::test_app_with_tab("");
+        app.pane = PaneMode::Split;
+        // The editor is the target until the reading view is touched.
+        let _ = app.update(Message::ZoomIn);
+        assert_eq!(app.editor_font_size, 15);
+        assert_eq!(app.reading_font_size, 16);
+
+        // Clicking the reading view moves the target there.
+        let _ = app.update(Message::ReadingClicked);
+        let _ = app.update(Message::ZoomIn);
+        assert_eq!(app.reading_font_size, 17);
+        assert_eq!(app.editor_font_size, 15);
+
+        restore_sizes();
+    }
+
+    #[test]
+    fn ctrl_scroll_zooms_and_a_plain_wheel_does_not() {
+        let _guard = settings_guard();
+        let mut app = find_tests::test_app_with_tab("");
+        app.pane = PaneMode::Reading;
+
+        // A wheel without Ctrl belongs to the scrollable under the
+        // pointer: nothing is zoomed.
+        let _ = app.update(Message::MouseWheel(1.0));
+        assert_eq!(app.reading_font_size, 16);
+
+        // With Ctrl held, scrolling up zooms in and down zooms out.
+        let _ = app.update(press_with(Modifiers::CTRL));
+        let _ = app.update(Message::MouseWheel(1.0));
+        assert_eq!(app.reading_font_size, 17);
+        let _ = app.update(Message::MouseWheel(-1.0));
+        assert_eq!(app.reading_font_size, 16);
+
+        // Letting go of Ctrl ends the zoom: the wheel belongs to the
+        // scrollable again.
+        let _ = app.update(Message::KeyReleased(Key::Named(Named::Control)));
+        let _ = app.update(Message::MouseWheel(1.0));
+        assert_eq!(app.reading_font_size, 16);
+
+        restore_sizes();
+    }
+
+    #[test]
+    fn a_narrow_window_folds_the_split_pane_away() {
+        let mut app = find_tests::test_app_with_tab("");
+        app.pane = PaneMode::Split;
+
+        // Below the threshold two panes do not fit: the split view
+        // collapses to the source pane.
+        let _ = app.update(Message::WindowResized(NARROW_WINDOW_WIDTH - 1.0));
+        assert_eq!(app.pane, PaneMode::Source);
+
+        // Wide enough again: the split layout comes back.
+        let _ = app.update(Message::WindowResized(NARROW_WINDOW_WIDTH + 1.0));
+        assert_eq!(app.pane, PaneMode::Split);
+    }
+
+    #[test]
+    fn a_pane_the_user_picks_is_not_overridden_by_the_window_width() {
+        let mut app = find_tests::test_app_with_tab("");
+        app.pane = PaneMode::Split;
+        let _ = app.update(Message::WindowResized(NARROW_WINDOW_WIDTH - 1.0));
+        assert_eq!(app.pane, PaneMode::Source);
+
+        // The user asks for the reading view while the window is narrow.
+        let reading = app
+            .pane_model
+            .iter()
+            .find(|id| app.pane_model.data::<PaneMode>(*id) == Some(&PaneMode::Reading))
+            .expect("the reading pane button exists");
+        let _ = app.update(Message::PaneActivated(reading));
+        assert_eq!(app.pane, PaneMode::Reading);
+
+        // Widening the window must not undo that choice.
+        let _ = app.update(Message::WindowResized(NARROW_WINDOW_WIDTH + 1.0));
+        assert_eq!(app.pane, PaneMode::Reading);
     }
 }
 
@@ -8393,6 +8761,7 @@ mod tree_sort_tests {
 
     #[test]
     fn the_sort_order_moves_the_notes() {
+        let _guard = settings_guard();
         let (_tmp, mut app) = app_with(&[("b.md", ""), ("a.md", ""), ("Folder/c.md", "")]);
         // The name order is the default: folders first, notes A to Z.
         assert_eq!(labels(&app), ["Folder", "c.md", "a.md", "b.md"]);

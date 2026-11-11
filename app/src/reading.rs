@@ -41,11 +41,33 @@ pub struct Ctx<'a> {
     pub from: String,
     pub strict_breaks: bool,
     pub palette: Palette,
+    /// The font the rendered prose uses: the user's custom family, or
+    /// the system font when none is set.
+    pub font: Font,
+    /// The base text size in pixels. Headings scale from it, so the
+    /// whole reading view grows and shrinks together.
+    pub size: f32,
     /// Callouts toggled by hand (tab-scoped, index-based).
     pub folds: &'a HashSet<u64>,
     /// Decoded images, keyed by vault-relative path, so re-renders do not
     /// re-decode. `RefCell` because `view` takes `&self`.
     pub images: &'a RefCell<HashMap<String, ImageHandle>>,
+}
+
+/// The size of a heading at `level`, scaled from the reading view's base
+/// size.
+///
+/// The factors keep the hierarchy the fixed sizes had (26/22/19/18/16 at
+/// a 16-pixel base) while following the user's chosen size.
+pub fn heading_size(level: u8, base: f32) -> f32 {
+    let factor = match level {
+        1 => 1.6,
+        2 => 1.35,
+        3 => 1.2,
+        4 => 1.1,
+        _ => 1.0,
+    };
+    (base * factor).round()
 }
 
 /// One heading for the outline panel (M4b): its top-level block index, the
@@ -316,15 +338,9 @@ pub(crate) fn render_block<'a>(
     match block {
         Block::Heading { level, content, .. } => {
             let (spans, _) = collect_inline(content, ctx, &InlineStyle::default());
-            let size = match level {
-                1 => 26.0,
-                2 => 22.0,
-                3 => 19.0,
-                4 => 17.0,
-                _ => 16.0,
-            };
             rich_text(spans)
-                .size(size)
+                .size(heading_size(*level, ctx.size))
+                .font(ctx.font)
                 .on_link_click(Message::OpenUri)
                 .into()
         }
@@ -369,6 +385,7 @@ pub(crate) fn render_block<'a>(
             scrollable::scrollable(
                 text(code.trim_end().to_string())
                     .font(cosmic::font::mono())
+                    .size(ctx.size)
                     .class(ctx.palette.text),
             )
             .width(Length::Fill),
@@ -379,6 +396,7 @@ pub(crate) fn render_block<'a>(
         Block::Math(expr) => container(
             text(expr.trim().to_string())
                 .font(cosmic::font::mono())
+                .size(ctx.size)
                 .class(ctx.palette.text),
         )
         .padding(6)
@@ -437,7 +455,15 @@ fn render_list<'a>(
         let body = render_blocks(&item.body, ctx, depth + 1, stack, fold_id);
         col = col.push(
             row::Row::new()
-                .push(container(text(marker).class(marker_color)).width(Length::Fixed(26.0)))
+                .push(
+                    container(
+                        text(marker)
+                            .font(ctx.font)
+                            .size(ctx.size)
+                            .class(marker_color),
+                    )
+                    .width(Length::Fixed(26.0)),
+                )
                 .push(container(body).width(Length::Fill)),
         );
     }
@@ -481,12 +507,23 @@ fn render_callout<'a>(
     };
 
     let header: Element<'static, Message> = if fold == Fold::None {
-        text(label).class(color).into()
-    } else {
-        let chevron = if open { "▾ " } else { "▸ " };
-        button::text(format!("{chevron}{label}"))
-            .on_press(Message::ToggleFold(id))
+        text(label)
+            .font(ctx.font)
+            .size(ctx.size)
+            .class(color)
             .into()
+    } else {
+        // A foldable callout's title is prose: it reads in the reading
+        // view's font, not the UI font the plain button would use.
+        let chevron = if open { "▾ " } else { "▸ " };
+        button::custom(
+            text(format!("{chevron}{label}"))
+                .font(ctx.font)
+                .size(ctx.size)
+                .class(color),
+        )
+        .on_press(Message::ToggleFold(id))
+        .into()
     };
 
     let mut col = column::Column::new().spacing(6);
@@ -511,8 +548,9 @@ fn render_table<'a>(
 
     let mut header_row = row::Row::new().spacing(8);
     for cell in header {
-        let (spans, _) = collect_inline(cell, ctx, &InlineStyle::bold());
-        header_row = header_row.push(container(rich_text(spans)).width(Length::Fill));
+        let (spans, _) = collect_inline(cell, ctx, &InlineStyle::bold(ctx.font));
+        header_row = header_row
+            .push(container(rich_text(spans).size(ctx.size).font(ctx.font)).width(Length::Fill));
     }
     grid = grid.push(header_row);
     grid = grid.push(cosmic::iced::widget::rule::horizontal(1));
@@ -521,7 +559,9 @@ fn render_table<'a>(
         let mut r = row::Row::new().spacing(8);
         for cell in row_cells {
             let (spans, _) = collect_inline(cell, ctx, &InlineStyle::default());
-            r = r.push(container(rich_text(spans)).width(Length::Fill));
+            r = r.push(
+                container(rich_text(spans).size(ctx.size).font(ctx.font)).width(Length::Fill),
+            );
         }
         grid = grid.push(r);
     }
@@ -543,7 +583,12 @@ fn render_paragraph<'a>(content: &[Inline], ctx: &Ctx<'a>) -> Element<'a, Messag
 
     let mut col = column::Column::new().spacing(6).width(Length::Fill);
     if !spans.is_empty() {
-        col = col.push(rich_text(spans).on_link_click(Message::OpenUri));
+        col = col.push(
+            rich_text(spans)
+                .size(ctx.size)
+                .font(ctx.font)
+                .on_link_click(Message::OpenUri),
+        );
     }
     for extra in extras {
         col = col.push(extra);
@@ -561,9 +606,14 @@ struct InlineStyle {
 }
 
 impl InlineStyle {
-    fn bold() -> Self {
+    /// Bold text in the reading view's own family: the weight changes,
+    /// the family does not.
+    fn bold(base: Font) -> Self {
         Self {
-            font: Some(cosmic::font::bold()),
+            font: Some(Font {
+                weight: font::Weight::Bold,
+                ..base
+            }),
             ..Default::default()
         }
     }
@@ -591,7 +641,9 @@ fn collect_inline_into<'a>(
         match inline {
             Inline::Text(s) => spans.push(base_span(s.clone(), style, ctx)),
             Inline::Emph(inner) => {
-                let font = style.font.unwrap_or_else(cosmic::font::default);
+                // Italic keeps the reading view's family: only the
+                // slant changes.
+                let font = style.font.unwrap_or(ctx.font);
                 let mut inner_style = style.clone();
                 inner_style.font = Some(Font {
                     style: font::Style::Italic,
@@ -600,7 +652,8 @@ fn collect_inline_into<'a>(
                 collect_inline_into(inner, ctx, &inner_style, spans, extras);
             }
             Inline::Strong(inner) => {
-                let font = style.font.unwrap_or_else(cosmic::font::default);
+                // Bold keeps the reading view's family too.
+                let font = style.font.unwrap_or(ctx.font);
                 let mut inner_style = style.clone();
                 inner_style.font = Some(Font {
                     weight: font::Weight::Bold,
@@ -1111,8 +1164,36 @@ mod tests {
                 surface: Color::BLACK,
                 is_dark: true,
             },
+            font: cosmic::font::default(),
+            size: 16.0,
             folds,
             images,
+        }
+    }
+
+    #[test]
+    fn headings_scale_with_the_reading_size() {
+        // At the default 16-pixel base the sizes match the fixed ones
+        // the renderer used before.
+        assert_eq!(heading_size(1, 16.0), 26.0);
+        assert_eq!(heading_size(2, 16.0), 22.0);
+        assert_eq!(heading_size(3, 16.0), 19.0);
+        assert_eq!(heading_size(4, 16.0), 18.0);
+        assert_eq!(heading_size(5, 16.0), 16.0);
+        // A bigger base scales the whole hierarchy.
+        assert_eq!(heading_size(1, 32.0), 51.0);
+        assert_eq!(heading_size(5, 32.0), 32.0);
+        // The headings stay in order and above the body text.
+        let mut previous = heading_size(1, 16.0);
+        for level in 2..=6 {
+            let size = heading_size(level, 16.0);
+            assert!(
+                size <= previous,
+                "level {level} is not smaller than level {}",
+                level - 1
+            );
+            assert!(size >= 16.0, "level {level} is not at least the body size");
+            previous = size;
         }
     }
 
