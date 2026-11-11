@@ -295,7 +295,7 @@ fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
                 }
             })),
     );
-    let body: Element<'a, Message> = match app.panel {
+    let body: Element<'a, Message> = match app.panel() {
         SidePanel::Files => tree_view(app, palette),
         SidePanel::Search => search_panel(app, palette),
         SidePanel::Tags => tags_panel(app, palette),

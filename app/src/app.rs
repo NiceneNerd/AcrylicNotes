@@ -18,6 +18,7 @@ use cosmic::iced::Color;
 use cosmic::widget::{icon, nav_bar, segmented_button};
 use unicode_segmentation::UnicodeSegmentation;
 
+use vault_app::commands::UiCommand;
 use vault_app::ids::TabId;
 use vault_core::vault::VaultError;
 use vault_core::{NoteSource, ObsidianSettings, Vault, VaultIndex};
@@ -564,7 +565,9 @@ pub struct VaultNotes {
     pub strict_breaks: bool,
     pub images: RefCell<std::collections::HashMap<String, ImageHandle>>,
     // --- M4b ---
-    pub panel: SidePanel,
+    /// Shared application state + reducer (restructure commit 05). The
+    /// sidebar section, and later slices, are owned by the kernel.
+    pub shared: vault_app::App,
     pub search_query: String,
     pub search_hits: Vec<vault_core::search::SearchHit>,
     pub selected_tag: Option<String>,
@@ -1910,6 +1913,17 @@ impl VaultNotes {
         self.tab_ids.active_path()
     }
 
+    /// The active sidebar section. The shared kernel owns it; the cosmic
+    /// frontend reads it as a view model.
+    pub fn panel(&self) -> SidePanel {
+        self.shared.state.panel
+    }
+
+    /// Switch the sidebar panel through the shared reducer.
+    pub(crate) fn set_panel(&mut self, panel: SidePanel) {
+        let _ = self.shared.dispatch(UiCommand::SetNavSection(panel));
+    }
+
     /// Whether any open tab for `path` has unsaved edits.
     pub fn is_tab_dirty(&self, path: &str) -> bool {
         self.tabs
@@ -3124,7 +3138,7 @@ impl VaultNotes {
         // press needs.
         if self.bounds_pending
             || self.vault.is_none()
-            || self.panel != SidePanel::Files
+            || self.panel() != SidePanel::Files
             || !self.sidebar_open
         {
             return Task::none();
@@ -3810,7 +3824,7 @@ impl cosmic::Application for VaultNotes {
             vault_input: String::new(),
             strict_breaks: false,
             images: RefCell::new(std::collections::HashMap::new()),
-            panel: SidePanel::default(),
+            shared: vault_app::App::new(),
             search_query: String::new(),
             search_hits: Vec::new(),
             selected_tag: None,
@@ -3997,7 +4011,7 @@ impl cosmic::Application for VaultNotes {
                 // tree is actually on screen: other panels have no rows,
                 // a collapsed sidebar hides the tree, and stale bounds
                 // would misidentify sources.
-                if self.vault.is_none() || self.panel != SidePanel::Files || !self.sidebar_open {
+                if self.vault.is_none() || self.panel() != SidePanel::Files || !self.sidebar_open {
                     return Task::none();
                 }
                 let Some(pos) = self.last_cursor else {
@@ -4069,7 +4083,7 @@ impl cosmic::Application for VaultNotes {
                 // The widget only publishes; the model's active state is ours.
                 self.nav_model.activate(id);
                 if let Some(panel) = self.nav_model.data::<SidePanel>(id).copied() {
-                    self.panel = panel;
+                    self.set_panel(panel);
                 }
                 self.dismiss_editor_overlays();
                 // Switching back to Files re-measures the (possibly
@@ -4662,7 +4676,7 @@ impl cosmic::Application for VaultNotes {
                     }
                     // `tag:` routes to the tag panel (M4b).
                     "tag" => {
-                        self.panel = SidePanel::Tags;
+                        self.set_panel(SidePanel::Tags);
                         self.selected_tag = Some(rest.to_string());
                         Task::none()
                     }
@@ -4670,7 +4684,8 @@ impl cosmic::Application for VaultNotes {
                 }
             }
             Message::SidePanel(panel) => {
-                self.panel = panel;
+                // Routed through the shared reducer (restructure commit 05).
+                self.set_panel(panel);
                 self.activate_nav(panel);
                 Task::none()
             }
@@ -6279,7 +6294,7 @@ mod find_tests {
             vault_input: String::new(),
             strict_breaks: false,
             images: RefCell::new(std::collections::HashMap::new()),
-            panel: SidePanel::default(),
+            shared: vault_app::App::new(),
             search_query: String::new(),
             search_hits: Vec::new(),
             selected_tag: None,
@@ -7520,7 +7535,7 @@ mod sidebar_collapse_tests {
         let mut app = find_tests::test_app_with_tab("");
         app.vault = Some(Vault::open(tmp.path()).unwrap());
         app.rebuild_index();
-        app.panel = SidePanel::Files;
+        app.set_panel(SidePanel::Files);
         app.sidebar_open = false;
         let _ = app.measure_tree_bounds_if_needed();
         assert!(!app.bounds_pending, "no measure while the tree is hidden");
@@ -7926,12 +7941,12 @@ mod tree_drag_tests {
         let (_tmp, mut app) = app_with(&[("a.md", "")]);
         // Another panel: the tree is not built there, so a measurement
         // would come back empty and wipe the bounds a later press needs.
-        app.panel = SidePanel::Search;
+        app.set_panel(SidePanel::Search);
         let _ = app.measure_tree_bounds_if_needed();
         assert!(!app.bounds_pending, "no measure queued off the Files panel");
 
         // On the Files panel a measure is queued and marked pending.
-        app.panel = SidePanel::Files;
+        app.set_panel(SidePanel::Files);
         let _ = app.measure_tree_bounds_if_needed();
         assert!(app.bounds_pending, "measure queued");
 
