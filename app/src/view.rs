@@ -336,7 +336,7 @@ fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
 fn tree_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
     let mut col = column::Column::new().spacing(0).width(Length::Fill);
     // The toolbar: the sort order and the fold controls.
-    col = col.push(tree_toolbar(app));
+    col = col.push(tree_toolbar(app, palette));
     if app.tree.is_empty() && app.tree_folder_edit_target().is_none() {
         return container(text("No notes.").class(palette.muted))
             .padding(12)
@@ -372,7 +372,11 @@ fn tree_view<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> 
 /// on a click; a right click opens the menu, where the order in force is
 /// checked. The two chevron buttons fold every folder away or open them
 /// all again.
-fn tree_toolbar<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
+///
+/// The row stays quiet on purpose: flat buttons, small icons, a muted
+/// label, and the fold controls pushed to the far right, away from the
+/// order they act on.
+fn tree_toolbar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
     let sort_icon = if app.tree_sort.descending() {
         "view-sort-descending-symbolic"
     } else {
@@ -380,14 +384,20 @@ fn tree_toolbar<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
     };
     let sort_button = button::custom(
         row::Row::new()
-            .push(icon::from_name(sort_icon).size(16))
-            .push(text(app.tree_sort.label()))
-            .spacing(6),
+            .push(icon::from_name(sort_icon).size(14))
+            .push(text(app.tree_sort.label()).size(12).class(palette.muted))
+            .spacing(4),
     )
     .class(cosmic::theme::Button::Text)
     .on_press(Message::TreeSort(app.tree_sort.next()))
     .height(Length::Shrink)
-    .width(Length::Shrink);
+    .width(Length::Shrink)
+    .padding(Padding {
+        left: 4.0,
+        right: 4.0,
+        top: 2.0,
+        bottom: 2.0,
+    });
 
     let sort: cosmic::Element<'a, Message> =
         context_menu(sort_button, Some(sort_menu(app.tree_sort)))
@@ -396,24 +406,30 @@ fn tree_toolbar<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
 
     row::Row::new()
         .push(sort)
+        .push(cosmic::iced::widget::space::horizontal())
         .push(
             button::icon(icon::from_name("pan-end-symbolic"))
+                .icon_size(14)
+                .class(cosmic::theme::Button::Icon)
+                .tooltip("Collapse all folders")
                 .on_press(Message::TreeCollapseAll)
                 .height(Length::Shrink),
         )
         .push(
             button::icon(icon::from_name("pan-down-symbolic"))
+                .icon_size(14)
+                .class(cosmic::theme::Button::Icon)
+                .tooltip("Expand all folders")
                 .on_press(Message::TreeExpandAll)
                 .height(Length::Shrink),
         )
-        .push(cosmic::iced::widget::space::horizontal())
-        .spacing(4)
+        .spacing(2)
         .align_y(alignment::Vertical::Center)
         .padding(Padding {
-            left: 6.0,
-            right: 6.0,
-            top: 4.0,
-            bottom: 4.0,
+            left: 4.0,
+            right: 4.0,
+            top: 2.0,
+            bottom: 2.0,
         })
         .width(Length::Fill)
         .into()

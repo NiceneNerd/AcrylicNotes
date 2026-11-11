@@ -727,8 +727,8 @@ All chord changes below supersede the M4c follow-up section above.
 
 ## Wikilinks, footnotes and the file tree (follow-up rounds)
 
-Nine small rounds, each one a commit of its own (A–C), then a fix from
-the user's first look at them (D).
+Nine small rounds, each one a commit of its own (A–C), then two fixes
+from the user's first look at them (D).
 
 ### Phase A — wikilinks read like links
 
@@ -821,8 +821,17 @@ the user's first look at them (D).
   editor in the live pane. The reading pane shows no editor, so nothing
   is selected there.
 
-### Phase D — the live editor's word delete
+### Phase D — the tree toolbar and the live editor's word delete
 
+- **The tree toolbar keeps quiet** (D1): the sort button and the two
+  fold buttons sat side by side in the middle of the row, each one a
+  control of its own weight — the sort button a full-height text
+  button, the chevrons 16-pixel icons — so the row read as a row of
+  buttons instead of a caption with two tools at its end. The toolbar
+  is now flat and small: a 14-pixel sort icon with the order in force
+  as a muted 12-pixel caption on the left, the fold chevrons (14
+  pixels, with tooltips naming what they do) pushed to the right edge,
+  and tight padding all round.
 - **The live editor deletes a word** (D2): Ctrl+Backspace in the live
   preview dropped a single character — the widget's own binding matches
   the modified key and ignores the modifier. It now deletes a word,
