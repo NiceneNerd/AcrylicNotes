@@ -1000,7 +1000,7 @@ fn tab_bar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
         strip = strip.push(tab_button(
             tab,
             idx,
-            app.tab_ids.active() == Some(tab.id),
+            app.shared.state.tabs.active() == Some(tab.id),
             palette,
         ));
     }

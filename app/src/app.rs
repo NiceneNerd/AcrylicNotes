@@ -562,9 +562,6 @@ pub struct VaultNotes {
     pub tree: Vec<TreeNode>,
     pub collapsed: HashSet<String>,
     pub tabs: Vec<Tab>,
-    /// Shared tab-bar state: ids, order, active tab (restructure commit 04).
-    /// The `tabs` payload vector stays aligned with `tab_ids.order()`.
-    pub tab_ids: vault_app::tabs::Tabs,
     /// Paths of open tabs that changed on disk while dirty.
     pub banner: Option<Banner>,
     /// Links invalidated by the last rename/move, awaiting the user's
@@ -1812,7 +1809,7 @@ impl VaultNotes {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
                 self.tabs.clear();
-                self.tab_ids.clear();
+                self.shared.state.tabs.clear();
                 self.shared.state.search.clear();
                 self.banner = None;
                 self.error = None;
@@ -1842,9 +1839,11 @@ impl VaultNotes {
     /// The display position of the active tab. The `tabs` payload vector
     /// stays aligned with the shared tab order, so this indexes into it.
     pub fn active_idx(&self) -> Option<usize> {
-        self.tab_ids
+        self.shared
+            .state
+            .tabs
             .active()
-            .and_then(|id| self.tab_ids.position(id))
+            .and_then(|id| self.shared.state.tabs.position(id))
     }
 
     /// The text the user has selected, if any.
@@ -1916,7 +1915,7 @@ impl VaultNotes {
 
     /// Path of the tab currently shown, if any.
     pub fn active_tab_path(&self) -> Option<&str> {
-        self.tab_ids.active_path()
+        self.shared.state.tabs.active_path()
     }
 
     /// The active sidebar section. The shared kernel owns it; the cosmic
@@ -2000,9 +1999,9 @@ impl VaultNotes {
 
     fn open_tab(&mut self, path: String) -> Task<Message> {
         self.dismiss_editor_overlays();
-        match self.tab_ids.open_or_focus(&path) {
+        match self.shared.state.tabs.open_or_focus(&path) {
             vault_app::tabs::TabOpenOutcome::Focused(id) => {
-                if self.tab_ids.activate(id).is_some() {
+                if self.shared.state.tabs.activate(id).is_some() {
                     // Live-editing state belongs to the previous tab's text.
                     self.live = None;
                 }
@@ -2703,10 +2702,52 @@ impl VaultNotes {
     /// reuse the original frontmatter bytes verbatim; frontmatter edits go
     /// through `save_note_full` with the full text.
     fn save_active(&mut self) -> Task<Message> {
-        if let Some(idx) = self.active_idx() {
-            self.save_tab(idx);
-        }
+        // Routed through the shared reducer: the command emits a tracked
+        // SaveTab effect and the cosmic effect runner executes it inline,
+        // feeding the outcome back as AppEvents (restructure commit 06).
+        let effects = self.shared.dispatch(UiCommand::SaveActiveTab);
+        self.run_effects(effects);
         Task::none()
+    }
+
+    /// The cosmic effect runner: executes the reducer's effects and maps
+    /// each outcome into an `AppEvent`. Saves run inline (sync file I/O
+    /// at vault scale); async kinds will move onto tasks as they convert.
+    fn run_effects(&mut self, effects: Vec<vault_app::effects::Effect>) {
+        for effect in effects {
+            match effect.kind {
+                vault_app::effects::EffectKind::SaveTab { tab } => {
+                    let Some(idx) = self.shared.state.tabs.position(tab) else {
+                        // The tab vanished mid-flight: nothing to save.
+                        self.shared
+                            .handle(vault_app::effects::AppEvent::SaveCompleted {
+                                effect: effect.id,
+                            });
+                        continue;
+                    };
+                    let saved = self.save_tab(idx);
+                    let event = if saved {
+                        vault_app::effects::AppEvent::SaveCompleted { effect: effect.id }
+                    } else {
+                        let error = if self.banner.is_some() {
+                            "changed on disk while you edited".to_string()
+                        } else {
+                            self.error
+                                .clone()
+                                .unwrap_or_else(|| "save failed".to_string())
+                        };
+                        vault_app::effects::AppEvent::SaveFailed {
+                            effect: effect.id,
+                            error,
+                        }
+                    };
+                    self.shared.handle(event);
+                }
+                vault_app::effects::EffectKind::ReloadTab { .. }
+                | vault_app::effects::EffectKind::SearchVault { .. }
+                | vault_app::effects::EffectKind::PersistSettings => {}
+            }
+        }
     }
 
     /// Save tab `idx` through the guarded write path. Returns whether the
@@ -2747,7 +2788,7 @@ impl VaultNotes {
     /// Close a tab, saving unsaved edits first. A refused save (external
     /// change) keeps the tab open so no edits are lost.
     fn close_tab(&mut self, idx: usize) -> Task<Message> {
-        let Some(id) = self.tab_ids.id_at(idx) else {
+        let Some(id) = self.shared.state.tabs.id_at(idx) else {
             return Task::none();
         };
         if self.tabs[idx].is_dirty() && !self.save_tab(idx) {
@@ -2756,7 +2797,7 @@ impl VaultNotes {
         self.dismiss_editor_overlays();
         // The shared model decides the fallback active tab (the neighbor
         // that took the closed tab's position); the payload vector follows.
-        let _next_active = self.tab_ids.close(id);
+        let _next_active = self.shared.state.tabs.close(id);
         self.tabs.remove(idx);
         // The removed tab may have been the one being live-edited.
         self.live = None;
@@ -2768,6 +2809,16 @@ impl VaultNotes {
     /// Activate the nav-bar item for `panel` (after a programmatic switch).
     fn activate_nav(&mut self, panel: SidePanel) {
         activate_entity_with(&mut self.nav_model, &panel);
+    }
+
+    /// Clear the shared kernel's conflict marks for the tabs behind the
+    /// banner's paths (a banner decision resolves them all).
+    fn resolve_shared_conflicts(&mut self, conflict_paths: &[String]) {
+        for tab in &self.tabs {
+            if conflict_paths.iter().any(|p| p == &tab.path) {
+                self.shared.state.conflicts.retain(|&id| id != tab.id);
+            }
+        }
     }
 
     /// Perform a multi-action editor command (formatting, word delete) as
@@ -3497,7 +3548,7 @@ impl VaultNotes {
             .map(|vault| vault.rename_note(&old, &new));
         match outcome {
             Some(Ok(())) => {
-                self.tab_ids.rename_path(&old, &new);
+                self.shared.state.tabs.rename_path(&old, &new);
                 for tab in &mut self.tabs {
                     if tab.path == old {
                         tab.path = new.clone();
@@ -3522,7 +3573,10 @@ impl VaultNotes {
         match outcome {
             Some(Ok(())) => {
                 let prefix = format!("{old}/");
-                self.tab_ids.rename_path_prefix(&prefix, &format!("{new}/"));
+                self.shared
+                    .state
+                    .tabs
+                    .rename_path_prefix(&prefix, &format!("{new}/"));
                 for tab in &mut self.tabs {
                     if let Some(rest) = tab.path.strip_prefix(&prefix) {
                         tab.path = format!("{new}/{rest}");
@@ -3744,7 +3798,7 @@ impl VaultNotes {
             Ok(()) => {
                 // The shared model keeps the active tab when it survives
                 // the deletion, else falls back to the last remaining one.
-                let _removed = self.tab_ids.retain_paths(|path| !affected(path));
+                let _removed = self.shared.state.tabs.retain_paths(|path| !affected(path));
                 self.tabs.retain(|tab| !affected(&tab.path));
                 self.rebuild_index();
             }
@@ -3802,6 +3856,11 @@ impl VaultNotes {
                     }
                     ExternalAction::Conflict => {
                         banner.conflicts.push(tab.path.clone());
+                        // The shared kernel tracks the conflict by tab id
+                        // (its banner decisions clear it again).
+                        if !self.shared.state.is_conflicted(tab.id) {
+                            self.shared.state.conflicts.push(tab.id);
+                        }
                     }
                 }
             }
@@ -3839,7 +3898,6 @@ impl cosmic::Application for VaultNotes {
             tree: Vec::new(),
             collapsed: HashSet::new(),
             tabs: Vec::new(),
-            tab_ids: vault_app::tabs::Tabs::new(),
             banner: None,
             pending_links: None,
             error: None,
@@ -3961,6 +4019,7 @@ impl cosmic::Application for VaultNotes {
                     }
                 }
                 self.error = None;
+                self.resolve_shared_conflicts(&conflicts);
                 Task::none()
             }
             Message::BannerOverwrite => {
@@ -3986,10 +4045,18 @@ impl cosmic::Application for VaultNotes {
                     }
                 }
                 self.rebuild_index();
+                self.resolve_shared_conflicts(&conflicts);
                 Task::none()
             }
             Message::BannerDismiss => {
-                self.banner = None;
+                // Keep mine: the banner (and the shared conflict marks)
+                // go away without touching the buffers.
+                let conflicts = self
+                    .banner
+                    .take()
+                    .map(|banner| banner.conflicts)
+                    .unwrap_or_default();
+                self.resolve_shared_conflicts(&conflicts);
                 Task::none()
             }
             Message::LinkUpdatesApply => {
@@ -4133,9 +4200,11 @@ impl cosmic::Application for VaultNotes {
                 // The shared model validates the position and reports the
                 // previous tab only when the active tab changed.
                 let changed = self
-                    .tab_ids
+                    .shared
+                    .state
+                    .tabs
                     .id_at(idx)
-                    .map(|id| self.tab_ids.activate(id).is_some())
+                    .map(|id| self.shared.state.tabs.activate(id).is_some())
                     .unwrap_or(false);
                 // Live-editing state belongs to the previous tab's text.
                 if changed {
@@ -6330,7 +6399,6 @@ mod find_tests {
             tree: Vec::new(),
             collapsed: HashSet::new(),
             tabs: Vec::new(),
-            tab_ids: vault_app::tabs::Tabs::new(),
             banner: None,
             pending_links: None,
             error: None,
@@ -6376,7 +6444,7 @@ mod find_tests {
             nav_model: build_nav_model(),
             pane_model: build_pane_model(PaneMode::default()),
         };
-        let tab_id = app.tab_ids.open("t.md");
+        let tab_id = app.shared.state.tabs.open("t.md");
         app.tabs.push(Tab::open(tab_id, "t.md".to_string(), text));
         app
     }
@@ -7452,7 +7520,7 @@ mod link_update_tests {
     #[test]
     fn open_tab_buffers_are_rewritten_not_the_disk_file() {
         let (tmp, mut app) = app_with(&[("a.md", "see [[b]]"), ("b.md", "b")]);
-        let tab_id = app.tab_ids.open("a.md");
+        let tab_id = app.shared.state.tabs.open("a.md");
         app.tabs
             .push(Tab::open(tab_id, "a.md".to_string(), "see [[b]]"));
         let _ = app.rename_tree_note("b.md".into(), "c.md".into());
@@ -8743,8 +8811,8 @@ mod live_tests {
         app.vault = Some(Vault::open(tmp.path()).unwrap());
         app.rebuild_index();
         app.tabs.clear();
-        app.tab_ids.clear();
-        let tab_id = app.tab_ids.open("n.md");
+        app.shared.state.tabs.clear();
+        let tab_id = app.shared.state.tabs.open("n.md");
         app.tabs
             .push(Tab::open(tab_id, "n.md".to_string(), "hello\n"));
         app.live_focus(0);
@@ -8845,7 +8913,10 @@ mod tree_sort_tests {
             ("Folder/Deep/deep.md", ""),
             ("Other/o.md", ""),
         ]);
-        app.tab_ids.rename_path("t.md", "Folder/Deep/deep.md");
+        app.shared
+            .state
+            .tabs
+            .rename_path("t.md", "Folder/Deep/deep.md");
         app.tabs[0].path = "Folder/Deep/deep.md".to_string();
         (tmp, app)
     }
@@ -8876,7 +8947,7 @@ mod tree_sort_tests {
     #[test]
     fn without_an_open_note_there_is_no_path_to_work_from() {
         let (_tmp, mut app) = app_with_current_note();
-        app.tab_ids.clear();
+        app.shared.state.tabs.clear();
 
         // No path to keep open, so everything folds away.
         let _ = app.update(Message::TreeCollapseOthers);
