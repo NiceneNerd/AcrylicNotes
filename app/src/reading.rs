@@ -276,9 +276,9 @@ fn foldable_blocks(blocks: &[Block]) -> usize {
         .sum()
 }
 
-/// The frontmatter block under `render_doc`: foldable, rendered as
-/// structured YAML instead of raw text. Nested maps and sequences are
-/// indented so the metadata is readable at a glance. `None` when the note
+/// The frontmatter block under `render_doc`: foldable, rendered as a
+/// two-column table of keys and values instead of raw text, with nested
+/// mappings hanging off their parent key as a tree. `None` when the note
 /// has no frontmatter (no empty code box is rendered). The live preview's
 /// frontmatter region reuses this.
 pub(crate) fn render_frontmatter<'a>(doc: &Doc, ctx: &Ctx<'a>) -> Option<Element<'a, Message>> {
@@ -304,7 +304,7 @@ pub(crate) fn render_frontmatter<'a>(doc: &Doc, ctx: &Ctx<'a>) -> Option<Element
         if open {
             match serde_norway::from_str::<serde_norway::Value>(yaml) {
                 Ok(value) => {
-                    fm_col = fm_col.push(render_yaml_value(&value, 0, ctx));
+                    fm_col = fm_col.push(render_frontmatter_table(&value, ctx));
                 }
                 Err(_) => {
                     // Invalid YAML: fall back to showing the raw text.
@@ -338,129 +338,203 @@ fn frontmatter_yaml(raw: &str) -> Option<&str> {
     Some(&raw[start..end])
 }
 
-/// Render one YAML value at the given nesting depth.
-///
-/// Indentation is done through layout (container padding), not through
-/// space-prefixed text — proportional fonts make space-based indentation
-/// misalign, so padding on the wrapping container keeps everything lined
-/// up regardless of the font.
-fn render_yaml_value<'a>(
+/// One row of the frontmatter table: the key cell (tree guide glyphs plus
+/// the key itself) and, for a leaf, the rendered value. A nested mapping's
+/// header row has no value; its entries follow as further rows.
+struct FrontmatterRow<'a> {
+    /// Tree guide glyphs (`│  ├─ `) for nested entries. Empty at the top
+    /// level, where keys line up as the table's first column.
+    prefix: String,
+    key: String,
+    value: Option<Element<'a, Message>>,
+}
+
+/// Render a YAML document as a two-column table: keys in the first column,
+/// values in the second, so metadata lines up at a glance. A nested mapping
+/// hangs off its parent key as a tree instead of indenting text with
+/// spaces, which proportional fonts cannot align.
+fn render_frontmatter_table<'a>(
     value: &serde_norway::Value,
-    depth: u16,
     ctx: &Ctx<'a>,
 ) -> Element<'a, Message> {
+    let mut rows = Vec::new();
     match value {
+        serde_norway::Value::Mapping(map) if !map.is_empty() => {
+            push_mapping_rows(map, 0, &mut Vec::new(), ctx, &mut rows);
+        }
+        // A frontmatter document that is not a mapping is a single value.
+        other => rows.push(FrontmatterRow {
+            prefix: String::new(),
+            key: String::new(),
+            value: Some(render_yaml_scalar(other, ctx)),
+        }),
+    }
+
+    let mut table = column::Column::new().spacing(3).width(Length::Fill);
+    for row in rows {
+        let mut key_cell = row::Row::new();
+        if !row.prefix.is_empty() {
+            key_cell = key_cell.push(
+                text(row.prefix)
+                    .font(cosmic::font::mono())
+                    .size(12.0)
+                    .class(ctx.palette.muted),
+            );
+        }
+        key_cell = key_cell.push(
+            text(row.key)
+                .font(ctx.font)
+                .size(12.0)
+                .class(ctx.palette.accent),
+        );
+        // Fixed proportions keep every value starting at the same x, which
+        // is what makes the list read as a table.
+        let mut line = row::Row::new()
+            .spacing(12)
+            .width(Length::Fill)
+            .push(container(key_cell).width(Length::FillPortion(1)));
+        if let Some(value) = row.value {
+            line = line.push(container(value).width(Length::FillPortion(2)));
+        }
+        table = table.push(line);
+    }
+    table.into()
+}
+
+/// Flatten a mapping into table rows, recursing into nested mappings with
+/// tree guide glyphs. `depth` is 0 for the top level (no glyphs); `guides`
+/// tracks which ancestors still need a vertical guide at each level.
+fn push_mapping_rows<'a>(
+    map: &serde_norway::Mapping,
+    depth: usize,
+    guides: &mut Vec<bool>,
+    ctx: &Ctx<'a>,
+    rows: &mut Vec<FrontmatterRow<'a>>,
+) {
+    let count = map.len();
+    for (i, (key, value)) in map.iter().enumerate() {
+        let last = i + 1 == count;
+        let prefix = tree_prefix(guides, depth, last);
+        let key = match key {
+            serde_norway::Value::String(s) => s.clone(),
+            other => inline_yaml(other),
+        };
+        match value {
+            // A nested mapping becomes a subtree under its key.
+            serde_norway::Value::Mapping(child) if !child.is_empty() => {
+                rows.push(FrontmatterRow {
+                    prefix,
+                    key,
+                    value: None,
+                });
+                // The root level has no guide column of its own, so only
+                // deeper levels contribute a vertical guide to their children.
+                if depth > 0 {
+                    guides.push(!last);
+                }
+                push_mapping_rows(child, depth + 1, guides, ctx, rows);
+                if depth > 0 {
+                    guides.pop();
+                }
+            }
+            other => rows.push(FrontmatterRow {
+                prefix,
+                key,
+                value: Some(render_yaml_scalar(other, ctx)),
+            }),
+        }
+    }
+}
+
+/// The guide glyphs in front of one nested key: a vertical bar for every
+/// ancestor that continues below, then a branch for this entry.
+fn tree_prefix(guides: &[bool], depth: usize, last: bool) -> String {
+    if depth == 0 {
+        return String::new();
+    }
+    let mut prefix = String::new();
+    for &continues in guides {
+        prefix.push_str(if continues { "│  " } else { "   " });
+    }
+    prefix.push_str(if last { "└─ " } else { "├─ " });
+    prefix
+}
+
+/// Render a leaf value for the table's second column.
+fn render_yaml_scalar<'a>(value: &serde_norway::Value, ctx: &Ctx<'a>) -> Element<'a, Message> {
+    match value {
+        serde_norway::Value::String(_) | serde_norway::Value::Bool(_) => text(inline_yaml(value))
+            .font(ctx.font)
+            .size(12.0)
+            .class(ctx.palette.text)
+            .into(),
+        serde_norway::Value::Number(_) => text(inline_yaml(value))
+            .font(cosmic::font::mono())
+            .size(12.0)
+            .class(ctx.palette.text)
+            .into(),
         serde_norway::Value::Null => text("null")
             .font(cosmic::font::mono())
             .size(12.0)
             .class(ctx.palette.muted)
             .into(),
-        serde_norway::Value::Bool(b) => text(format!("{b}"))
-            .font(ctx.font)
+        serde_norway::Value::Tagged(_) => text(inline_yaml(value))
+            .font(cosmic::font::mono())
             .size(12.0)
-            .class(ctx.palette.text)
+            .class(ctx.palette.muted)
             .into(),
-        serde_norway::Value::Number(n) => {
-            let s = if let Some(i) = n.as_i64() {
-                i.to_string()
-            } else {
-                n.as_f64().map(|f| f.to_string()).unwrap_or_default()
-            };
-            text(s)
-                .font(cosmic::font::mono())
-                .size(12.0)
-                .class(ctx.palette.text)
-                .into()
-        }
-        serde_norway::Value::String(s) => {
-            // Quote strings that look like they could be confused with
-            // other YAML types, but keep plain strings unquoted.
-            let displayed = if s.is_empty() || s.starts_with(' ') || s.ends_with(' ') {
-                format!("{:?}", s)
-            } else {
-                s.clone()
-            };
-            text(displayed)
+        // Sequences (and empty mappings) stay on one line in the value
+        // column; only mappings with entries become subtrees.
+        serde_norway::Value::Sequence(_) | serde_norway::Value::Mapping(_) => {
+            text(inline_yaml(value))
                 .font(ctx.font)
                 .size(12.0)
                 .class(ctx.palette.text)
                 .into()
         }
-        serde_norway::Value::Sequence(seq) => {
-            if seq.is_empty() {
-                return text("[]")
-                    .font(cosmic::font::mono())
-                    .size(12.0)
-                    .class(ctx.palette.muted)
-                    .into();
-            }
-            let mut col = column::Column::new().spacing(2);
-            for item in seq.iter() {
-                col = col.push(
-                    container(
-                        row::Row::new()
-                            .spacing(4)
-                            .push(
-                                text("• ")
-                                    .font(ctx.font)
-                                    .size(12.0)
-                                    .class(ctx.palette.muted),
-                            )
-                            .push(render_yaml_value(item, depth + 1, ctx)),
-                    )
-                    .padding([0.0, 0.0, 0.0, depth as f32 * INDENT_WIDTH]),
-                );
-            }
-            col.into()
-        }
-        serde_norway::Value::Mapping(map) => {
-            if map.is_empty() {
-                return text("{}")
-                    .font(cosmic::font::mono())
-                    .size(12.0)
-                    .class(ctx.palette.muted)
-                    .into();
-            }
-            let mut col = column::Column::new().spacing(2);
-            for (key, val) in map.iter() {
-                // Frontmatter keys are almost always strings; fall back to
-                // the Debug representation for anything else.
-                let key_str = match key {
-                    serde_norway::Value::String(s) => s.clone(),
-                    _ => format!("{key:?}"),
-                };
-                let child = render_yaml_value(val, depth + 1, ctx);
-                col = col.push(
-                    container(
-                        row::Row::new()
-                            .spacing(4)
-                            .push(
-                                text(format!("{key_str}: "))
-                                    .font(ctx.font)
-                                    .size(12.0)
-                                    .class(ctx.palette.accent),
-                            )
-                            .push(child),
-                    )
-                    .padding([0.0, 0.0, 0.0, depth as f32 * INDENT_WIDTH]),
-                );
-            }
-            col.into()
-        }
-        serde_norway::Value::Tagged(tagged) => {
-            // Tag implements Display: "!tagname"
-            text(format!("!{}", tagged.tag))
-                .font(cosmic::font::mono())
-                .size(12.0)
-                .class(ctx.palette.muted)
-                .into()
-        }
     }
 }
 
-/// Horizontal indentation width per nesting level for structured
-/// frontmatter rendering.
-const INDENT_WIDTH: f32 = 20.0;
+/// A YAML value on one line: scalars as written, sequences as `[a, b]`,
+/// mappings as `{k: v}`. Used for values that do not become subtrees and
+/// for non-string keys.
+fn inline_yaml(value: &serde_norway::Value) -> String {
+    match value {
+        serde_norway::Value::Null => "null".to_string(),
+        serde_norway::Value::Bool(b) => b.to_string(),
+        serde_norway::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.to_string()
+            } else {
+                n.as_f64().map(|f| f.to_string()).unwrap_or_default()
+            }
+        }
+        serde_norway::Value::String(s) => {
+            // Quote strings that could be confused with other YAML types
+            // or that would lose leading/trailing space.
+            if s.is_empty() || s.starts_with(' ') || s.ends_with(' ') {
+                format!("{s:?}")
+            } else {
+                s.clone()
+            }
+        }
+        serde_norway::Value::Sequence(seq) => {
+            let items: Vec<String> = seq.iter().map(inline_yaml).collect();
+            format!("[{}]", items.join(", "))
+        }
+        serde_norway::Value::Mapping(map) => {
+            let items: Vec<String> = map
+                .iter()
+                .map(|(key, value)| format!("{}: {}", inline_yaml(key), inline_yaml(value)))
+                .collect();
+            format!("{{{}}}", items.join(", "))
+        }
+        // `Tag`'s Display already includes the leading `!`.
+        serde_norway::Value::Tagged(tagged) => {
+            format!("{} {}", tagged.tag, inline_yaml(&tagged.value))
+        }
+    }
+}
 
 fn render_blocks<'a>(
     blocks: &[Block],
@@ -1352,6 +1426,36 @@ mod tests {
             assert!(size >= 16.0, "level {level} is not at least the body size");
             previous = size;
         }
+    }
+
+    #[test]
+    fn frontmatter_tree_guides_mark_branches_and_continuations() {
+        // Top-level keys carry no guides: they are the table's first column.
+        assert_eq!(tree_prefix(&[], 0, false), "");
+        assert_eq!(tree_prefix(&[], 0, true), "");
+        // First-level entries are branches; the last one gets a corner.
+        assert_eq!(tree_prefix(&[], 1, false), "├─ ");
+        assert_eq!(tree_prefix(&[], 1, true), "└─ ");
+        // Deeper entries draw a bar for each ancestor that continues below.
+        assert_eq!(tree_prefix(&[true], 2, false), "│  ├─ ");
+        assert_eq!(tree_prefix(&[false, true], 3, true), "   │  └─ ");
+    }
+
+    #[test]
+    fn frontmatter_values_stay_inline_outside_subtrees() {
+        let value: serde_norway::Value =
+            serde_norway::from_str("tags: [a, b]\nmeta: {author: Caleb, year: 2024}\n").unwrap();
+        let serde_norway::Value::Mapping(map) = &value else {
+            panic!("mapping expected");
+        };
+        assert_eq!(inline_yaml(map.get("tags").unwrap()), "[a, b]");
+        assert_eq!(
+            inline_yaml(map.get("meta").unwrap()),
+            "{author: Caleb, year: 2024}"
+        );
+        // A tag's Display already includes the leading `!`.
+        let tagged: serde_norway::Value = serde_norway::from_str("!Thing x").unwrap();
+        assert_eq!(inline_yaml(&tagged), "!Thing x");
     }
 
     #[test]
