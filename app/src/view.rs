@@ -28,6 +28,15 @@ use crate::reading;
 use crate::scroll::READING_SCROLL;
 use crate::tree::TreeNode;
 
+/// Fixed vertical padding around the reading text column: enough to give
+/// the document some breathing room, but not part of the user-configurable
+/// margin choice.
+const READING_VERTICAL_PADDING: f32 = 8.0;
+
+/// Width of the scrollbar drawn by the cosmic scrollable, so the right
+/// margin can make room for it and avoid overlaying the text.
+const SCROLLBAR_WIDTH: f32 = 8.0;
+
 pub fn view(app: &VaultNotes) -> Element<'_, Message> {
     if app.vault.is_none() {
         empty_state(app)
@@ -1303,12 +1312,12 @@ fn reading_pane<'a>(
         folds: &tab.folds,
         images: &app.images,
     };
-    // The id anchors outline/search/footnote jumps (see scroll.rs). The
-    // document column is centered at a readable measure (matching the web
-    // view's ~46rem) instead of stretching edge to edge. Padding goes on
-    // the wrapping container: a Scrollable's own `padding` only insets its
-    // scrollbar, not its content. The margin around the column is the
-    // user's choice (None / Compact / Comfortable / Spacious).
+    // The id anchors outline/search/footnote jumps (see scroll.rs).
+    // Padding goes on the wrapping container: a Scrollable's own
+    // `padding` only insets its scrollbar, not its content. The margin
+    // around the column is the user's choice (None / Compact /
+    // Comfortable / Spacious) plus a fixed vertical space; the right side
+    // also makes room for the scrollbar so it never overlays the text.
     //
     // A click in the reading view marks it as the pane in focus, so the
     // zoom shortcuts act on its font size.
@@ -1316,7 +1325,6 @@ fn reading_pane<'a>(
         cosmic::iced::widget::mouse_area(
             scrollable::scrollable(
                 container(reading::render_doc(&tab.doc, &ctx))
-                    .max_width(736)
                     .width(Length::Fill)
                     .align_x(alignment::Horizontal::Center),
             )
@@ -1328,14 +1336,14 @@ fn reading_pane<'a>(
     )
     .width(Length::Fill)
     .height(Length::Fill)
-    // Horizontal margin only: left and right. Vertical padding would
-    // push the document away from the pane's top and bottom edges for
-    // no reading benefit.
+    // Padding around the text column: a fixed small vertical space plus
+    // the configurable horizontal margin. The right side also makes room
+    // for the scrollbar so it never overlays the text.
     .padding([
-        0.0,
+        READING_VERTICAL_PADDING,
         app.reading_margin.padding(),
-        0.0,
-        app.reading_margin.padding(),
+        READING_VERTICAL_PADDING,
+        app.reading_margin.padding() + SCROLLBAR_WIDTH,
     ])
     .into()
 }
@@ -1398,12 +1406,14 @@ fn live_pane<'a>(
     container(pane)
         .width(Length::Fill)
         .height(Length::Fill)
-        // Horizontal margin only: left and right (see reading_pane).
+        // Padding around the preview column: fixed vertical space plus
+        // the configurable horizontal margin, with room on the right for
+        // the scrollbar.
         .padding([
-            0.0,
+            READING_VERTICAL_PADDING,
             app.reading_margin.padding(),
-            0.0,
-            app.reading_margin.padding(),
+            READING_VERTICAL_PADDING,
+            app.reading_margin.padding() + SCROLLBAR_WIDTH,
         ])
         .into()
 }

@@ -874,15 +874,20 @@ fn collect_inline_into<'a>(
             Inline::FootnoteRef(label) => {
                 let uri = format!("fnref:{label}");
                 match superscript_digits(label) {
-                    // A numbered footnote reads as a raised marker.
-                    Some(marker) => {
-                        spans.push(Span::new(marker).color(ctx.palette.accent).link(uri))
-                    }
-                    // A named one keeps its bracketed label, smaller.
+                    // A numbered footnote reads as a raised marker. Make it
+                    // slightly larger than body text so it's easy to spot.
+                    Some(marker) => spans.push(
+                        Span::new(marker)
+                            .size(ctx.size + 2.0)
+                            .color(ctx.palette.accent)
+                            .link(uri),
+                    ),
+                    // A named one keeps its bracketed label, smaller but
+                    // still easy to read.
                     None => spans.push(
                         Span::new(format!("[{label}]"))
-                            .size(12.0)
-                            .color(ctx.palette.muted)
+                            .size(13.0)
+                            .color(ctx.palette.text)
                             .link(uri),
                     ),
                 }
