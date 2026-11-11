@@ -1,0 +1,3 @@
+# Embedded B
+
+Leaf embed.
