@@ -15,6 +15,7 @@ pub mod editor;
 pub mod effects;
 pub mod fuzzy;
 pub mod ids;
+pub mod layout;
 pub mod markdown;
 pub mod navigation;
 pub mod persistence;

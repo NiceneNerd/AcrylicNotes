@@ -175,7 +175,6 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::TabId as _;
     use crate::persistence::ConflictDecision;
 
     fn app_with_tabs(paths: &[&str]) -> App {

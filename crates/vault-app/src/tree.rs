@@ -2,6 +2,7 @@
 //! unit-testable without a GUI (M4 working rules).
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 use crate::settings::TreeSort;
@@ -188,6 +189,113 @@ pub fn ancestor_paths(path: &str) -> Vec<String> {
     out
 }
 
+/// One flattened row of the visible tree: the node a sidebar renders,
+/// with its nesting depth and expansion state resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRow {
+    /// Display name of the node (extension included for notes).
+    pub name: String,
+    /// Vault-relative, '/'-separated path.
+    pub path: String,
+    /// Nesting depth (0 = vault root level).
+    pub depth: usize,
+    /// Whether the row is a folder.
+    pub is_folder: bool,
+    /// For folders: whether the children are currently shown. Always
+    /// `false` for notes.
+    pub expanded: bool,
+}
+
+/// Expansion and selection state for a sidebar tree.
+///
+/// Kernel-owned so both frontends fold, select, and flatten identically
+/// (restructure plan §5.1: native widgets hold no duplicate decisions).
+/// Folders start collapsed; the row flattening skips the children of
+/// collapsed folders, mirroring the Linux sidebar.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TreeState {
+    expanded: HashSet<String>,
+    selected: Option<String>,
+}
+
+impl TreeState {
+    /// Show the folder at `path` (idempotent).
+    pub fn expand(&mut self, path: &str) {
+        self.expanded.insert(path.to_string());
+    }
+
+    /// Hide the folder at `path`. Returns whether it was expanded before
+    /// (children of collapsed folders disappear from the visible rows).
+    pub fn collapse(&mut self, path: &str) -> bool {
+        self.expanded.remove(path)
+    }
+
+    /// Expand the folder at `path` when collapsed, collapse it when
+    /// expanded (the click on a folder row).
+    pub fn toggle(&mut self, path: &str) {
+        if !self.collapse(path) {
+            self.expand(path);
+        }
+    }
+
+    /// Whether the folder at `path` is expanded.
+    #[must_use]
+    pub fn is_expanded(&self, path: &str) -> bool {
+        self.expanded.contains(path)
+    }
+
+    /// Select the note or folder at `path`.
+    pub fn select(&mut self, path: impl Into<String>) {
+        self.selected = Some(path.into());
+    }
+
+    /// The selected path, if any.
+    #[must_use]
+    pub fn selected(&self) -> Option<&str> {
+        self.selected.as_deref()
+    }
+
+    /// Depth-first visible rows of `nodes`: a folder's children appear
+    /// only while the folder is expanded. The same nodes always produce
+    /// the same rows for the same state, on every platform.
+    #[must_use]
+    pub fn visible_rows(&self, nodes: &[TreeNode]) -> Vec<TreeRow> {
+        fn walk(state: &TreeState, nodes: &[TreeNode], depth: usize, out: &mut Vec<TreeRow>) {
+            for node in nodes {
+                match node {
+                    TreeNode::Folder {
+                        name,
+                        path,
+                        children,
+                    } => {
+                        let expanded = state.is_expanded(path);
+                        out.push(TreeRow {
+                            name: name.clone(),
+                            path: path.clone(),
+                            depth,
+                            is_folder: true,
+                            expanded,
+                        });
+                        if expanded {
+                            walk(state, children, depth + 1, out);
+                        }
+                    }
+                    TreeNode::Note { name, path } => out.push(TreeRow {
+                        name: name.clone(),
+                        path: path.clone(),
+                        depth,
+                        is_folder: false,
+                        expanded: false,
+                    }),
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, nodes, 0, &mut out);
+        out
+    }
+}
+
 /// A pending sidebar-tree edit, started from the right-click menu (M4c).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeEditKind {
@@ -332,7 +440,10 @@ mod tests {
         };
         assert_eq!(path, "Deep");
         // The empty chain exists with no notes inside.
-        let Some(TreeNode::Folder { path, children, .. }) = children.first() else {
+        let Some(TreeNode::Folder {
+            path, children: _, ..
+        }) = children.first()
+        else {
             panic!("nested empty folder");
         };
         assert_eq!(path, "Deep/a");
@@ -452,5 +563,110 @@ mod tests {
             value: "up".to_string(),
         };
         assert_eq!(rename_root.target_path(), "up");
+    }
+
+    // --- TreeState -------------------------------------------------------------
+
+    fn sample_tree() -> Vec<TreeNode> {
+        build_with_folders(
+            &entries(&["Notes/Glass.md", "Notes/nested/Deep.md", "root.md"]),
+            &[],
+            TreeSort::NameAsc,
+        )
+    }
+
+    fn row_summary(rows: &[TreeRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| {
+                format!(
+                    "{}{}{}",
+                    "-".repeat(row.depth),
+                    row.name,
+                    if row.expanded { "+" } else { "" }
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn folders_start_collapsed_and_toggle_open() {
+        let nodes = sample_tree();
+        let mut state = TreeState::default();
+
+        // Collapsed by default: only the top level is visible.
+        let rows = state.visible_rows(&nodes);
+        assert_eq!(
+            row_summary(&rows),
+            vec!["Notes", "root.md"],
+            "collapsed folders hide their children"
+        );
+
+        // Toggling the folder reveals its subtree (one level at a time;
+        // inside "Notes" the subfolder sorts before the notes).
+        state.toggle("Notes");
+        assert!(state.is_expanded("Notes"));
+        let rows = state.visible_rows(&nodes);
+        assert_eq!(
+            row_summary(&rows),
+            vec!["Notes+", "-nested", "-Glass.md", "root.md"]
+        );
+
+        // Toggling again collapses it back.
+        state.toggle("Notes");
+        assert!(!state.is_expanded("Notes"));
+        assert_eq!(
+            row_summary(&state.visible_rows(&nodes)),
+            vec!["Notes", "root.md"]
+        );
+    }
+
+    #[test]
+    fn nested_expansion_flattens_depth_first() {
+        let nodes = sample_tree();
+        let mut state = TreeState::default();
+        state.expand("Notes");
+        state.expand("Notes/nested");
+
+        let rows = state.visible_rows(&nodes);
+        assert_eq!(
+            row_summary(&rows),
+            vec!["Notes+", "-nested+", "--Deep.md", "-Glass.md", "root.md"]
+        );
+        // Row paths stay vault-relative and full.
+        assert_eq!(rows[3].path, "Notes/Glass.md");
+        assert!(!rows[3].is_folder);
+    }
+
+    #[test]
+    fn selection_is_kernel_state() {
+        let mut state = TreeState::default();
+        assert_eq!(state.selected(), None);
+        state.select("Notes/Glass.md");
+        assert_eq!(state.selected(), Some("Notes/Glass.md"));
+        state.select("root.md");
+        assert_eq!(state.selected(), Some("root.md"));
+    }
+
+    #[test]
+    fn collapsing_a_parent_hides_but_keeps_nested_expansion() {
+        let nodes = sample_tree();
+        let mut state = TreeState::default();
+        state.expand("Notes");
+        state.expand("Notes/nested");
+        // Collapsing the parent hides the child rows...
+        assert!(state.collapse("Notes"));
+        assert_eq!(
+            row_summary(&state.visible_rows(&nodes)),
+            vec!["Notes", "root.md"]
+        );
+        // ...but the child's expansion state survives re-expansion.
+        state.expand("Notes");
+        assert!(state.is_expanded("Notes/nested"));
+        assert_eq!(
+            row_summary(&state.visible_rows(&nodes)),
+            vec!["Notes+", "-nested+", "--Deep.md", "-Glass.md", "root.md"]
+        );
+        // Collapsing an already-collapsed folder reports false.
+        assert!(!state.collapse("root.md"));
     }
 }
