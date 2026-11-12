@@ -11,6 +11,7 @@ mod editor_text;
 mod glass;
 mod highlight;
 mod live;
+mod panels;
 mod reading;
 mod scroll;
 mod settings;
