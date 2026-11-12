@@ -6394,6 +6394,7 @@ dependencies = [
  "nucleo",
  "serde",
  "serde_json",
+ "tempfile",
  "vault-core",
  "vault-md",
  "vault-platform",

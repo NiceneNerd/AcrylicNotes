@@ -303,4 +303,33 @@ mod tests {
         assert_eq!(entries[1].level, 2);
         assert!(entries[1].block > entries[0].block);
     }
+
+    #[test]
+    fn backlink_and_tag_view_models_read_a_real_vault() {
+        // The repo's basic fixture: Welcome <-> Deep Note link both ways.
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/basic");
+        let vault = vault_core::Vault::open(&root).expect("fixture vault opens");
+
+        let backlinks = sorted_backlinks(&vault, "notes/sub/Deep Note.md");
+        assert_eq!(backlinks, vec!["notes/Welcome.md".to_string()]);
+
+        // A scratch vault exercises the tag drill-down end to end.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("a.md"),
+            "---\ntags: [alpha, beta]\n---\n\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("b.md"), "---\ntags: [alpha]\n---\n\nbody\n").unwrap();
+        let scratch = vault_core::Vault::open(tmp.path()).unwrap();
+        assert_eq!(
+            tag_counts(&scratch),
+            vec![("alpha".to_string(), 2usize), ("beta".to_string(), 1usize)]
+        );
+        assert_eq!(
+            tag_notes(&scratch, "alpha"),
+            vec!["a.md".to_string(), "b.md".to_string()]
+        );
+    }
 }
