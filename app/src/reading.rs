@@ -26,6 +26,8 @@ use cosmic::Element;
 use vault_core::{NoteSource, Vault, VaultIndex};
 use vault_md::{parse_note, Block, Doc, Embed, Fold, Inline, ListItem, WikiLink};
 
+use vault_app::markdown::plain_inlines;
+
 use crate::app::{Message, Palette};
 use serde_json::Value;
 use serde_saphyr::from_str;
@@ -72,30 +74,8 @@ pub fn heading_size(level: u8, base: f32) -> f32 {
     (base * factor).round()
 }
 
-/// One heading for the outline panel (M4b): its top-level block index, the
-/// heading level and its plain text.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutlineEntry {
-    pub block: usize,
-    pub level: u8,
-    pub text: String,
-}
-
-/// Top-level headings of a document, in document order.
-pub fn outline(doc: &Doc) -> Vec<OutlineEntry> {
-    doc.blocks
-        .iter()
-        .enumerate()
-        .filter_map(|(i, block)| match block {
-            Block::Heading { level, content, .. } => Some(OutlineEntry {
-                block: i,
-                level: *level,
-                text: plain_inlines(content),
-            }),
-            _ => None,
-        })
-        .collect()
-}
+// The outline view model (OutlineEntry + outline()) moved to
+// vault_app::navigation with the other navigation view models.
 
 /// The plain text of a block, descending into nested structures (lists,
 /// quotes, callouts, footnote definitions, tables). Embeds do not descend —
@@ -1232,40 +1212,6 @@ fn slice_block<'a>(blocks: &'a [Block], block_id: &str) -> &'a [Block] {
     &[]
 }
 
-fn plain_inlines(inlines: &[Inline]) -> String {
-    let mut out = String::new();
-    for inline in inlines {
-        match inline {
-            Inline::Text(s) | Inline::Code(s) | Inline::Math(s) | Inline::Html(s) => {
-                out.push_str(s)
-            }
-            Inline::Emph(inner)
-            | Inline::Strong(inner)
-            | Inline::Strike(inner)
-            | Inline::Highlight(inner)
-            | Inline::InlineFootnote(inner) => out.push_str(&plain_inlines(inner)),
-            Inline::Link { content, .. } => out.push_str(&plain_inlines(content)),
-            Inline::WikiLink(link) => out.push_str(&plain_wiki_label(link)),
-            Inline::Image { alt, .. } => out.push_str(alt),
-            Inline::Embed(embed) => out.push_str(&embed.target.note),
-            Inline::Tag(t) => {
-                out.push('#');
-                out.push_str(t);
-            }
-            Inline::FootnoteRef(l) => out.push_str(&format!("[{l}]")),
-            Inline::SoftBreak | Inline::HardBreak => out.push(' '),
-        }
-    }
-    out
-}
-
-fn plain_wiki_label(link: &WikiLink) -> String {
-    link.alias
-        .as_ref()
-        .map(|alias| plain_inlines(alias))
-        .unwrap_or_else(|| link.target.note.clone())
-}
-
 fn default_callout_title(kind: &str) -> &'static str {
     match kind.to_lowercase().as_str() {
         "note" | "info" | "todo" => "Note",
@@ -1538,19 +1484,6 @@ mod tests {
         assert_eq!(superscript_digits("note"), None);
         assert_eq!(superscript_digits(""), None);
         assert_eq!(superscript_digits("1a"), None);
-    }
-
-    #[test]
-    fn outline_lists_top_level_headings_with_block_indices() {
-        let doc = parse_note("# One\n\ntext\n\n## Two\n\n- a list\n- items\n\n# Three\n");
-        let entries = outline(&doc);
-        assert_eq!(entries.len(), 3, "{entries:?}");
-        assert_eq!(entries[0].block, 0);
-        assert_eq!(entries[0].level, 1);
-        assert_eq!(entries[0].text, "One");
-        assert_eq!(entries[1].block, 2);
-        assert_eq!(entries[1].level, 2);
-        assert_eq!(entries[2].text, "Three");
     }
 
     #[test]

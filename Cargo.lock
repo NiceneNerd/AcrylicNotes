@@ -6391,9 +6391,11 @@ dependencies = [
 name = "vault-app"
 version = "0.1.0"
 dependencies = [
+ "nucleo",
  "serde",
  "serde_json",
  "vault-core",
+ "vault-md",
  "vault-platform",
 ]
 

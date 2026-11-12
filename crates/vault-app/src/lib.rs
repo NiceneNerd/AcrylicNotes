@@ -12,7 +12,9 @@
 pub mod app_state;
 pub mod commands;
 pub mod effects;
+pub mod fuzzy;
 pub mod ids;
+pub mod markdown;
 pub mod navigation;
 pub mod persistence;
 pub mod reducer;
@@ -20,6 +22,7 @@ pub mod repository;
 pub mod search;
 pub mod settings;
 pub mod tabs;
+pub mod tree;
 pub mod workflow;
 
 pub use app_state::AppState;

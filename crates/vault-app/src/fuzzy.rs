@@ -77,6 +77,21 @@ pub fn rank(query: &str, needles: &[String], limit: usize) -> Vec<Ranked> {
 ///    unrelated files whose folder happens to contain those letters.
 ///
 /// Ties keep the caller's order (the vault's alphabetical paths).
+/// The file title of a vault-relative path: the last component without
+/// its `.md` ("Notes/Journal/Daily.md" → "Daily"). The path-aware ranker
+/// scores the title separately from the whole path.
+pub fn title_of(path: &str) -> String {
+    path.rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches(".md")
+        .to_string()
+}
+
+/// Rank `paths` against `query` with path-aware rules: `/` counts as a
+/// delimiter, so matches right after a folder separator get the
+/// word-boundary bonus, and word hits on the file title outrank hits on
+/// the folder path (tiered).
 pub fn rank_paths(query: &str, paths: &[String], limit: usize) -> Vec<Ranked> {
     let words: Vec<&str> = query.split_whitespace().collect();
     if words.is_empty() {
@@ -97,7 +112,7 @@ pub fn rank_paths(query: &str, paths: &[String], limit: usize) -> Vec<Ranked> {
     let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
     let mut ranked: Vec<Candidate> = Vec::new();
     for (index, path) in paths.iter().enumerate() {
-        let title = crate::app::title_of(path);
+        let title = title_of(path);
         let mut score_total = 0u32;
         // Tier 2: every word hit the title. Tier 1: at least one word
         // only hit the folder path.

@@ -140,10 +140,10 @@ Source of truth: the `Message` enum (`app/src/app.rs:317–541`) and its `update
 | NAV-006 | Search panel: input + button, worker-thread search, "No matches."/"N matches", title + path:line + 64-char snippet | view.rs:713–747 |
 | NAV-007 | Search engine: ripgrep library, `.md` only, hidden skipped, gitignore NOT respected, smart-case, regex w/ literal fallback, 200-hit cap | vault-core/src/search.rs:29–80 |
 | NAV-008 | `SearchOpen`: opens note, Source→Split, scrolls reading to first block containing query | app.rs:4719–4738 |
-| NAV-009 | Tags panel: sorted tags with counts, back button, click-clears filter | view.rs:750–796 |
-| NAV-010 | Links panel: backlinks of active note, nearest-first resolution | view.rs:800–826 |
-| NAV-011 | Outline panel: headings indented 14 px × (level−1) capped 4; click jumps (PANE-009) | view.rs:829–858 |
-| NAV-012 | Quick switcher: 20 items max; empty query = recent-first; fuzzy per-word conjunctive (nucleo) | app.rs:2046–2073, fuzzy.rs:26–120 |
+| NAV-009 | Tags panel: sorted tags with counts, back button, click-clears filter — the tag data is the **shared** `vault_app::navigation::{tag_counts, tag_notes}` view models since Phase 5 | crates/vault-app/src/navigation.rs, view.rs |
+| NAV-010 | Links panel: backlinks of active note, nearest-first resolution — the sorted list is the **shared** `vault_app::navigation::sorted_backlinks` view model since Phase 5 | crates/vault-app/src/navigation.rs, view.rs |
+| NAV-011 | Outline panel: headings indented 14 px × (level−1) capped 4; click jumps (PANE-009) — the heading list is the **shared** `vault_app::navigation::outline` view model since Phase 5 | crates/vault-app/src/navigation.rs, view.rs |
+| NAV-012 | Quick switcher: 20 items max; empty query = recent-first; fuzzy per-word conjunctive (nucleo) — the whole switcher state machine is the **shared** `vault_app::navigation::QuickSwitcher` + `vault_app::fuzzy` rankers since Phase 5 | crates/vault-app/src/{navigation,fuzzy}.rs, app.rs handlers |
 | NAV-013 | Switcher UI: auto-focused input, `▸` selection, dimmed backdrop, max width 560, opaque layer | view.rs:882–940 |
 | NAV-014 | Switcher activation: Enter/click/Esc; no-op without vault | app.rs:4750–4792 |
 
@@ -157,7 +157,7 @@ Source of truth: the `Message` enum (`app/src/app.rs:317–541`) and its `update
 | TREE-004 | `TreeSort` (4 orders), collapse/expand-all, collapse-others, reveal current | view.rs:388–477 |
 | TREE-005 | Drag-and-drop move (app-level pointer state, 6 px threshold, measured row bounds) | drag.rs |
 | TREE-006 | Delete acts immediately — **no confirmation dialog**; files go to `.trash/` (flagged for parity) | app.rs:3692–3738 |
-| TREE-007 | Sort semantics: folders first (case-insensitive name), notes per order, attachments sink last in date orders | tree.rs:40–155 |
+| TREE-007 | Sort semantics: folders first (case-insensitive name), notes per order, attachments sink last in date orders — the whole tree model (`TreeNode`, builder, sorts, tree edits) moved to **`vault_app::tree`** in Phase 5 | crates/vault-app/src/tree.rs |
 | TREE-008 | Attachment tree filter: normalized extensions, case-insensitive, empty shows all | app.rs:768–785 |
 
 ## 8. Links (LINK-*)

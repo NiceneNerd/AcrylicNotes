@@ -26,7 +26,7 @@ use crate::editor_text::{
 };
 use crate::reading;
 use crate::scroll::READING_SCROLL;
-use crate::tree::TreeNode;
+use vault_app::tree::TreeNode;
 
 /// Fixed vertical padding around the reading text column: enough to give
 /// the document some breathing room, but not part of the user-configurable
@@ -759,13 +759,11 @@ fn tags_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message>
         .width(Length::Fill);
     match &app.selected_tag {
         None => {
-            let mut tags = vault.all_tags();
-            tags.sort();
+            let tags = vault_app::navigation::tag_counts(vault);
             if tags.is_empty() {
                 col = col.push(text("No tags in this vault.").class(palette.muted));
             }
-            for tag in tags {
-                let count = vault.notes_for_tag(&tag).len();
+            for (tag, count) in tags {
                 col = col.push(
                     button::text(format!("#{tag} ({count})"))
                         .on_press(Message::TagSelected(tag))
@@ -782,9 +780,7 @@ fn tags_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message>
                     .height(Length::Shrink)
                     .width(Length::Fill),
             );
-            let mut notes = vault.notes_for_tag(tag);
-            notes.sort();
-            for path in notes {
+            for path in vault_app::navigation::tag_notes(vault, tag) {
                 col = col.push(
                     button::text(title_of(&path))
                         .on_press(Message::TabOpen(path))
@@ -811,8 +807,7 @@ fn links_panel<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message
         .padding(8)
         .width(Length::Fill);
     col = col.push(text(format!("Links to “{}”", title_of(path))).class(palette.muted));
-    let mut backlinks = vault.backlinks(path);
-    backlinks.sort();
+    let backlinks = vault_app::navigation::sorted_backlinks(vault, path);
     if backlinks.is_empty() {
         col = col.push(text("No backlinks.").class(palette.muted));
     }

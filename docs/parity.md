@@ -37,7 +37,7 @@ scenarios.
 | NAV-* | Search | — | — | Existing (reference) | Not started |
 | NAV-* | Tags/backlinks | — | — | Existing (reference) | Not started |
 | NAV-* | Outline | — | — | Existing (reference) | Not started |
-| NAV-* | Quick switcher | — | — | Existing (reference) | Not started |
+| NAV-* | Quick switcher | — | — | Existing (reference; switcher/fuzzy/tags/backlinks/outline/tree view models shared via `vault_app::{navigation,tree,fuzzy}` since Phase 5) | Not started |
 | EDIT-* | Find/replace | — | — | Existing (reference) | Not started |
 | DLG-* | Dialogs | — | — | Existing (reference) | Not started |
 | PLAT-* | Attachments | — | — | Existing (reference) | Not started |

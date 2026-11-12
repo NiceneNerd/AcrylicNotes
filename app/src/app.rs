@@ -36,7 +36,7 @@ fn hit_view(hit: vault_core::search::SearchHit) -> SearchHitView {
 
 use crate::live;
 use crate::settings;
-use crate::tree::{self, TreeNode};
+use vault_app::tree::{self, TreeNode};
 
 /// How the note area is laid out. Defined in settings (it persists) and
 /// re-exported here.
@@ -72,21 +72,15 @@ impl SidePanelIcon for SidePanel {
     }
 }
 
-/// The quick switcher: a fuzzy overlay over all note paths (M4b, nucleo).
-#[derive(Debug, Default)]
-pub struct Switcher {
-    pub open: bool,
-    pub query: String,
-    /// Ranked note paths (already materialized from the index).
-    pub items: Vec<String>,
-    pub selected: usize,
-}
-
+/// The quick switcher is a shared view model (`vault_app::navigation::
+/// QuickSwitcher`): the shell only feeds it the vault's notes and renders
+/// its items.
 /// Id of the switcher's text input (so it can be focused on open).
 pub const SWITCHER_INPUT: &str = "switcher-input";
 
-/// How many notes the quick switcher shows at most.
-pub const SWITCHER_MAX_ITEMS: usize = 20;
+/// How many notes the quick switcher shows at most (the view model's
+/// policy constant, re-exported for the shell's overlays).
+use vault_app::navigation::SWITCHER_MAX_ITEMS;
 
 /// Id of the find bar's text input (focused when find opens).
 pub const FIND_INPUT: &str = "find-input";
@@ -181,8 +175,9 @@ pub struct Tab {
     /// editor text actually changes (one parse per edit, not per frame).
     pub doc: Doc,
     doc_text: String,
-    /// Headings for the outline panel, in sync with `doc`.
-    pub outline: Vec<crate::reading::OutlineEntry>,
+    /// Headings for the outline panel, in sync with `doc` (the view
+    /// model lives in `vault_app::navigation`).
+    pub outline: Vec<vault_app::navigation::OutlineEntry>,
     /// Callouts the user folded by hand (ids from the reading renderer).
     pub folds: HashSet<u64>,
     /// Undo snapshots: the text and cursor before each edit, newest last.
@@ -244,7 +239,7 @@ impl Tab {
             self.words = count_words(&text);
             self.chars = text.chars().count();
             self.doc_text = text;
-            self.outline = crate::reading::outline(&self.doc);
+            self.outline = vault_app::navigation::outline(&self.doc);
         }
     }
 
@@ -581,7 +576,7 @@ pub struct VaultNotes {
     /// preference, read when glass is evaluated.
     pub appearance: Box<dyn vault_platform::AppearanceService>,
     pub selected_tag: Option<String>,
-    pub switcher: Switcher,
+    pub switcher: vault_app::navigation::QuickSwitcher,
     // --- M4c ---
     /// When the editor last saw an edit action; drives autosave-on-idle.
     pub last_edit: Option<std::time::Instant>,
@@ -1332,7 +1327,7 @@ fn wiki_replacement(text: &str, cursor: Position, target: &str) -> Option<WikiRe
 /// paths so duplicate-titled notes stay distinguishable.
 pub(crate) fn wiki_paths(query: &str, paths: &[String]) -> Vec<String> {
     let titles: Vec<String> = paths.iter().map(|p| title_of(p)).collect();
-    crate::fuzzy::rank(query, &titles, WIKI_MAX_ITEMS)
+    vault_app::fuzzy::rank(query, &titles, WIKI_MAX_ITEMS)
         .into_iter()
         .map(|ranked| paths[ranked.index].clone())
         .collect()
@@ -2067,33 +2062,18 @@ impl VaultNotes {
         }
     }
 
-    /// Re-rank the switcher's items from the vault's note paths.
+    /// Re-rank the switcher's items from the vault's notes. The ranking
+    /// policy lives in the shared view model; the shell only feeds it
+    /// the note list.
     fn rerank_switcher(&mut self) {
-        let query = self.switcher.query.clone();
-        if let Some(vault) = self.vault.as_ref() {
-            let mut notes = vault.notes_sorted();
-            if query.trim().is_empty() {
-                // No query: the most recently touched notes first (the
-                // ones you are working on), ties alphabetical. A plain
-                // path dump buries them under whatever sorts first.
-                notes.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.path.cmp(&b.path)));
-                self.switcher.items = notes
-                    .iter()
-                    .take(SWITCHER_MAX_ITEMS)
-                    .map(|note| note.path.clone())
-                    .collect();
-            } else {
-                let paths: Vec<String> = notes.iter().map(|note| note.path.clone()).collect();
-                self.switcher.items = crate::fuzzy::rank_paths(&query, &paths, SWITCHER_MAX_ITEMS)
-                    .into_iter()
-                    .map(|ranked| paths[ranked.index].clone())
-                    .collect();
+        match self.vault.as_ref() {
+            Some(vault) => {
+                let notes = vault.notes_sorted();
+                let owned: Vec<vault_core::Note> = notes.into_iter().cloned().collect();
+                self.switcher
+                    .set_query(self.switcher.query.clone(), &owned, SWITCHER_MAX_ITEMS);
             }
-        } else {
-            self.switcher.items.clear();
-        }
-        if self.switcher.selected >= self.switcher.items.len() {
-            self.switcher.selected = 0;
+            None => self.switcher.clear_items(),
         }
     }
 
@@ -3937,7 +3917,7 @@ impl cosmic::Application for VaultNotes {
             opener: vault_platform_linux::external_opener(),
             appearance: vault_platform_linux::appearance(),
             selected_tag: None,
-            switcher: Switcher::default(),
+            switcher: vault_app::navigation::QuickSwitcher::default(),
             last_edit: None,
             glass_style: vault_glass::GlassStyle::Opaque,
             theme: settings::ThemeChoice::default(),
@@ -4907,10 +4887,8 @@ impl cosmic::Application for VaultNotes {
                     // No vault: the overlay would render nowhere (empty state).
                     return Task::none();
                 }
-                self.switcher.open = !self.switcher.open;
+                self.switcher.toggle();
                 if self.switcher.open {
-                    self.switcher.query.clear();
-                    self.switcher.selected = 0;
                     self.rerank_switcher();
                     return cosmic::widget::text_input::focus::<Message>(Id::new(SWITCHER_INPUT))
                         .map(cosmic::Action::App);
@@ -4924,25 +4902,21 @@ impl cosmic::Application for VaultNotes {
                 Task::none()
             }
             Message::SwitcherMove(delta) => {
-                if !self.switcher.items.is_empty() {
-                    let len = self.switcher.items.len() as i32;
-                    let next = (self.switcher.selected as i32 + delta).rem_euclid(len);
-                    self.switcher.selected = next as usize;
-                }
+                self.switcher.move_selection(delta);
                 Task::none()
             }
             Message::SwitcherActivate => {
-                let Some(path) = self.switcher.items.get(self.switcher.selected).cloned() else {
+                let Some(path) = self.switcher.selected_path().cloned() else {
                     return Task::none();
                 };
-                self.switcher.open = false;
+                self.switcher.close();
                 self.open_tab(path)
             }
             Message::SwitcherSelect(i) => {
                 let Some(path) = self.switcher.items.get(i).cloned() else {
                     return Task::none();
                 };
-                self.switcher.open = false;
+                self.switcher.close();
                 self.open_tab(path)
             }
             Message::KeyPressed(status, modifiers, key) => {
@@ -6393,7 +6367,7 @@ mod find_tests {
                 backdrop: vault_platform::Backdrop::Opaque,
             }),
             selected_tag: None,
-            switcher: Switcher::default(),
+            switcher: vault_app::navigation::QuickSwitcher::default(),
             last_edit: None,
             glass_style: vault_glass::GlassStyle::Opaque,
             theme: settings::ThemeChoice::default(),
