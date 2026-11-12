@@ -27,9 +27,9 @@ impl WindowsEffectRunner {
 
     /// Execute `effects`, feeding outcomes back as `AppEvent`s.
     #[cfg(target_os = "windows")]
-    pub fn run(&mut self, effects: Vec<Effect>) {
+    pub fn run(&mut self, effects: &[Effect]) {
         for effect in effects {
-            match effect.kind {
+            match &effect.kind {
                 vault_app::effects::EffectKind::PersistSettings => {
                     // Settings persistence is handled by the libcosmic
                     // shell's storage; on Windows it goes through the
@@ -43,7 +43,7 @@ impl WindowsEffectRunner {
                 vault_app::effects::EffectKind::ReloadTab { .. } => {}
                 vault_app::effects::EffectKind::SearchVault { .. } => {}
                 vault_app::effects::EffectKind::OpenExternal { target } => {
-                    let _ = open_external_target(target);
+                    let _ = open_external_target(target.clone());
                 }
             }
         }

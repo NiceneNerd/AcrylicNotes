@@ -54,13 +54,13 @@ impl WindowsApp {
     pub fn handle_native(&mut self, message: WindowsMessage) -> Vec<Effect> {
         let effects = match message {
             WindowsMessage::Command(cmd) => self.shared.dispatch(cmd),
-            WindowsMessage::EffectCompleted { id, event } => {
+            WindowsMessage::EffectCompleted { event, .. } => {
                 self.shared.handle(event);
                 Vec::new()
             }
             WindowsMessage::Native(_) => Vec::new(),
         };
-        self.runner.run(effects);
+        self.runner.run(&effects);
         effects
     }
 

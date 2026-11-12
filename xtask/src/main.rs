@@ -11,6 +11,9 @@
 //!   test-windows-core   cross-compile check of the platform-neutral shared
 //!                       crates (vault-core, vault-md, vault-app, vault-platform)
 //!                       for x86_64-pc-windows-gnu (target must be installed)
+//!   check-windows-ui    cross-compile check of the app-windows frontend
+//!                       (cfg(windows) code incl. the pinned windows-reactor)
+//!                       for x86_64-pc-windows-gnu (target must be installed)
 //!   parity-report       summarize docs/parity.md matrix rows by Windows status
 
 use std::process::{exit, Command};
@@ -68,6 +71,13 @@ fn main() {
             }
             run_cargo(&cmd);
         }
+        Some("check-windows-ui") => {
+            let target = args
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or("x86_64-pc-windows-gnu");
+            run_cargo(&["check", "--target", target, "-p", "app-windows"]);
+        }
         Some("parity-report") => parity_report(),
         Some("help") | Some("--help") | Some("-h") => print_usage(),
         Some(other) => {
@@ -101,6 +111,10 @@ fn print_usage() {
     println!(
         "  test-windows-core [target]  cross-compile check for x86_64-pc-windows-gnu \
          (default) of vault-core, vault-md, vault-app, vault-platform"
+    );
+    println!(
+        "  check-windows-ui [target]   cross-compile check of app-windows \
+         (cfg(windows) code + windows-reactor pin) for x86_64-pc-windows-gnu (default)"
     );
     println!("  parity-report         summarize docs/parity.md matrix rows by Windows status");
     println!();

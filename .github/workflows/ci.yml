@@ -52,3 +52,17 @@ jobs:
       - run: |
           cargo check --tests --target x86_64-pc-windows-gnu \
             -p vault-core -p vault-md -p vault-app -p vault-platform
+
+  check-windows-ui:
+    name: cross-compile app-windows UI path for x86_64-pc-windows-gnu
+    runs-on: ubuntu-latest
+    needs: [clippy]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      # Type-checks the cfg(windows) code (WindowsApp, effect runner, message
+      # flow) and the pinned windows-reactor dependency, which no Linux build
+      # compiles. Native execution/UI verification stays user-side.
+      - run: cargo run -p xtask -- check-windows-ui

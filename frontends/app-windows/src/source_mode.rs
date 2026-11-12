@@ -25,7 +25,7 @@ pub struct SourceEditor {
 impl SourceEditor {
     /// Create a new source editor showing `text`.
     #[cfg(target_os = "windows")]
-    pub fn new(text: &str) -> Self {
+    pub fn new(_text: &str) -> Self {
         Self {
             caret: (0, 0),
             has_selection: false,
