@@ -17,6 +17,8 @@ pub struct Config {
     pub port: u16,
     /// Required token; `None` disables auth (explicit `--no-auth` only).
     pub auth: Option<String>,
+    /// Limit the web view to this vault-relative folder (and its subfolders).
+    pub view_folder: Option<String>,
 }
 
 /// One CLI mistake, with the usage line attached.
@@ -31,10 +33,14 @@ impl std::fmt::Display for ArgsError {
 
 pub const USAGE: &str =
     "usage: vault-web [VAULT_PATH] [--port N] [--bind ADDR] [--token T] [--no-auth]
+                 [--view-folder PATH]
 
 Serves a vault read-only over HTTP. Vault defaults to the last-used vault
 from the GUI's settings. Auth defaults to a generated token (printed at
-startup); pass it as `?token=…` or `Authorization: Bearer …`.";
+startup); pass it as `?token=…` or `Authorization: Bearer …`.
+
+--view-folder limits the view to one folder of the vault (and its
+subfolders); notes outside it are neither listed nor reachable.";
 
 /// Parse CLI args into a [`Config`]. `vault` may still be empty — the caller
 /// falls back to the last-used vault (and reports it in the error).
@@ -44,6 +50,7 @@ pub fn parse_args(args: &[String], default_vault: Option<PathBuf>) -> Result<Con
     let mut port: Option<u16> = None;
     let mut token: Option<String> = None;
     let mut no_auth = false;
+    let mut view_folder: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -75,6 +82,12 @@ pub fn parse_args(args: &[String], default_vault: Option<PathBuf>) -> Result<Con
                 token = Some(value.clone());
             }
             "--no-auth" => no_auth = true,
+            "--view-folder" => {
+                let Some(value) = it.next() else {
+                    return Err(ArgsError("--view-folder needs a value".into()));
+                };
+                view_folder = Some(value.to_string());
+            }
             "--help" | "-h" => return Err(ArgsError(String::new())),
             other => {
                 if other.starts_with('-') {
@@ -114,6 +127,7 @@ pub fn parse_args(args: &[String], default_vault: Option<PathBuf>) -> Result<Con
         bind,
         port: port.unwrap_or(8177),
         auth,
+        view_folder,
     })
 }
 
@@ -235,5 +249,17 @@ mod tests {
     #[test]
     fn generated_tokens_differ() {
         assert_ne!(generate_token(), generate_token());
+    }
+
+    #[test]
+    fn view_folder_is_parsed() {
+        let config = parse_args(&args(&["/v", "--view-folder", "Notes/Sub"]), None).unwrap();
+        assert_eq!(config.view_folder.as_deref(), Some("Notes/Sub"));
+    }
+
+    #[test]
+    fn view_folder_defaults_to_none() {
+        let config = parse_args(&args(&["/v"]), None).unwrap();
+        assert_eq!(config.view_folder, None);
     }
 }

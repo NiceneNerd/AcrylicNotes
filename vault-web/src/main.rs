@@ -32,7 +32,11 @@ async fn main() {
         }
     };
 
-    let state = Arc::new(ServerState::new(vault, cfg.auth.clone()));
+    let state = Arc::new(ServerState::new(
+        vault,
+        cfg.auth.clone(),
+        cfg.view_folder.clone(),
+    ));
     let app = vault_web::server::router(state);
     let addr = std::net::SocketAddr::new(cfg.bind, cfg.port);
 

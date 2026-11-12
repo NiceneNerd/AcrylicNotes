@@ -52,17 +52,17 @@ fn setup() -> (tempfile::TempDir, PathBuf) {
     (tmp, root)
 }
 
-fn app_with(root: &std::path::Path, auth: Option<String>) -> Router {
+fn app_with(root: &std::path::Path, auth: Option<String>, view_folder: Option<String>) -> Router {
     let vault = Vault::open(root).unwrap();
-    router(Arc::new(ServerState::new(vault, auth)))
+    router(Arc::new(ServerState::new(vault, auth, view_folder)))
 }
 
 fn app(root: &std::path::Path) -> Router {
-    app_with(root, None)
+    app_with(root, None, None)
 }
 
 fn token_app(root: &std::path::Path) -> Router {
-    app_with(root, Some(TOKEN.to_string()))
+    app_with(root, Some(TOKEN.to_string()), None)
 }
 
 /// GET a URI; returns status, headers, and the body as text.
@@ -378,7 +378,7 @@ async fn token_accepted_via_query_and_bearer_header() {
 #[tokio::test]
 async fn auth_disabled_when_configured_so() {
     let (_tmp, root) = setup();
-    let (status, _, _) = get(app_with(&root, None), "/n/Note.md").await;
+    let (status, _, _) = get(app_with(&root, None, None), "/n/Note.md").await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -591,4 +591,119 @@ async fn first_token_visit_can_sign_in_and_theme_in_one_click() {
     // The redirect keeps the token (the browser re-presents it; the session
     // cookie is already in hand) but drops the theme parameter.
     assert_eq!(headers[header::LOCATION], "/?token=tok123");
+}
+
+// --- view folder -------------------------------------------------------------
+
+fn view_folder_setup() -> tempfile::TempDir {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().join("vault");
+    std::fs::create_dir_all(root.join("Notes")).unwrap();
+    std::fs::create_dir_all(root.join("Notes/Sub")).unwrap();
+    std::fs::create_dir_all(root.join("Journal")).unwrap();
+    std::fs::write(root.join("Root.md"), "root note\n").unwrap();
+    std::fs::write(root.join("Notes/N.md"), "notes note\n").unwrap();
+    std::fs::write(root.join("Notes/Sub/Deep.md"), "deep note\n").unwrap();
+    std::fs::write(root.join("Journal/J.md"), "journal note\n").unwrap();
+    tmp
+}
+
+#[tokio::test]
+async fn view_folder_lists_only_notes_inside() {
+    let tmp = view_folder_setup();
+    let root = tmp.path().join("vault");
+    let app = app_with(&root, None, Some("Notes".to_string()));
+    let (_, _, body) = get(app, "/").await;
+
+    // Inside view folder.
+    assert!(body.contains("href=\"/n/Notes/N.md\""), "{body}");
+    assert!(body.contains("href=\"/n/Notes/Sub/Deep.md\""), "{body}");
+    // Outside view folder.
+    assert!(!body.contains("href=\"/n/Root.md\""), "{body}");
+    assert!(!body.contains("href=\"/n/Journal/J.md\""), "{body}");
+    // No root-level notes section.
+    assert!(!body.contains("<h2>(root)</h2>"), "{body}");
+}
+
+#[tokio::test]
+async fn view_folder_excludes_outside_notes_from_tag_page() {
+    let tmp = view_folder_setup();
+    let root = tmp.path().join("vault");
+    // Tag 'mytag' appears in both Notes/N.md (inside) and Journal/J.md (outside).
+    std::fs::write(
+        root.join("Notes/N.md"),
+        "notes note #mytag\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Journal/J.md"),
+        "journal note #mytag\n",
+    )
+    .unwrap();
+    let app = app_with(&root, None, Some("Notes".to_string()));
+    let (_, _, body) = get(app, "/tag/mytag").await;
+
+    assert!(body.contains("href=\"/n/Notes/N.md\""), "{body}");
+    assert!(!body.contains("href=\"/n/Journal/J.md\""), "{body}");
+}
+
+#[tokio::test]
+async fn view_folder_filters_search_results() {
+    let tmp = view_folder_setup();
+    let root = tmp.path().join("vault");
+    std::fs::write(root.join("Notes/N.md"), "unique term in notes\n").unwrap();
+    std::fs::write(root.join("Journal/J.md"), "unique term in journal\n").unwrap();
+    let app = app_with(&root, None, Some("Notes".to_string()));
+    let (_, _, body) = get(app, "/search?q=unique").await;
+
+    assert!(body.contains("href=\"/n/Notes/N.md\""), "{body}");
+    assert!(!body.contains("href=\"/n/Journal/J.md\""), "{body}");
+}
+
+#[tokio::test]
+async fn view_folder_blocks_note_outside_folder() {
+    let tmp = view_folder_setup();
+    let root = tmp.path().join("vault");
+    let app = app_with(&root, None, Some("Notes".to_string()));
+
+    // Inside view folder: OK.
+    let (status, _, _) = get(app.clone(), "/n/Notes/N.md").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Outside view folder: 404.
+    let (status, _, _) = get(app.clone(), "/n/Root.md").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = get(app, "/n/Journal/J.md").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn view_folder_blocks_files_outside_folder() {
+    let tmp = view_folder_setup();
+    let root = tmp.path().join("vault");
+    let app = app_with(&root, None, Some("Notes".to_string()));
+
+    // Attachment inside view folder: OK.
+    std::fs::create_dir_all(root.join("Notes/attach")).unwrap();
+    std::fs::write(root.join("Notes/attach/img.png"), b"fake-png").unwrap();
+    let (status, _, _) = get(app.clone(), "/files/Notes/attach/img.png").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Attachment outside view folder: 404.
+    std::fs::create_dir_all(root.join("attach")).unwrap();
+    std::fs::write(root.join("attach/outside.png"), b"fake-png").unwrap();
+    let (status, _, _) = get(app, "/files/attach/outside.png").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn view_folder_subfolder_works() {
+    let tmp = view_folder_setup();
+    let root = tmp.path().join("vault");
+    let app = app_with(&root, None, Some("Notes/Sub".to_string()));
+    let (_, _, body) = get(app, "/").await;
+
+    assert!(body.contains("href=\"/n/Notes/Sub/Deep.md\""), "{body}");
+    assert!(!body.contains("href=\"/n/Notes/N.md\""), "{body}");
+    assert!(!body.contains("href=\"/n/Root.md\""), "{body}");
 }

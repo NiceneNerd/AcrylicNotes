@@ -131,6 +131,7 @@ footer {{ max-width: 46rem; margin: 3rem auto 0; color: var(--fg-tertiary); font
 .footnotes {{ margin-top: 2em; border-top: 1px solid var(--fg-tertiary); padding-top: 0.4em; font-size: 0.92em; }}
 .footnotes p {{ margin: 0.2em 0; }}
 .footnote-back {{ text-decoration: none; color: var(--fg-tertiary); }}
+sup {{ line-height: 0; }}
 .tree details {{ margin: 0.15rem 0; }}
 .tree details details {{ margin-left: 1.1rem; border-left: 1px solid var(--bg-tertiary); padding-left: 0.5rem; }}
 .tree summary {{ cursor: pointer; user-select: none; }}

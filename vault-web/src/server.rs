@@ -32,10 +32,12 @@ pub struct ServerState {
     pub vault_name: String,
     pub auth: Option<String>,
     pub strict_breaks: bool,
+    /// Limit the web view to this folder (vault-relative). If None, show entire vault.
+    pub view_folder: Option<String>,
 }
 
 impl ServerState {
-    pub fn new(vault: Vault, auth: Option<String>) -> Self {
+    pub fn new(vault: Vault, auth: Option<String>, view_folder: Option<String>) -> Self {
         let root = vault.root().to_path_buf();
         let vault_name = root
             .file_name()
@@ -51,7 +53,17 @@ impl ServerState {
             vault_name,
             auth,
             strict_breaks,
+            view_folder,
         }
+    }
+
+    /// Whether `rel` (vault-relative) is inside the configured view folder.
+    /// With no view folder configured, everything is allowed.
+    fn in_view(&self, rel: &str) -> bool {
+        let Some(folder) = &self.view_folder else {
+            return true;
+        };
+        rel == folder || rel.starts_with(&format!("{folder}/"))
     }
 }
 
@@ -259,10 +271,14 @@ async fn index_page(
     OriginalUri(uri): OriginalUri,
 ) -> Response {
     let chrome = chrome(&headers, &uri);
-    // folder -> (path, title), "" for the root.
+    // When a view folder is configured, only notes inside it (and its
+    // subfolders) are listed, and only tags appearing on those notes.
     let mut groups: std::collections::BTreeMap<String, Vec<(String, String)>> =
         std::collections::BTreeMap::new();
     for note in state.vault.notes_sorted() {
+        if !state.in_view(&note.path) {
+            continue;
+        }
         let folder = note
             .path
             .rsplit_once('/')
@@ -273,31 +289,45 @@ async fn index_page(
             .or_default()
             .push((note.path.clone(), note.title.clone()));
     }
-    // Folders without notes still appear (they are valid navigation targets
-    // from the GUI's perspective and new notes can land in them).
-    let folder_list = state.vault.folders();
+    let folder_list: Vec<String> = state
+        .vault
+        .folders()
+        .into_iter()
+        .filter(|f| state.in_view(f))
+        .collect();
 
     let mut body = String::new();
-    // The vault as a collapsible folder tree (pure <details>/CSS, collapsed
-    // by default like the GUI sidebar).
     let tree = crate::tree::build(&folder_list, &groups);
     body.push_str(&crate::tree::render(&tree));
 
-    // Root-level notes (the tree holds folders only).
-    let root_notes = groups.get("").cloned().unwrap_or_default();
-    if !root_notes.is_empty() {
-        body.push_str("<h2>(root)</h2>\n<ul>\n");
-        for (path, title) in &root_notes {
-            body.push_str(&format!(
-                "<li><a href=\"/n/{}\">{}</a></li>\n",
-                path_encode(path),
-                page::escape(title)
-            ));
+    // Root-level notes only show when not restricted to a subfolder.
+    if state.view_folder.is_none() {
+        let root_notes = groups.get("").cloned().unwrap_or_default();
+        if !root_notes.is_empty() {
+            body.push_str("<h2>(root)</h2>\n<ul>\n");
+            for (path, title) in &root_notes {
+                body.push_str(&format!(
+                    "<li><a href=\"/n/{}\">{}</a></li>\n",
+                    path_encode(path),
+                    page::escape(title)
+                ));
+            }
+            body.push_str("</ul>\n");
         }
-        body.push_str("</ul>\n");
     }
 
-    let tags = state.vault.all_tags();
+    let tags = state
+        .vault
+        .all_tags()
+        .into_iter()
+        .filter(|tag| {
+            state
+                .vault
+                .notes_for_tag(tag)
+                .iter()
+                .any(|p| state.in_view(p))
+        })
+        .collect::<Vec<_>>();
     if !tags.is_empty() {
         body.push_str("<h2>Tags</h2>\n<p>");
         for tag in &tags {
@@ -325,6 +355,11 @@ async fn note_page(
     // dotfile components are refused (a redirect would leak their shape),
     // and symlinks may not escape the vault.
     if guard::safe_resolve(&state.root, rel).is_none() {
+        return not_found(&state);
+    }
+    // View-folder confinement: notes outside the configured view folder are
+    // unreachable.
+    if !state.in_view(rel) {
         return not_found(&state);
     }
     if !rel.ends_with(".md") {
@@ -388,7 +423,12 @@ async fn tag_page(
 ) -> Response {
     let chrome = chrome(&headers, &uri);
     let tag = tag.trim_start_matches('/');
-    let mut notes = state.vault.notes_for_tag(tag);
+    let mut notes = state
+        .vault
+        .notes_for_tag(tag)
+        .into_iter()
+        .filter(|p| state.in_view(p))
+        .collect::<Vec<_>>();
     notes.sort();
     let mut body = format!(
         "<h1>#{}</h1>\n<p><a href=\"/\">← all notes</a></p>\n<ul>\n",
@@ -446,8 +486,11 @@ async fn search_page(
     );
     let trimmed = q.trim();
     if !trimmed.is_empty() {
-        let hits =
-            vault_core::search::search(&state.root, trimmed, SEARCH_MAX_HITS).unwrap_or_default();
+        let hits = vault_core::search::search(&state.root, trimmed, SEARCH_MAX_HITS)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|hit| state.in_view(&hit.path))
+            .collect::<Vec<_>>();
         body.push_str(&format!(
             "<p>{} match{} for <code>{}</code></p>\n<ul>\n",
             hits.len(),
@@ -472,6 +515,9 @@ async fn search_page(
 async fn file_bytes(State(state): State<Arc<ServerState>>, Path(path): Path<String>) -> Response {
     let rel = path.trim_start_matches('/');
     let Some(full) = guard::safe_resolve(&state.root, rel) else {
+        return not_found(&state);
+    };
+    if !state.in_view(rel) {
         return not_found(&state);
     };
     match std::fs::read(&full) {
