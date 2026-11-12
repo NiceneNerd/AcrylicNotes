@@ -7,6 +7,7 @@ pub mod app;
 pub mod file_tree;
 pub mod reading;
 pub mod source_mode;
+pub mod split_mode;
 pub mod windows_effect_runner;
 pub mod windows_message;
 
