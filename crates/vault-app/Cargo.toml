@@ -6,6 +6,7 @@ description = "GUI-free application kernel: shared state, commands, effects, and
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+vault-core = { path = "../../vault-core" }
 vault-platform = { path = "../vault-platform" }
 
 [dev-dependencies]

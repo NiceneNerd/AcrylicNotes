@@ -175,12 +175,12 @@ Source of truth: the `Message` enum (`app/src/app.rs:317–541`) and its `update
 | ID | Behavior | Source |
 | --- | --- | --- |
 | SAVE-001 | Ctrl+S / Save button saves only the active tab | app.rs:4568 |
-| SAVE-002 | Save plan: body-only write (frontmatter bytes verbatim) when BOM+FM match disk; full text otherwise | app.rs:5104–5138 |
-| SAVE-003 | Guarded save: base-text sentinel; external change refused (`ExternallyModified`) → conflict banner | app.rs:2684–2717 |
-| SAVE-004 | Autosave: 2 s tick, active tab, idle ≥ `autosave_secs` (default 2, clamp 1..=60) | app.rs:3746–3754 |
+| SAVE-002 | Save plan: body-only write (frontmatter bytes verbatim) when BOM+FM match disk; full text otherwise — **shared** in `vault_app::workflow::save_plan` since Phase 4 | crates/vault-app/src/workflow.rs |
+| SAVE-003 | Guarded save: base-text sentinel; external change refused (`ExternallyModified`) → conflict banner — **shared** in `vault_app::workflow::guarded_save` over the `NoteRepository` trait (live `Vault` adapter, `MemoryRepository` fake) since Phase 4 | crates/vault-app/src/{workflow,repository}.rs |
+| SAVE-004 | Autosave: 2 s tick, active tab, idle ≥ `autosave_secs` (default 2, clamp 1..=60) — the idle policy is **shared** in `vault_app::workflow::autosave_due` since Phase 4 | crates/vault-app/src/workflow.rs, app.rs tick |
 | SAVE-005 | Watcher poll with own-write suppression | vault-core/src/vault.rs:97–165 |
 | SAVE-006 | External-change classification: identical → silent; clean → auto-reload + info banner; dirty → conflict banner | app.rs:5030–5052 |
-| SAVE-007 | Conflict banner: Reload from disk / Keep mine / Save mine anyway (fresh sentinel) | app.rs:3925–3978 |
+| SAVE-007 | Conflict banner: Reload from disk / Keep mine / Save mine anyway (fresh sentinel) — the decision application is **shared** in `vault_app::workflow::resolve_conflict` since Phase 4 | crates/vault-app/src/workflow.rs, app.rs banner handlers |
 | SAVE-008 | Reloaded info banner + Dismiss | view.rs:195–208 |
 | SAVE-009 | Close-tab: dirty saves first; refused save keeps tab open | app.rs:2719–2745 |
 | SAVE-010 | Delete pre-save: dirty affected tabs saved first; refusal aborts deletion | app.rs:3692–3709 |
@@ -275,3 +275,17 @@ load-modify-store (SET-021/022).
   through the `AppearanceService` trait.
 
 Everything else — drag-and-drop, watcher, clipboard, settings — is platform-neutral by design.
+
+## Shared since Phase 4 (persistence workflow)
+
+- **SAVE-002/003** (Phase 4 update): the save-plan decision and the guarded
+  save moved from the cosmic shell into `vault_app::workflow`
+  (`save_plan`, `guarded_save`), executed against the new
+  `vault_app::repository::NoteRepository` trait. The production adapter is
+  the live `Vault`; tests inject the deterministic `MemoryRepository`
+  fake. The cosmic frontend only orchestrates outcomes now.
+- **SAVE-004/007** (Phase 4 update): the autosave idle policy
+  (`autosave_due`) and the conflict-banner decision application
+  (`resolve_conflict`) are shared kernel functions, unit-tested at the
+  reducer/workflow level before the UI was touched (plan §"add fake
+  repository tests before changing UI").

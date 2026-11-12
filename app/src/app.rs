@@ -22,7 +22,6 @@ use vault_app::commands::UiCommand;
 use vault_app::ids::SearchRequestId;
 use vault_app::ids::TabId;
 use vault_app::search::SearchHitView;
-use vault_core::vault::VaultError;
 use vault_core::{NoteSource, ObsidianSettings, Vault, VaultIndex};
 use vault_md::{parse_note, Doc};
 
@@ -726,14 +725,6 @@ impl cosmic::widget::menu::Action for SortMenuAction {
     fn message(&self) -> Self::Message {
         Message::TreeSort(self.0)
     }
-}
-
-/// Pure autosave decision: an idle period measured since the last edit is
-/// due for a save. Unit-testable without an `Instant`.
-/// Pure autosave decision: an idle period measured since the last edit is
-/// at least the configured delay.
-fn autosave_due(idle_since_last_edit: Option<std::time::Duration>, delay_secs: u64) -> bool {
-    idle_since_last_edit.is_some_and(|d| d >= std::time::Duration::from_secs(delay_secs))
 }
 
 /// Persist one settings change: load-modify-store so every other field
@@ -2785,36 +2776,39 @@ impl VaultNotes {
         }
     }
 
-    /// Save tab `idx` through the guarded write path. Returns whether the
-    /// tab is now clean; on refusal (external change) the conflict banner is
-    /// raised and the tab stays dirty.
+    /// Save tab `idx` through the shared guarded-save workflow. Returns
+    /// whether the tab is now clean; on refusal (external change) the
+    /// conflict banner is raised and the tab stays dirty.
     fn save_tab(&mut self, idx: usize) -> bool {
-        let Some(vault) = self.vault.as_mut() else {
-            return false;
+        let outcome = match self.vault.as_mut() {
+            // The live Vault is the NoteRepository; the workflow decides
+            // the write path and applies the sentinel guard.
+            Some(vault) => {
+                let tab = &self.tabs[idx];
+                guarded_save(vault, &tab.path, &tab.content.text(), &tab.base_text)
+            }
+            None => return false,
         };
-        let tab = &mut self.tabs[idx];
-        // The sentinel is the base text our edits were made against: an
-        // external change since then refuses the save instead of clobbering.
-        let base = tab.base_text.clone();
-        match write_tab(vault, tab, &base) {
-            Ok(_) => {
+        match outcome {
+            SaveOutcome::Saved => {
+                let tab = &mut self.tabs[idx];
                 tab.base_text = tab.content.text();
                 tab.refresh_doc();
                 self.error = None;
                 self.rebuild_index();
                 true
             }
-            Err(VaultError::Write(vault_core::WriteError::ExternallyModified)) => {
+            SaveOutcome::ExternallyModified => {
                 // The file changed under us: offer resolution in the banner.
-                let path = tab.path.clone();
+                let path = self.tabs[idx].path.clone();
                 self.banner = Some(Banner {
                     reloaded: Vec::new(),
                     conflicts: vec![path],
                 });
                 false
             }
-            Err(error) => {
-                self.error = Some(format!("save failed: {error}"));
+            SaveOutcome::Failed(message) => {
+                self.error = Some(message);
                 false
             }
         }
@@ -4073,12 +4067,25 @@ impl cosmic::Application for VaultNotes {
                         if !conflicts.iter().any(|p| p == &tab.path) {
                             continue;
                         }
-                        let disk = vault.note_source(&tab.path).unwrap_or_default();
-                        match write_tab(vault, tab, &disk) {
-                            Ok(_) => tab.base_text = tab.content.text(),
-                            Err(error) => {
-                                self.error = Some(format!("overwrite failed: {error}"));
+                        // Deliberate overwrite through the shared conflict
+                        // workflow: the fresh disk text becomes the sentinel.
+                        let text = tab.content.text();
+                        match resolve_conflict(
+                            vault,
+                            &tab.path,
+                            &text,
+                            vault_app::persistence::ConflictDecision::SaveMineAnyway,
+                        ) {
+                            ConflictResolution::Saved => tab.base_text = text,
+                            ConflictResolution::ExternallyModified => {
+                                self.error = Some(
+                                    "overwrite failed: changed on disk while you edited".into(),
+                                );
                             }
+                            ConflictResolution::Failed(message) => {
+                                self.error = Some(message);
+                            }
+                            ConflictResolution::Reloaded { .. } | ConflictResolution::Kept => {}
                         }
                     }
                 }
@@ -5237,41 +5244,12 @@ pub struct TreeDrag {
 /// Movement (px) from the press before a tree drag activates.
 const TREE_DRAG_THRESHOLD: f32 = crate::drag::DRAG_THRESHOLD;
 
-/// How the editor buffer should be written: body-only (frontmatter bytes are
-/// provably untouched) or full text (the user edited the frontmatter).
-pub(crate) enum SavePlan {
-    Body(String),
-    Full(String),
-}
-
-/// Write a tab's buffer through the safe save path.
-///
-/// `original` is the on-disk text this write is based on. Saves normally
-/// pass the tab's `base_text`, so an external change since load is REFUSED
-/// (`ExternallyModified`) instead of silently clobbered; the conflict
-/// banner's "save mine anyway" passes the fresh disk text to overwrite
-/// deliberately.
-pub(crate) fn write_tab(
-    vault: &mut Vault,
-    tab: &mut Tab,
-    original: &str,
-) -> Result<vault_core::WriteResult, VaultError> {
-    let text = tab.content.text();
-    match save_plan(&text, original) {
-        SavePlan::Body(body) => vault.save_note(&tab.path, original, &body),
-        SavePlan::Full(full) => vault.save_note_full(&tab.path, original, &full),
-    }
-}
-
-pub(crate) fn save_plan(editor: &str, disk: &str) -> SavePlan {
-    let editor_split = vault_core::split_frontmatter(editor);
-    let disk_split = vault_core::split_frontmatter(disk);
-    if editor_split.bom == disk_split.bom && editor_split.raw == disk_split.raw {
-        SavePlan::Body(editor_split.body)
-    } else {
-        SavePlan::Full(editor.to_string())
-    }
-}
+// The save write-path decision (body-only vs full text) and the guarded
+// save itself moved to vault_app::workflow (restructure commit 07); the
+// frontend only orchestrates the outcome now.
+use vault_app::workflow::{
+    autosave_due, guarded_save, resolve_conflict, ConflictResolution, SaveOutcome,
+};
 
 /// Sanitize a new note name from an unresolved link target: no traversal, no
 /// dot-directories. Returns the cleaned name (without extension).
@@ -5307,45 +5285,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn body_edits_keep_the_body_path() {
-        let disk = "---\ntitle: T\n---\n\nold body\n";
-        let editor = "---\ntitle: T\n---\n\nnew body\n";
-        match save_plan(editor, disk) {
-            SavePlan::Body(body) => assert_eq!(body, "\nnew body\n"),
-            SavePlan::Full(_) => panic!("frontmatter untouched; body path expected"),
-        }
-    }
-
-    #[test]
-    fn frontmatter_edits_take_the_full_text_path() {
-        let disk = "---\ntitle: T\n---\n\nbody\n";
-        let editor = "---\ntitle: Edited\ntags: [x]\n---\n\nbody\n";
-        match save_plan(editor, disk) {
-            SavePlan::Body(_) => panic!("frontmatter edited; full-text path expected"),
-            SavePlan::Full(full) => assert_eq!(full, editor),
-        }
-    }
-
-    #[test]
-    fn adding_or_removing_frontmatter_takes_the_full_text_path() {
-        assert!(matches!(
-            save_plan("---\na: 1\n---\n\nb\n", "b\n"),
-            SavePlan::Full(_)
-        ));
-        assert!(matches!(
-            save_plan("b\n", "---\na: 1\n---\n\nb\n"),
-            SavePlan::Full(_)
-        ));
-    }
-
-    #[test]
-    fn bom_differences_take_the_full_text_path() {
-        let disk = "---\na: 1\n---\n\nb\n";
-        let editor = "\u{feff}---\na: 1\n---\n\nb\n";
-        assert!(matches!(save_plan(editor, disk), SavePlan::Full(_)));
-    }
-
-    #[test]
     fn new_note_names_reject_traversal_and_dotfiles() {
         assert_eq!(sanitize_new_name("Glass"), Some("Glass".to_string()));
         assert_eq!(
@@ -5377,17 +5316,21 @@ mod tests {
 
     #[test]
     fn tab_save_refuses_to_clobber_external_changes() {
-        use cosmic::iced::widget::text_editor::{Action, Edit};
+        use vault_app::workflow::guarded_save;
 
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("n.md"), "hello\n").unwrap();
         let mut vault = Vault::open(tmp.path()).unwrap();
         let mut tab = Tab::open(TabId::new(0), "n.md".to_string(), "hello\n");
 
-        // Local edit + save against our base: goes through the safe path.
+        // Local edit + save against our base: goes through the safe path
+        // (the live Vault is the NoteRepository adapter).
         tab.content.perform(Action::Edit(Edit::Insert('X')));
         let base = tab.base_text.clone();
-        write_tab(&mut vault, &mut tab, &base).unwrap();
+        assert_eq!(
+            guarded_save(&mut vault, "n.md", &tab.content.text(), &base),
+            vault_app::workflow::SaveOutcome::Saved
+        );
         assert_eq!(
             vault.note_source("n.md").as_deref(),
             Some(tab.content.text().as_str())
@@ -5396,18 +5339,18 @@ mod tests {
         // External change after our base: refused, disk keeps its content.
         std::fs::write(tmp.path().join("n.md"), "external\n").unwrap();
         let base = tab.base_text.clone();
-        let err = write_tab(&mut vault, &mut tab, &base);
-        assert!(matches!(
-            err,
-            Err(VaultError::Write(
-                vault_core::WriteError::ExternallyModified
-            ))
-        ));
+        assert_eq!(
+            guarded_save(&mut vault, "n.md", &tab.content.text(), &base),
+            vault_app::workflow::SaveOutcome::ExternallyModified
+        );
         assert_eq!(vault.note_source("n.md").as_deref(), Some("external\n"));
 
         // The banner's "save mine anyway": fresh disk text as the sentinel.
         let fresh = vault.note_source("n.md").unwrap();
-        write_tab(&mut vault, &mut tab, &fresh).unwrap();
+        assert_eq!(
+            guarded_save(&mut vault, "n.md", &tab.content.text(), &fresh),
+            vault_app::workflow::SaveOutcome::Saved
+        );
         assert_eq!(
             vault.note_source("n.md").as_deref(),
             Some(tab.content.text().as_str())

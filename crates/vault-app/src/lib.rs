@@ -16,9 +16,11 @@ pub mod ids;
 pub mod navigation;
 pub mod persistence;
 pub mod reducer;
+pub mod repository;
 pub mod search;
 pub mod settings;
 pub mod tabs;
+pub mod workflow;
 
 pub use app_state::AppState;
 pub use reducer::App;
