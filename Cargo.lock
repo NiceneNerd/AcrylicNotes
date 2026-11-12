@@ -6395,6 +6395,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "unicode-segmentation",
  "vault-core",
  "vault-md",
  "vault-platform",

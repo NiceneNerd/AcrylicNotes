@@ -78,17 +78,17 @@ Source of truth: the `Message` enum (`app/src/app.rs:317–541`) and its `update
 | EDIT-006 | Word wrap toggle in both editors | view.rs:1195–1199 |
 | EDIT-007 | Undo/redo — per-tab snapshot stacks (text+cursor), limit 100, redo cleared by edits | app.rs:800–842 |
 | EDIT-008 | Formatting: Bold/Italic/Strike/Code/Highlight/Link — wrap selection or insert empty markers | app.rs:292–314, 847–872 |
-| EDIT-009 | Footnote insertion (Ctrl+Alt+F): `[^N]` + `[^N]: ` definition; N = first undefined; definition blank-line normalization; code-fence aware | app.rs:884–1005 |
-| EDIT-010 | Word delete (Ctrl+Backspace/Delete): unicode word boundaries, line-break crossing, one undo step | app.rs:1007–1023 |
-| EDIT-011 | Auto-pairs `( [ { " ' \` \` \` around selection (stays selected for nesting); step-over closer; boundary-checked quotes; setting off inserts raw | app.rs:1417–1592 |
+| EDIT-009 | Footnote insertion (Ctrl+Alt+F): `[^N]` + `[^N]: ` definition; N = first undefined; definition blank-line normalization; code-fence aware — the pure text math is **shared** in `vault_app::editor::{insert_footnote, next_footnote_number}` since Phase 6 | crates/vault-app/src/editor.rs, app.rs handler |
+| EDIT-010 | Word delete (Ctrl+Backspace/Delete): unicode word boundaries, line-break crossing, one undo step — the byte ranges are **shared** in `vault_app::editor::{word_before, word_after}` since Phase 6 (action glue stays in the shell) | crates/vault-app/src/editor.rs, app.rs |
+| EDIT-011 | Auto-pairs `( [ { " ' \` \` \` around selection (stays selected for nesting); step-over closer; boundary-checked quotes; setting off inserts raw — the pair table is **shared** in `vault_app::editor::pair_for` since Phase 6 (the iced-action glue stays in the shell) | crates/vault-app/src/editor.rs, app.rs |
 | EDIT-012 | Clipboard Copy/Cut/Paste/Select-All routed through app messages (join undo/dirty bookkeeping); paste is async | app.rs:4360–4409 |
 | EDIT-013 | Editor context menu: Undo, Redo, Cut, Copy, Paste, Select All | view.rs:512–557 |
 | EDIT-014 | Editor focus persistence — stable `note-editor` id + popup slot | view.rs |
 | EDIT-015 | Find bar UI: query, live count "N of M", up/down, case "Aa" toggle, replace row | view.rs:1075–1136 |
-| EDIT-016 | Find matching: literal substring per line, ASCII case folding (byte-stable offsets) | app.rs:1130–1234 |
+| EDIT-016 | Find matching: literal substring per line, ASCII case folding (byte-stable offsets) — **shared** in `vault_app::editor::{find_matches, first_at_or_after, next_index, replace_spans}` since Phase 6 | crates/vault-app/src/editor.rs |
 | EDIT-017 | Find navigation: first match at/after cursor, wrap next/prev, match selected (live: region caret lifted to file coords) | app.rs:2816–2925 |
 | EDIT-018 | Replace one/all — single undo step; selection points at following match | app.rs:2927–3024 |
-| EDIT-019 | Wiki completion trigger: unclosed `[[`, re-evaluated per edit, setting-gated | app.rs:3153–3205 |
+| EDIT-019 | Wiki completion trigger: unclosed `[[`, re-evaluated per edit, setting-gated — the query scan is **shared** in `vault_app::editor::wiki_query_at` since Phase 6 | crates/vault-app/src/editor.rs, app.rs |
 | EDIT-020 | Wiki dropdown: 8 title rows, dimmed parents, click accepts, bottom-left anchored | view.rs:1256–1294 |
 | EDIT-021 | Wiki acceptance: replaces partial per `link_path_format`, keeps custom label, consumes auto-paired `]]`, one undo step, works in live buffers | app.rs:3207–3318 |
 | EDIT-022 | Unicode entry overlay (Ctrl+Shift+U): hex buffer (max 6), Space/Enter commit, Backspace unravels, Esc cancels | app.rs:1685–1712, 4524–4567 |
@@ -289,3 +289,21 @@ Everything else — drag-and-drop, watcher, clipboard, settings — is platform-
   (`resolve_conflict`) are shared kernel functions, unit-tested at the
   reducer/workflow level before the UI was touched (plan §"add fake
   repository tests before changing UI").
+
+## Shared since Phase 6 (pure editor operations)
+
+- **EDIT-009/010/011/016/019** (Phase 6 update): the pure editor text
+  math left the cosmic shell for `vault_app::editor` — footnote
+  insertion with definition normalization (`insert_footnote`,
+  `next_footnote_number`), find/replace scanning (`find_matches`,
+  `first_at_or_after`, `next_index`, `replace_spans`), unicode word
+  motion (`word_before`, `word_after`), offset/caret math
+  (`offset_of`, `position_of`, `char_boundary`), the bracket pair
+  table (`pair_for`), and the wikilink query scan (`wiki_query_at`).
+  Positions are shared `Caret` (line, byte-column) values; the shell
+  converts its iced cursors at the call sites and keeps only the
+  iced-action glue (`format_actions`, `autopair_actions`,
+  `word_delete_actions`, live-mode region deletion). All moved tests
+  now run at the kernel level (editor.rs: 21 tests over footnote
+  normalization incl. code fences and caret tracking, find edge cases,
+  word motion, byte-exact splices, wikilink byte columns).

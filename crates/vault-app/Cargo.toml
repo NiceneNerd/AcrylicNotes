@@ -11,6 +11,10 @@ vault-md = { path = "../../vault-md" }
 vault-platform = { path = "../vault-platform" }
 # Quick-switcher fuzzy matching (the helix editor's engine).
 nucleo = "0.5"
+# The same word segmentation cosmic-text uses, so the shared editor's
+# word motion finds the same word boundaries the live editor's own
+# motions find.
+unicode-segmentation = "1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -30,15 +30,15 @@ scenarios.
 | NAV-* | Sidebar sections | — | — | Existing (reference) | Not started |
 | TREE-* | File tree | — | — | Existing (reference) | Not started |
 | TAB-* | Tabs | — | — | Existing (reference) | Not started |
-| EDIT-* | Source editor | — | — | Existing (reference) | Not started |
+| EDIT-* | Source editor | — | — | Existing (reference; pure editor text ops shared via `vault_app::editor` since Phase 6) | Not started |
 | PANE-* | Reading view | — | — | Existing (reference) | Not started |
 | PANE-* | Split mode | — | — | Existing (reference) | Not started |
-| EDIT-*, PANE-* | Live mode | — | — | Existing (reference) | Not started |
+| EDIT-*, PANE-* | Live mode | — | — | Existing (reference; word/offset math shared via `vault_app::editor` since Phase 6) | Not started |
 | NAV-* | Search | — | — | Existing (reference) | Not started |
 | NAV-* | Tags/backlinks | — | — | Existing (reference) | Not started |
 | NAV-* | Outline | — | — | Existing (reference) | Not started |
 | NAV-* | Quick switcher | — | — | Existing (reference; switcher/fuzzy/tags/backlinks/outline/tree view models shared via `vault_app::{navigation,tree,fuzzy}` since Phase 5) | Not started |
-| EDIT-* | Find/replace | — | — | Existing (reference) | Not started |
+| EDIT-* | Find/replace | — | — | Existing (reference; matching shared via `vault_app::editor` since Phase 6) | Not started |
 | DLG-* | Dialogs | — | — | Existing (reference) | Not started |
 | PLAT-* | Attachments | — | — | Existing (reference) | Not started |
 | SET-* | Theme | — | — | Existing (reference) | Not started |

@@ -11,6 +11,7 @@
 
 pub mod app_state;
 pub mod commands;
+pub mod editor;
 pub mod effects;
 pub mod fuzzy;
 pub mod ids;
