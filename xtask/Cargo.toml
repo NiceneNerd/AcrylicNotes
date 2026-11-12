@@ -1,0 +1,12 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+description = "Workspace maintenance xtask: shared-crate checks, Windows cross-target checks, parity report."
+
+# No runtime dependencies: the xtask dispatches to `cargo` via
+# std::process::Command so it builds and runs offline without pulling crates
+# into the default workspace gate commands.
+[[bin]]
+name = "xtask"
+path = "src/main.rs"

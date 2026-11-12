@@ -9,6 +9,7 @@ members = [
     "vault-md",
     "app",
     "vault-web",
+    "xtask",
 ]
 # `app` depends on libcosmic + iced from git repos (pinned revs in
 # app/Cargo.toml), so the default commands build/test the UI-free layers
