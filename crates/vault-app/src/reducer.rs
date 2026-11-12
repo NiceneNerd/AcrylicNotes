@@ -19,8 +19,9 @@ pub struct App {
     pub state: AppState,
     effect_ids: IdAllocator,
     /// Effects requested but not yet completed, keyed by id, mapping to
-    /// the tab they act on. Used to reject stale completions.
-    in_flight: HashMap<EffectId, TabId>,
+    /// the tab they act on (`None` for tab-less effects such as opening
+    /// external targets). Used to reject stale completions.
+    in_flight: HashMap<EffectId, Option<TabId>>,
 }
 
 impl App {
@@ -78,8 +79,13 @@ impl App {
                     return Vec::new();
                 };
                 let id = self.effect_ids.allocate();
-                self.in_flight.insert(id, tab);
+                self.in_flight.insert(id, Some(tab));
                 vec![Effect::new(id, EffectKind::SaveTab { tab })]
+            }
+            UiCommand::OpenExternal { target } => {
+                let id = self.effect_ids.allocate();
+                self.in_flight.insert(id, None);
+                vec![Effect::new(id, EffectKind::OpenExternal { target })]
             }
             UiCommand::ResolveConflict { tab, decision } => match decision {
                 crate::persistence::ConflictDecision::KeepMine => {
@@ -89,13 +95,13 @@ impl App {
                 crate::persistence::ConflictDecision::ReloadFromDisk => {
                     self.state.conflicts.retain(|&candidate| candidate != tab);
                     let id = self.effect_ids.allocate();
-                    self.in_flight.insert(id, tab);
+                    self.in_flight.insert(id, Some(tab));
                     vec![Effect::new(id, EffectKind::ReloadTab { tab })]
                 }
                 crate::persistence::ConflictDecision::SaveMineAnyway => {
                     self.state.conflicts.retain(|&candidate| candidate != tab);
                     let id = self.effect_ids.allocate();
-                    self.in_flight.insert(id, tab);
+                    self.in_flight.insert(id, Some(tab));
                     vec![Effect::new(id, EffectKind::SaveTab { tab })]
                 }
             },
@@ -115,7 +121,9 @@ impl App {
         let (effect_id, tab) = match &event {
             AppEvent::SaveCompleted { effect }
             | AppEvent::SaveFailed { effect, .. }
-            | AppEvent::ReloadCompleted { effect, .. } => match self.in_flight.get(effect) {
+            | AppEvent::ReloadCompleted { effect, .. }
+            | AppEvent::OpenCompleted { effect }
+            | AppEvent::OpenFailed { effect, .. } => match self.in_flight.get(effect) {
                 Some(&tab) => (*effect, tab),
                 None => return, // stale or duplicate completion
             },
@@ -125,20 +133,31 @@ impl App {
         match event {
             AppEvent::SaveCompleted { .. } => {
                 // The disk now matches the buffer: the conflict is resolved.
-                self.state.conflicts.retain(|&candidate| candidate != tab);
+                if let Some(tab) = tab {
+                    self.state.conflicts.retain(|&candidate| candidate != tab);
+                }
             }
             AppEvent::SaveFailed { error, .. } => {
                 // A refused save (externally modified or I/O error) leaves
                 // the tab conflicted until the user decides.
-                if !self.state.is_conflicted(tab) {
-                    self.state.conflicts.push(tab);
+                if let Some(tab) = tab {
+                    if !self.state.is_conflicted(tab) {
+                        self.state.conflicts.push(tab);
+                    }
                 }
                 self.state.last_error = Some(error);
             }
             AppEvent::ReloadCompleted { .. } => {
                 // The note was re-read; the conflict is resolved (the
                 // frontend applies the returned text to its payload).
-                self.state.conflicts.retain(|&candidate| candidate != tab);
+                if let Some(tab) = tab {
+                    self.state.conflicts.retain(|&candidate| candidate != tab);
+                }
+            }
+            // The platform took the open request; nothing to record.
+            AppEvent::OpenCompleted { .. } => {}
+            AppEvent::OpenFailed { error, .. } => {
+                self.state.last_error = Some(error);
             }
             // Handled above.
             AppEvent::SearchCompleted { .. } => {}
@@ -405,5 +424,60 @@ mod tests {
             hits: vec![],
         });
         assert!(app.state.search.hits().is_empty());
+    }
+
+    #[test]
+    fn open_external_commands_track_their_effect_until_completion() {
+        use crate::effects::EffectKind as Kind;
+        let mut app = App::new();
+        let target = vault_platform::OpenTarget::Url("https://example.com".into());
+
+        // The command emits exactly one tracked effect.
+        let effects = app.dispatch(UiCommand::OpenExternal {
+            target: target.clone(),
+        });
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].kind, Kind::OpenExternal { target });
+        assert!(app.is_in_flight(effects[0].id));
+
+        // Success drains the tracking and records nothing.
+        let id = effects[0].id;
+        app.handle(AppEvent::OpenCompleted { effect: id });
+        assert!(!app.is_in_flight(id));
+        assert_eq!(app.state.last_error, None);
+
+        // A failure surfaces on the error line and drains the tracking.
+        let effects = app.dispatch(UiCommand::OpenExternal {
+            target: vault_platform::OpenTarget::File("/tmp/a.png".into()),
+        });
+        let id = effects[0].id;
+        app.handle(AppEvent::OpenFailed {
+            effect: id,
+            error: "opener xdg-open not found".into(),
+        });
+        assert!(!app.is_in_flight(id));
+        assert_eq!(
+            app.state.last_error.as_deref(),
+            Some("opener xdg-open not found")
+        );
+    }
+
+    #[test]
+    fn stale_or_unknown_open_completions_are_ignored() {
+        let mut app = App::new();
+        let effects = app.dispatch(UiCommand::OpenExternal {
+            target: vault_platform::OpenTarget::Url("https://example.com".into()),
+        });
+        let id = effects[0].id;
+        app.handle(AppEvent::OpenCompleted { effect: id });
+
+        // The same completion twice and a never-dispatched id both land
+        // nowhere: no error line text appears from stale events.
+        app.handle(AppEvent::OpenCompleted { effect: id });
+        app.handle(AppEvent::OpenFailed {
+            effect: crate::ids::EffectId::new(999),
+            error: "stale failure".into(),
+        });
+        assert_eq!(app.state.last_error, None);
     }
 }

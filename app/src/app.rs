@@ -575,6 +575,12 @@ pub struct VaultNotes {
     /// Shared application state + reducer (restructure commit 05). The
     /// sidebar section, and later slices, are owned by the kernel.
     pub shared: vault_app::App,
+    /// The platform's external opener (restructure commit 06b): URLs and
+    /// attachments go through this trait, never a direct shell call.
+    pub opener: Box<dyn vault_platform::ExternalOpener>,
+    /// The platform's appearance service: the compositor's backdrop
+    /// preference, read when glass is evaluated.
+    pub appearance: Box<dyn vault_platform::AppearanceService>,
     pub selected_tag: Option<String>,
     pub switcher: Switcher,
     // --- M4c ---
@@ -2745,6 +2751,33 @@ impl VaultNotes {
                     };
                     self.shared.handle(event);
                 }
+                vault_app::effects::EffectKind::OpenExternal { target } => {
+                    // The one shell→platform hop: the adapter object,
+                    // selected at startup, owns the shell call.
+                    let outcome = match &target {
+                        vault_platform::OpenTarget::Url(url) => self.opener.open_url(url),
+                        vault_platform::OpenTarget::File(path) => self.opener.open_file(path),
+                    };
+                    match outcome {
+                        Ok(()) => {
+                            self.shared
+                                .handle(vault_app::effects::AppEvent::OpenCompleted {
+                                    effect: effect.id,
+                                });
+                        }
+                        Err(error) => {
+                            // Spawn-level failures surface on the error
+                            // line (decision 3); success stays silent.
+                            let message = format!("open failed: {error}");
+                            self.error = Some(message.clone());
+                            self.shared
+                                .handle(vault_app::effects::AppEvent::OpenFailed {
+                                    effect: effect.id,
+                                    error: message,
+                                });
+                        }
+                    }
+                }
                 vault_app::effects::EffectKind::ReloadTab { .. }
                 | vault_app::effects::EffectKind::SearchVault { .. }
                 | vault_app::effects::EffectKind::PersistSettings => {}
@@ -3907,6 +3940,8 @@ impl cosmic::Application for VaultNotes {
             strict_breaks: false,
             images: RefCell::new(std::collections::HashMap::new()),
             shared: vault_app::App::new(),
+            opener: vault_platform_linux::external_opener(),
+            appearance: vault_platform_linux::appearance(),
             selected_tag: None,
             switcher: Switcher::default(),
             last_edit: None,
@@ -3954,7 +3989,8 @@ impl cosmic::Application for VaultNotes {
         // Restore preferences (M4c): theme choice, then the glass request,
         // then the last-used vault (M4 decision 1) when it still exists.
         app.theme = persisted.theme;
-        app.glass_style = crate::glass::plan(persisted.glass_enabled);
+        app.glass_style =
+            crate::glass::plan(persisted.glass_enabled, app.appearance.preferred_backdrop());
 
         let mut tasks = Vec::new();
         tasks.push(theme_task(persisted.theme));
@@ -5006,23 +5042,24 @@ impl cosmic::Application for VaultNotes {
                 Task::none()
             }
             Message::OpenExternal(url) => {
-                #[cfg(target_os = "linux")]
-                {
-                    use std::process::{Command, Stdio};
-                    let _ = Command::new("xdg-open")
-                        .arg(&url)
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .spawn();
-                }
-                #[cfg(not(target_os = "linux"))]
-                let _ = url;
+                // Hand the URL to the platform's default handler through
+                // the shared reducer + effect runner (restructure 06b).
+                // The old `#[cfg(not(linux))]` no-op discard is gone by
+                // construction: the adapter always exists.
+                let effects = self.shared.dispatch(UiCommand::OpenExternal {
+                    target: vault_platform::OpenTarget::Url(url),
+                });
+                self.run_effects(effects);
                 Task::none()
             }
             Message::OpenAttachment(path) => {
                 // Vault-relative → absolute, then the platform handler.
                 let absolute = self.attachment_path(&path);
-                self.update(Message::OpenExternal(absolute.display().to_string()))
+                let effects = self.shared.dispatch(UiCommand::OpenExternal {
+                    target: vault_platform::OpenTarget::File(absolute),
+                });
+                self.run_effects(effects);
+                Task::none()
             }
         }
     }
@@ -6408,6 +6445,10 @@ mod find_tests {
             strict_breaks: false,
             images: RefCell::new(std::collections::HashMap::new()),
             shared: vault_app::App::new(),
+            opener: Box::new(vault_platform::testing::RecordingOpener::succeeding()),
+            appearance: Box::new(vault_platform::testing::FixedAppearance {
+                backdrop: vault_platform::Backdrop::Opaque,
+            }),
             selected_tag: None,
             switcher: Switcher::default(),
             last_edit: None,
@@ -8958,5 +8999,106 @@ mod tree_sort_tests {
         // Nothing to reveal: the tree stays as it is.
         let _ = app.update(Message::TreeRevealCurrent);
         assert_eq!(app.collapsed.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    use cosmic::app::Application as _;
+    use std::path::Path;
+    use std::sync::Arc;
+    use vault_platform::testing::{OpenCall, RecordingOpener};
+    use vault_platform::{ExternalOpener, OpenError};
+
+    /// Exposes a `RecordingOpener` through the trait object while keeping
+    /// an inspectable handle outside the app (no downcast needed).
+    struct SharedOpener {
+        inner: Arc<RecordingOpener>,
+    }
+
+    impl ExternalOpener for SharedOpener {
+        fn open_url(&self, url: &str) -> Result<(), OpenError> {
+            self.inner.open_url(url)
+        }
+
+        fn open_file(&self, path: &Path) -> Result<(), OpenError> {
+            self.inner.open_file(path)
+        }
+
+        fn reveal_path(&self, path: &Path) -> Result<(), OpenError> {
+            self.inner.reveal_path(path)
+        }
+    }
+
+    fn app_with_opener(opener: Arc<RecordingOpener>) -> VaultNotes {
+        let mut app = find_tests::test_app_with_tab("");
+        app.opener = Box::new(SharedOpener { inner: opener });
+        app
+    }
+
+    #[test]
+    fn open_external_hands_urls_to_the_platform_opener() {
+        let opener = Arc::new(RecordingOpener::succeeding());
+        let mut app = app_with_opener(opener.clone());
+        let _ = app.update(Message::OpenExternal("https://example.com".into()));
+        assert_eq!(
+            opener.calls(),
+            vec![OpenCall::Url("https://example.com".into())]
+        );
+        // Success stays silent (fire-and-forget) and drains the effect.
+        assert_eq!(app.error, None);
+        assert_eq!(app.shared.state.last_error, None);
+    }
+
+    #[test]
+    fn open_external_surfaces_spawn_failures_on_the_error_line() {
+        let opener = Arc::new(RecordingOpener::failing(OpenError::NotFound {
+            program: "xdg-open".into(),
+        }));
+        let mut app = app_with_opener(opener.clone());
+        let _ = app.update(Message::OpenExternal("https://example.com".into()));
+        assert_eq!(opener.calls().len(), 1, "the adapter was still called");
+        assert_eq!(
+            app.error.as_deref(),
+            Some("open failed: opener xdg-open not found")
+        );
+        // The failure is recorded in the shared kernel too.
+        assert_eq!(
+            app.shared.state.last_error.as_deref(),
+            Some("open failed: opener xdg-open not found")
+        );
+    }
+
+    #[test]
+    fn open_attachment_hands_an_absolute_file_to_the_opener() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("assets")).unwrap();
+        std::fs::write(tmp.path().join("assets/cat.png"), "bytes").unwrap();
+
+        let opener = Arc::new(RecordingOpener::succeeding());
+        let mut app = app_with_opener(opener.clone());
+        app.vault = Some(Vault::open(tmp.path()).unwrap());
+        let _ = app.update(Message::OpenAttachment("assets/cat.png".into()));
+        // Vault-relative resolved to absolute before the platform hop.
+        assert_eq!(
+            opener.calls(),
+            vec![OpenCall::File(tmp.path().join("assets/cat.png"))]
+        );
+        assert_eq!(app.error, None);
+    }
+
+    #[test]
+    fn a_failed_attachment_open_reports_the_file_target_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.png"), "bytes").unwrap();
+
+        let opener = Arc::new(RecordingOpener::failing(OpenError::Failed {
+            message: "no handler".into(),
+        }));
+        let mut app = app_with_opener(opener);
+        app.vault = Some(Vault::open(tmp.path()).unwrap());
+        let _ = app.update(Message::OpenAttachment("a.png".into()));
+        assert_eq!(app.error.as_deref(), Some("open failed: no handler"));
     }
 }

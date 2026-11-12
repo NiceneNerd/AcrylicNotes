@@ -34,6 +34,10 @@ pub enum EffectKind {
         request: crate::ids::SearchRequestId,
         query: String,
     },
+    /// Hand a URL or file to the platform's default handler, reporting
+    /// `AppEvent::OpenCompleted` / `OpenFailed` with the same id.
+    #[serde(rename = "open-external")]
+    OpenExternal { target: vault_platform::OpenTarget },
 }
 
 /// One requested side effect, identified so late completions are checkable.
@@ -67,6 +71,15 @@ mod tests {
         let json = serde_json::to_string(&effect).unwrap();
         assert_eq!(serde_json::from_str::<Effect>(&json).unwrap(), effect);
 
+        let open_effect = Effect::new(
+            EffectId::new(10),
+            EffectKind::OpenExternal {
+                target: vault_platform::OpenTarget::Url("https://example.com".into()),
+            },
+        );
+        let json = serde_json::to_string(&open_effect).unwrap();
+        assert_eq!(serde_json::from_str::<Effect>(&json).unwrap(), open_effect);
+
         let events = vec![
             AppEvent::SaveCompleted {
                 effect: EffectId::new(1),
@@ -86,6 +99,13 @@ mod tests {
                     line_no: 4,
                     line: "needle".into(),
                 }],
+            },
+            AppEvent::OpenCompleted {
+                effect: EffectId::new(10),
+            },
+            AppEvent::OpenFailed {
+                effect: EffectId::new(11),
+                error: "opener xdg-open not found".into(),
             },
         ];
         for event in events {
@@ -119,4 +139,11 @@ pub enum AppEvent {
         request: crate::ids::SearchRequestId,
         hits: Vec<crate::search::SearchHitView>,
     },
+    /// The platform handed the open request to its default handler.
+    #[serde(rename = "open-completed")]
+    OpenCompleted { effect: EffectId },
+    /// The platform refused the open request (missing opener, spawn
+    /// failure). The message is user-facing text for the error line.
+    #[serde(rename = "open-failed")]
+    OpenFailed { effect: EffectId, error: String },
 }

@@ -42,9 +42,9 @@ Source of truth: the `Message` enum (`app/src/app.rs:317–541`) and its `update
 | VAULT-001 | `WatchTick` — 2 s watcher poll; reload externally changed files, re-index | vault-core/src/vault.rs:97–165, app.rs:3756–3797 |
 | VAULT-002 | `DailyNote` — path from `.obsidian` daily-notes settings, template rendering, folder chains | vault-core/src/vault.rs:400–466, app.rs:2027–2043 |
 | VAULT-003 | Vault open restores `last_vault` on startup when the dir exists | app.rs:3892–3898 |
-| PLAT-001 | `OpenExternal` — **LINUX-ONLY**: spawns `xdg-open` fire-and-forget; every other target silently discards the URL | app.rs:4896–4909 |
-| PLAT-002 | `OpenAttachment` — vault-relative → absolute, then OpenExternal; inherits PLAT-001 limitation | app.rs:4910–4914 |
-| PLAT-003 | Glass probe at startup (Wayland detection; X11 → Opaque); Blur requests `Action::BlurEnabled` | vault-glass/src/platform/linux.rs, app.rs:3881–3891 |
+| PLAT-001 | `OpenExternal` — URLs go to the platform's default handler via `vault_platform::ExternalOpener` (Phase 3); the old non-Linux no-op discard is gone by construction. Linux adapter spawns `xdg-open` fire-and-forget; spawn failures surface on the error line | crates/vault-platform/src/opener.rs, crates/vault-platform-linux/src/opener.rs |
+| PLAT-002 | `OpenAttachment` — vault-relative → absolute, handed to the opener as `OpenTarget::File`; same Linux adapter | app.rs `Message::OpenAttachment` |
+| PLAT-003 | Glass probe behind `vault_platform::AppearanceService` (Phase 3): Linux adapter delegates to the vault-glass Wayland probe (X11 → Opaque); Blur requests `Action::BlurEnabled` | crates/vault-platform-linux/src/appearance.rs, app/src/glass.rs |
 | PLAT-004 | Non-Linux glass backends exist in vault-glass (Mica/Acrylic/Vibrancy fallbacks) but GUI only consumes the probe | vault-glass/src/lib.rs:9–18 |
 | PLAT-005 | Translucent surfaces: editor overlay 0.18, switcher 0.88, sidebar 0.9, popups 0.94 | view.rs, app.rs |
 | PLAT-006 | Image rendering — local raster from disk (cached Handle), SVG via path; remote images are text placeholders (no network); pinned iced is `image-without-codecs` | reading.rs:1045–1158 |
@@ -267,7 +267,11 @@ load-modify-store (SET-021/022).
 
 ## Explicit Linux-only items today
 
-- **PLAT-001/002**: `xdg-open` external opening; every other target silently discards URLs.
-- **PLAT-003**: blur request is Wayland-only (X11 probes Opaque).
+- **PLAT-001/002** (Phase 3 update): external opening now runs through the
+  `vault_platform::ExternalOpener` trait with a Linux xdg-open adapter; the
+  silent non-Linux no-op no longer exists (the adapter object always exists).
+  Real xdg-open/document behavior is a user manual check on a Linux desktop.
+- **PLAT-003**: blur request is Wayland-only (X11 probes Opaque), reported
+  through the `AppearanceService` trait.
 
 Everything else — drag-and-drop, watcher, clipboard, settings — is platform-neutral by design.

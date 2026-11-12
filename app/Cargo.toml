@@ -8,6 +8,8 @@ description = "Vault Notes — libcosmic GUI (M4)"
 vault-core = { path = "../vault-core" }
 vault-md = { path = "../vault-md" }
 vault-app = { path = "../crates/vault-app" }
+vault-platform = { path = "../crates/vault-platform" }
+vault-platform-linux = { path = "../crates/vault-platform-linux" }
 # Used from M4c on (glass backdrop); kept listed so the dependency stays honest.
 vault-glass = { path = "../vault-glass" }
 dirs = "6.0"

@@ -11,6 +11,7 @@ use crate::ids::TabId;
 use crate::navigation::NavSection;
 use crate::persistence::ConflictDecision;
 use crate::settings::PaneMode;
+use vault_platform::OpenTarget;
 
 /// One user intent.
 ///
@@ -57,6 +58,10 @@ pub enum UiCommand {
     /// scan and reports `AppEvent::SearchCompleted`).
     #[serde(rename = "search-vault")]
     SearchVault { query: String },
+    /// Hand a URL or file to the platform's default handler
+    /// (`EffectKind::OpenExternal`, reported via `AppEvent::Open…`).
+    #[serde(rename = "open-external")]
+    OpenExternal { target: OpenTarget },
 }
 
 #[cfg(test)]
@@ -88,6 +93,9 @@ mod tests {
             },
             UiCommand::SearchVault {
                 query: "needle".into(),
+            },
+            UiCommand::OpenExternal {
+                target: vault_platform::OpenTarget::Url("https://example.com".into()),
             },
         ];
         for command in commands {

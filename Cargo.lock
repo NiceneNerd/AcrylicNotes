@@ -228,6 +228,8 @@ dependencies = [
  "vault-core",
  "vault-glass",
  "vault-md",
+ "vault-platform",
+ "vault-platform-linux",
 ]
 
 [[package]]
@@ -6391,6 +6393,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "vault-platform",
 ]
 
 [[package]]
@@ -6440,6 +6443,14 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "vault-platform-linux"
+version = "0.1.0"
+dependencies = [
+ "vault-glass",
+ "vault-platform",
 ]
 
 [[package]]

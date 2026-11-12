@@ -1,0 +1,9 @@
+[package]
+name = "vault-platform-linux"
+version = "0.1.0"
+edition = "2021"
+description = "Linux platform adapters: xdg-open external opening, COSMIC appearance probe"
+
+[dependencies]
+vault-platform = { path = "../vault-platform" }
+vault-glass = { path = "../../vault-glass" }

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/vault-app",
     "crates/vault-platform",
+    "crates/vault-platform-linux",
     "vault-glass",
     "vault-core",
     "vault-md",
@@ -15,6 +16,7 @@ members = [
 default-members = [
     "crates/vault-app",
     "crates/vault-platform",
+    "crates/vault-platform-linux",
     "vault-glass",
     "vault-core",
     "vault-md",

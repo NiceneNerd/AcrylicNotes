@@ -45,7 +45,7 @@ scenarios.
 | MISC-* | Glass/backdrop | — | — | Existing (reference) | Not started |
 | SET-* | Settings | — | — | Existing (reference) | Not started |
 | PLAT-* | Clipboard | — | — | Existing (reference) | Not started |
-| PLAT-* | External links | — | — | Existing (reference) | Not started |
+| PLAT-* | External links | — | — | Existing (reference; behind `vault_platform::ExternalOpener` since Phase 3) | Not started |
 | SAVE-* | Watcher/conflicts | — | — | Existing (reference) | Not started |
 | MISC-* | Daily note | — | — | Existing (reference) | Not started |
 | STATUS-* | Status bar | — | — | Existing (reference) | Not started |
