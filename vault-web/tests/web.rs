@@ -151,9 +151,10 @@ async fn index_shows_a_collapsible_folder_tree() {
     let (_tmp, root) = setup();
     let (status, _, body) = get(app(&root), "/").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    // Folders are <details> elements with their path as the anchor id, and
-    // every one of them is closed (collapsed by default, like the GUI).
-    assert!(body.contains("<details id=\"Notes\">"), "{body}");
+    // Folders are <details> elements with their path as the anchor id;
+    // top-level folders start open, nested ones stay collapsed (like the
+    // GUI).
+    assert!(body.contains("<details id=\"Notes\" open>"), "{body}");
     assert_eq!(
         body.matches("<details").count(),
         body.matches("</details>").count(),
@@ -630,16 +631,8 @@ async fn view_folder_excludes_outside_notes_from_tag_page() {
     let tmp = view_folder_setup();
     let root = tmp.path().join("vault");
     // Tag 'mytag' appears in both Notes/N.md (inside) and Journal/J.md (outside).
-    std::fs::write(
-        root.join("Notes/N.md"),
-        "notes note #mytag\n",
-    )
-    .unwrap();
-    std::fs::write(
-        root.join("Journal/J.md"),
-        "journal note #mytag\n",
-    )
-    .unwrap();
+    std::fs::write(root.join("Notes/N.md"), "notes note #mytag\n").unwrap();
+    std::fs::write(root.join("Journal/J.md"), "journal note #mytag\n").unwrap();
     let app = app_with(&root, None, Some("Notes".to_string()));
     let (_, _, body) = get(app, "/tag/mytag").await;
 

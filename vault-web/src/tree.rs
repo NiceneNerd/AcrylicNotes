@@ -97,7 +97,7 @@ pub fn build(
 /// count), note links as leaves. `id` is the folder path so breadcrumbs can
 /// link straight to a folder on the index page.
 pub fn render(folders: &[TreeFolder]) -> String {
-    fn walk(folders: &[TreeFolder], out: &mut String) {
+    fn walk(folders: &[TreeFolder], out: &mut String, start: bool) {
         for folder in folders {
             let count = folder.total_notes();
             let count_html = if count > 0 {
@@ -106,8 +106,9 @@ pub fn render(folders: &[TreeFolder]) -> String {
                 String::new()
             };
             out.push_str(&format!(
-                "<details id=\"{}\">\n<summary>{}{count_html}</summary>\n",
+                "<details id=\"{}\"{}>\n<summary>{}{count_html}</summary>\n",
                 path_encode(&folder.path),
+                if start { " open" } else { "" },
                 escape(&folder.name),
             ));
             if !folder.notes.is_empty() {
@@ -121,12 +122,12 @@ pub fn render(folders: &[TreeFolder]) -> String {
                 }
                 out.push_str("</ul>\n");
             }
-            walk(&folder.children, out);
+            walk(&folder.children, out, false);
             out.push_str("</details>\n");
         }
     }
     let mut out = String::from("<div class=\"tree\">\n");
-    walk(folders, &mut out);
+    walk(folders, &mut out, true);
     out.push_str("</div>\n");
     out
 }
@@ -190,7 +191,7 @@ mod tests {
         );
         let html = render(&tree);
         assert!(html.contains("<div class=\"tree\">"), "{html}");
-        assert!(html.contains("<details id=\"Notes\">"), "{html}");
+        assert!(html.contains("<details id=\"Notes\" open>"), "{html}");
         assert!(
             html.contains("<summary>Notes <span class=\"count\">(1)</span></summary>"),
             "{html}"
