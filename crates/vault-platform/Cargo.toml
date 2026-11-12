@@ -1,0 +1,11 @@
+[package]
+name = "vault-platform"
+version = "0.1.0"
+edition = "2021"
+description = "GUI-free platform service contracts: traits and domain-safe DTOs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0"
