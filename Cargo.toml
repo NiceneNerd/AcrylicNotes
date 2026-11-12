@@ -10,6 +10,7 @@ members = [
     "app",
     "vault-web",
     "xtask",
+    "frontends/app-windows",
 ]
 # `app` depends on libcosmic + iced from git repos (pinned revs in
 # app/Cargo.toml), so the default commands build/test the UI-free layers

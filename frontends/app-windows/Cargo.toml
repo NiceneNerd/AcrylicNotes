@@ -1,0 +1,21 @@
+[package]
+name = "app-windows"
+version = "0.1.0"
+edition = "2021"
+description = "Native WinUI 3 frontend for VaultNotes (windows-reactor). Windows UI; compiles to a compile-time skeleton on non-Windows targets."
+
+[dependencies]
+# Platform-neutral shared kernel: commands, effects, view models, repository.
+vault-app = { path = "../../crates/vault-app" }
+# Platform service contracts (ExternalOpener, etc.) consumed by the effect runner.
+vault-platform = { path = "../../crates/vault-platform" }
+
+# windows-reactor (WinUI 3) is pinned to an exact version and only pulled in
+# on Windows targets. This crate compiles to a skeleton on Linux/macOS so the
+# workspace gates stay green here; native Windows compilation is user-side.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-reactor = { version = "=0.100.0" }
+
+[[bin]]
+name = "app-windows"
+path = "src/main.rs"
