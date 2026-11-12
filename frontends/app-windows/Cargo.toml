@@ -7,6 +7,8 @@ description = "Native WinUI 3 frontend for VaultNotes (windows-reactor). Windows
 [dependencies]
 # Platform-neutral shared kernel: commands, effects, view models, repository.
 vault-app = { path = "../../crates/vault-app" }
+# Shared Markdown IR (Doc/Block/Inline) for the reading renderer.
+vault-md = { path = "../../vault-md" }
 # Platform service contracts (ExternalOpener, etc.) consumed by the effect runner.
 vault-platform = { path = "../../crates/vault-platform" }
 

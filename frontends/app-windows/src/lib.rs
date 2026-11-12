@@ -4,6 +4,9 @@
 //! user-side (no Windows runner in this session).
 
 pub mod app;
+pub mod file_tree;
+pub mod reading;
+pub mod source_mode;
 pub mod windows_effect_runner;
 pub mod windows_message;
 

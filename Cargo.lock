@@ -237,6 +237,7 @@ name = "app-windows"
 version = "0.1.0"
 dependencies = [
  "vault-app",
+ "vault-md",
  "vault-platform",
  "windows-reactor",
 ]
