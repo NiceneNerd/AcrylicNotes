@@ -1392,7 +1392,9 @@ pub(crate) fn footnote_entry_binding(
     if press.modifiers.command() || press.modifiers.alt() {
         return None;
     }
-    match &press.key {
+    // Use modified_key: it carries the character with modifiers applied
+    // (e.g. Shift+'a' -> 'A'), which is what we want for text input.
+    match &press.modified_key {
         cosmic::iced::keyboard::Key::Character(c) => {
             let mut chars = c.chars();
             let first = chars.next()?;
@@ -7933,6 +7935,24 @@ mod live_tests {
         }
     }
 
+    fn press_text_modified(
+        key: Key,
+        modified_key: Key,
+        modifiers: Modifiers,
+        text: Option<&str>,
+    ) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key,
+            modified_key,
+            physical_key: cosmic::iced::keyboard::key::Physical::Unidentified(
+                cosmic::iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: text.map(SmolStr::new),
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
     #[test]
     fn key_bindings_route_the_live_edits() {
         let plain = Modifiers::default();
@@ -8154,6 +8174,20 @@ mod live_tests {
         ));
         assert!(matches!(
             crate::view::live_key_binding(
+                press_text_modified(
+                    Key::Character(SmolStr::new("a")),
+                    Key::Character(SmolStr::new("A")),
+                    Modifiers::SHIFT,
+                    Some("A")
+                ),
+                false,
+                false,
+                true
+            ),
+            Some(text_editor::Binding::Custom(Message::FootnoteText('A')))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(
                 press_text(Key::Character(SmolStr::new(" ")), plain, Some(" ")),
                 false,
                 false,
@@ -8210,6 +8244,20 @@ mod live_tests {
                 true
             ),
             Some(text_editor::Binding::Custom(Message::FootnoteText('a')))
+        ));
+        assert!(matches!(
+            crate::view::editor_key_binding(
+                press_text_modified(
+                    Key::Character(SmolStr::new("a")),
+                    Key::Character(SmolStr::new("A")),
+                    Modifiers::SHIFT,
+                    Some("A")
+                ),
+                false,
+                false,
+                true
+            ),
+            Some(text_editor::Binding::Custom(Message::FootnoteText('A')))
         ));
         // Shifted arrows fall through to the widget's select-motion path.
         assert!(matches!(
