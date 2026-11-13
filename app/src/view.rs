@@ -312,8 +312,9 @@ fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
     );
     // The styled panel: the background paints over the container's own
     // padding, so the floating margins must live on an outer transparent
-    // container. The shell already insets the whole content row by its
-    // border padding, hence no left margin here.
+    // container. A uniform gap on every side floats the panel away from
+    // the window frame and the note area alike, as the COSMIC apps with
+    // sidebars do.
     let panel = container(col)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -340,7 +341,7 @@ fn sidebar<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
     container(panel)
         .width(Length::Fixed(crate::app::SIDEBAR_WIDTH))
         .height(Length::Fill)
-        .padding([gap, gap, gap, 0.0])
+        .padding(gap)
         .into()
 }
 
@@ -1175,14 +1176,16 @@ fn live_pane<'a>(
         // Space between the vertical scrollbar and the content so
         // the scrollbar never overlays the text.
         .spacing(SCROLLBAR_SPACING);
-    // The wiki dropdown is ALWAYS the stack's second child, even closed
-    // (an empty placeholder takes its slot) — a structural change would
-    // rebuild the subtree and drop the focused editor's key state, the
-    // same trap the source editor's popup avoids.
+    // The popup layer is ALWAYS the stack's second child, even when no
+    // popup is open (an empty placeholder takes its slot) — a structural
+    // change would rebuild the subtree and drop the focused editor's
+    // key state, the same trap the source editor's popup avoids. The
+    // Unicode entry overlay takes priority, like in the source pane.
     let wiki = app.wiki_complete.as_ref();
-    let overlay: cosmic::Element<'a, Message> = match wiki {
-        Some(wiki) => wiki_dropdown(wiki, palette),
-        None => container(column::Column::new()).into(),
+    let overlay: cosmic::Element<'a, Message> = match (&app.unicode_input, wiki) {
+        (Some(_), _) => unicode_entry_overlay(app, palette),
+        (None, Some(wiki)) => wiki_dropdown(wiki, palette),
+        (None, None) => container(column::Column::new()).into(),
     };
     let pane: cosmic::Element<'a, Message> = stack([scroll.into(), overlay]).into();
     container(pane)
@@ -1276,6 +1279,7 @@ fn focused_block_editor<'a>(
         .as_ref()
         .expect("focused editor without live state");
     let wiki_open = app.wiki_complete.is_some();
+    let unicode_open = app.unicode_input.is_some();
     let base_font = editor_font(app.editor_font_mono, &app.editor_font_family);
     set_editor_base_font(base_font);
     // Same highlighter and surface as the source editor (M4 decision 3);
@@ -1309,7 +1313,7 @@ fn focused_block_editor<'a>(
             },
             editor_highlight_format,
         )
-        .key_binding(move |press| live_key_binding(press, wiki_open))
+        .key_binding(move |press| live_key_binding(press, wiki_open, unicode_open))
         .style(editor_surface_style)
         .into()
 }
@@ -1366,16 +1370,33 @@ pub(crate) fn editor_key_binding(
 /// intercepted so `app.rs` can decide between a plain motion and
 /// crossing into a neighboring region, Ctrl+Backspace / Ctrl+Delete
 /// delete a word like they do in the source editor, and typed
-/// brackets/quotes route through the auto-pair table.
+/// brackets/quotes route through the auto-pair table (Shift-typed
+/// symbols included, like the source editor).
+///
+/// Ctrl+Shift+U opens Unicode codepoint entry exactly like in the
+/// source editor: while it is open, the region's editor feeds the hex
+/// buffer instead of typing (`unicode_entry_binding`, checked first).
+/// Ctrl+Alt+F inserts a footnote: the reference at the region's caret,
+/// the definition at the end of the note.
+///
 /// Everything else (typing, Enter, copy/paste, selection) falls back to
 /// the editor's own bindings — including Ctrl combos the formatting map
 /// does not claim, so copy/cut/paste/select-all keep working.
 pub(crate) fn live_key_binding(
     press: text_editor::KeyPress,
     wiki_open: bool,
+    unicode_open: bool,
 ) -> Option<text_editor::Binding<Message>> {
     if !matches!(press.status, text_editor::Status::Focused { .. }) {
         return None;
+    }
+    // While Unicode codepoint entry is open, the editor swallows typing
+    // and feeds the hex buffer — above every other binding, the same
+    // priority the source editor gives it.
+    if unicode_open {
+        if let Some(binding) = unicode_entry_binding(&press) {
+            return Some(binding);
+        }
     }
     let ctrl = press.modifiers.command();
     let plain = press.modifiers == Modifiers::default();
@@ -1404,7 +1425,17 @@ pub(crate) fn live_key_binding(
         }
         Key::Character(c) if ctrl => {
             let lower = c.to_lowercase();
-            match (lower.as_str(), press.modifiers.shift()) {
+            let shift = press.modifiers.shift();
+            let alt = press.modifiers.alt();
+            // Footnote shares the source editor's chord: Ctrl+Alt+F.
+            if lower == "f" && alt {
+                return Some(text_editor::Binding::Custom(Message::LiveFootnote));
+            }
+            // Unicode codepoint entry starts like in the source editor.
+            if lower == "u" && shift && !alt {
+                return Some(text_editor::Binding::Custom(Message::UnicodeStart));
+            }
+            match (lower.as_str(), shift) {
                 ("z", false) => Some(text_editor::Binding::Custom(Message::EditorUndo)),
                 ("z", true) => Some(text_editor::Binding::Custom(Message::EditorRedo)),
                 ("y", false) => Some(text_editor::Binding::Custom(Message::EditorRedo)),
@@ -1417,11 +1448,13 @@ pub(crate) fn live_key_binding(
                 },
             }
         }
-        Key::Character(_) if plain && typed.is_some_and(|c| crate::app::pair_for(c).is_some()) => {
-            Some(text_editor::Binding::Custom(Message::EditorAutoPair(
-                typed.expect("checked above"),
-            )))
-        }
+        // Pairable characters pair regardless of Shift: the shifted
+        // symbols (parens, braces) are typed with Shift held, and the
+        // source editor pairs them the same way. Ctrl'd chords never
+        // reach this arm — the ctrl match above claims them first.
+        Key::Character(_) if typed.is_some_and(|c| crate::app::pair_for(c).is_some()) => Some(
+            text_editor::Binding::Custom(Message::EditorAutoPair(typed.expect("checked above"))),
+        ),
         Key::Named(Named::Backspace) if plain => {
             Some(text_editor::Binding::Custom(Message::LiveBackspace))
         }
