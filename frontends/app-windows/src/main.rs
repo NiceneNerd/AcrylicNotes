@@ -1,22 +1,18 @@
 //! Binary entry point for the WinUI 3 frontend.
 //!
-//! On Windows this boots the `windows-reactor` application loop around
-//! [`app::WindowsApp`]. On non-Windows targets it is a compile-time stub
-//! so the workspace gates stay green here; native Windows execution is
-//! user-side.
+//! Everything in the library — the kernel wiring (`WindowsApp`), the
+//! effect runner, the message flow — compiles and is unit-tested on
+//! every platform. What is missing is the native bootstrapping: the
+//! windows-reactor window loop, the WinUI 3 controls, and the live
+//! platform adapters (vault repository, shell launcher). Those land with
+//! the p11 platform services on a real Windows machine; native execution
+//! and UI verification are user-side, never claimed via Wine.
 
-use app_windows::WindowsApp;
-
-#[cfg(target_os = "windows")]
 fn main() {
-    // windows-reactor application loop goes here on a real Windows build.
-    let _app = WindowsApp::default();
-    eprintln!("app-windows: running on Windows (native UI path)");
-}
-
-#[cfg(not(target_os = "windows"))]
-fn main() {
-    // Stub entry point: the crate type-checks but produces no window.
-    let _ = WindowsApp::default();
-    eprintln!("app-windows: skeleton on non-Windows target; native UI is Windows-only.");
+    eprintln!(
+        "app-windows: the native Windows UI is not wired yet (p11 platform \
+         services pending); the kernel wiring is complete and tested. See \
+         docs/parity.md APPWIN rows."
+    );
+    std::process::exit(1);
 }

@@ -1,82 +1,80 @@
-//! Executes effects produced by the shared `vault_app::App` reducer and
-//! maps outcomes into `AppEvent`s delivered back to `App::handle`.
+//! The platform services the shared reducer's effects run against.
 //!
-//! On Windows this drives WinUI 3 / windows-reactor APIs and real platform
-//! calls (shell launch for external open, ...). On non-Windows targets it
-//! is a compile-time stub: effects are accepted but never performed, so
-//! the crate type-checks here without windows-reactor.
+//! The runner is a service holder, not a decision maker: it owns the
+//! [`NoteRepository`] (guarded saves, note reads) and the platform
+//! [`ExternalOpener`] (shell hand-offs), injected at construction. Which
+//! effects run and what they report back is `WindowsApp::run_effects`'s
+//! job, mirroring the cosmic shell's effect runner.
+//!
+//! Tests inject [`vault_app::repository::testing::MemoryRepository`] and
+//! [`vault_platform::testing::RecordingOpener`], so the whole effect path
+//! — dispatch, execution, event feedback — runs and is asserted on Linux.
+//! Production (Windows) wiring passes the live adapters, which arrive
+//! with the p11 platform services. All types here are single-threaded
+//! (`Rc`/`RefCell`); the native window loop runs the UI on one thread.
 
-use vault_app::effects::Effect;
-use vault_platform::OpenTarget;
+use std::cell::RefCell;
+use std::path::Path;
+use std::rc::Rc;
 
-/// Runs `vault_app::Effect` values on the native platform.
-pub struct WindowsEffectRunner;
+use vault_app::repository::{NoteRepository, RepositoryError};
+use vault_app::workflow::SaveOutcome;
+use vault_platform::{ExternalOpener, OpenError, OpenTarget};
+
+/// Holds the services the reducer's effects need.
+pub struct WindowsEffectRunner {
+    repo: Rc<RefCell<dyn NoteRepository>>,
+    opener: Rc<dyn ExternalOpener>,
+}
 
 impl WindowsEffectRunner {
-    /// Create a new runner.
-    #[cfg(target_os = "windows")]
-    pub fn new() -> Self {
-        Self
+    /// Construct a runner around injected services.
+    #[must_use]
+    pub fn new(repo: Rc<RefCell<dyn NoteRepository>>, opener: Rc<dyn ExternalOpener>) -> Self {
+        Self { repo, opener }
     }
 
-    /// Create a new runner (stub on non-Windows: accepted, not performed).
-    #[cfg(not(target_os = "windows"))]
-    pub fn new() -> Self {
-        Self
+    /// Perform a guarded save of `text` at `path`, with `base` as the
+    /// sentinel the edits were made against (shared workflow decision).
+    pub fn save(&mut self, path: &str, text: &str, base: &str) -> SaveOutcome {
+        let mut repo = self.repo.borrow_mut();
+        vault_app::workflow::guarded_save(&mut *repo, path, text, base)
     }
 
-    /// Execute `effects`, feeding outcomes back as `AppEvent`s.
-    #[cfg(target_os = "windows")]
-    pub fn run(&mut self, effects: &[Effect]) {
-        for effect in effects {
-            match &effect.kind {
-                vault_app::effects::EffectKind::PersistSettings => {
-                    // Settings persistence is handled by the libcosmic
-                    // shell's storage; on Windows it goes through the
-                    // shared settings DTO atomically written to disk.
+    /// The current disk text of the note at `path`, with a user-facing
+    /// error message on failure (the `reload failed: ...` family the
+    /// workflow reports).
+    pub fn read_note(&self, path: &str) -> Result<String, String> {
+        self.repo
+            .borrow()
+            .read_note(path)
+            .map_err(|error| match error {
+                RepositoryError::NotFound { path } => {
+                    format!("reload failed: note not found: {path}")
                 }
-                vault_app::effects::EffectKind::SaveTab { tab } => {
-                    // Save is performed by the reducer's repository
-                    // adapter; the runner only reports completion.
-                    let _ = tab;
+                RepositoryError::ExternallyModified => {
+                    "reload failed: changed on disk while you edited".to_string()
                 }
-                vault_app::effects::EffectKind::ReloadTab { .. } => {}
-                vault_app::effects::EffectKind::SearchVault { .. } => {}
-                vault_app::effects::EffectKind::OpenExternal { target } => {
-                    let _ = open_external_target(target.clone());
-                }
-            }
-        }
+                RepositoryError::Failed { message } => format!("reload failed: {message}"),
+            })
     }
 
-    /// Execute `effects` (stub on non-Windows: accepted, not performed).
-    #[cfg(not(target_os = "windows"))]
-    pub fn run(&mut self, _effects: Vec<Effect>) {
-        // No native platform here: effects are type-checked but not run.
-        // Real execution happens on Windows via windows-reactor.
+    /// Hand an open target to the platform's default handler. Success is
+    /// fire-and-forget (the reducer drains the tracking on
+    /// `OpenCompleted`); spawn-level failures surface as `OpenFailed`.
+    pub fn open_external(&self, target: &OpenTarget) -> Result<(), String> {
+        let outcome = match target {
+            OpenTarget::Url(url) => self.opener.open_url(url),
+            OpenTarget::File(path) => self.opener.open_file(path),
+        };
+        outcome.map_err(|error: OpenError| error.to_string())
     }
-}
 
-impl Default for WindowsEffectRunner {
-    fn default() -> Self {
-        Self::new()
+    /// Whether the platform could open `path` in a file manager (part of
+    /// the opener contract; no consumer feature yet).
+    pub fn reveal_path(&self, path: &Path) -> Result<(), String> {
+        self.opener
+            .reveal_path(path)
+            .map_err(|error| error.to_string())
     }
-}
-
-/// Hand an external-open target to the platform's default handler.
-///
-/// On Windows this launches the default handler via ShellExecuteEx / the
-/// Windows App SDK. Returns an error string on failure; success is
-/// fire-and-forget (the reducer reports `OpenCompleted` separately).
-#[cfg(target_os = "windows")]
-fn open_external_target(_target: OpenTarget) -> Result<(), String> {
-    // windows-reactor / WinRT call goes here on a real Windows build.
-    Ok(())
-}
-
-/// Stub on non-Windows: external opening is not available here.
-#[cfg(not(target_os = "windows"))]
-#[allow(dead_code)]
-fn open_external_target(_target: OpenTarget) -> Result<(), String> {
-    Err("external opening requires a Windows target".to_string())
 }

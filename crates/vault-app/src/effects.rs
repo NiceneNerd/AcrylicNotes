@@ -92,6 +92,10 @@ mod tests {
                 effect: EffectId::new(3),
                 text: "fresh".into(),
             },
+            AppEvent::ReloadFailed {
+                effect: EffectId::new(4),
+                error: "reload failed: note not found: a.md".into(),
+            },
             AppEvent::SearchCompleted {
                 request: crate::ids::SearchRequestId::new(3),
                 hits: vec![crate::search::SearchHitView {
@@ -132,6 +136,11 @@ pub enum AppEvent {
     /// The reload for `effect` read the note's current disk text.
     #[serde(rename = "reload-completed")]
     ReloadCompleted { effect: EffectId, text: String },
+    /// The reload for `effect` could not read the note (I/O error,
+    /// missing note). The conflict stays unresolved; the message is
+    /// user-facing text for the error line.
+    #[serde(rename = "reload-failed")]
+    ReloadFailed { effect: EffectId, error: String },
     /// A vault-wide search finished. Keyed by the search request (not an
     /// effect id): the session drops results from older requests.
     #[serde(rename = "search-completed")]

@@ -1,23 +1,52 @@
 //! Envelope for events coming from the native Windows UI.
 //!
-//! Each event is either a command for the shared reducer, an effect
-//! completion from the runner, or a raw native event awaiting
-//! translation. The variant shape is identical on every target so
-//! `WindowsApp::handle_native` can be written once.
+//! Each message is either a command for the shared reducer, an effect
+//! outcome reported back by the runner (late, real async I/O), or a raw
+//! native event the shell translates itself. The shape is identical on
+//! every target, so `WindowsApp::handle_native` is written once and
+//! unit-tested on Linux.
 
+use vault_app::commands::UiCommand;
 use vault_app::effects::AppEvent;
-use vault_app::ids::EffectId;
 
 /// A message from the native Windows UI.
-///
-/// On Windows, `Command` carries a `UiCommand` produced by a WinUI 3
-/// interaction and `Native` wraps the windows-reactor event that hasn't
-/// been translated yet. On non-Windows targets this is a type-level stub.
 pub enum WindowsMessage {
-    /// A command produced by a UI interaction (e.g. a button press).
-    Command(vault_app::commands::UiCommand),
-    /// The outcome of a previously-issued effect, keyed by its id.
-    EffectCompleted { id: EffectId, event: AppEvent },
-    /// A raw native event awaiting translation.
-    Native(EffectId),
+    /// A command produced by a UI interaction (button press, selection,
+    /// keyboard shortcut). The kernel decides everything.
+    Command(UiCommand),
+    /// The outcome of a previously-issued effect. `AppEvent` carries the
+    /// `EffectId` it belongs to, so no separate id is needed here (the
+    /// kernel rejects stale ids itself).
+    EffectCompleted(AppEvent),
+    /// A raw native event awaiting the shell's translation.
+    Native(NativeEvent),
+}
+
+/// A raw native event with no direct `UiCommand` equivalent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeEvent {
+    /// The user asked to close the window. Dirty buffers are flushed
+    /// through the same guarded-save path the tab-close workflow uses
+    /// (WIN-108 semantics: closing never silently discards edits).
+    WindowClosing,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_message_envelope_carries_each_kind() {
+        let messages = vec![
+            WindowsMessage::Command(UiCommand::SaveActiveTab),
+            WindowsMessage::EffectCompleted(AppEvent::SaveCompleted {
+                effect: vault_app::ids::EffectId::new(7),
+            }),
+            WindowsMessage::Native(NativeEvent::WindowClosing),
+        ];
+        // A smoke pass over the variants; behavior lives in app.rs tests.
+        assert!(matches!(messages[0], WindowsMessage::Command(_)));
+        assert!(matches!(messages[1], WindowsMessage::EffectCompleted(_)));
+        assert!(matches!(messages[2], WindowsMessage::Native(_)));
+    }
 }

@@ -82,6 +82,16 @@ impl App {
                 self.in_flight.insert(id, Some(tab));
                 vec![Effect::new(id, EffectKind::SaveTab { tab })]
             }
+            UiCommand::SaveTabs { tabs } => tabs
+                .iter()
+                .map(|&tab| {
+                    // Tabs closed before their save completes are drained
+                    // by the vanished-tab rule in the frontend runner.
+                    let id = self.effect_ids.allocate();
+                    self.in_flight.insert(id, Some(tab));
+                    Effect::new(id, EffectKind::SaveTab { tab })
+                })
+                .collect(),
             UiCommand::OpenExternal { target } => {
                 let id = self.effect_ids.allocate();
                 self.in_flight.insert(id, None);
@@ -122,6 +132,7 @@ impl App {
             AppEvent::SaveCompleted { effect }
             | AppEvent::SaveFailed { effect, .. }
             | AppEvent::ReloadCompleted { effect, .. }
+            | AppEvent::ReloadFailed { effect, .. }
             | AppEvent::OpenCompleted { effect }
             | AppEvent::OpenFailed { effect, .. } => match self.in_flight.get(effect) {
                 Some(&tab) => (*effect, tab),
@@ -153,6 +164,17 @@ impl App {
                 if let Some(tab) = tab {
                     self.state.conflicts.retain(|&candidate| candidate != tab);
                 }
+            }
+            AppEvent::ReloadFailed { error, .. } => {
+                // The disk text could not be read: the situation that
+                // raised the banner persists, so it comes back for the
+                // user to decide, and the reason surfaces.
+                if let Some(tab) = tab {
+                    if !self.state.is_conflicted(tab) {
+                        self.state.conflicts.push(tab);
+                    }
+                }
+                self.state.last_error = Some(error);
             }
             // The platform took the open request; nothing to record.
             AppEvent::OpenCompleted { .. } => {}
@@ -270,6 +292,28 @@ mod tests {
     }
 
     #[test]
+    fn save_tabs_emits_one_tracked_effect_per_listed_tab() {
+        let mut app = app_with_tabs(&["a.md", "b.md", "c.md"]);
+        let tabs = [tab_at(&app, 0), tab_at(&app, 2)];
+        let effects = app.dispatch(UiCommand::SaveTabs {
+            tabs: tabs.to_vec(),
+        });
+        // One tracked save per listed tab, in order, regardless of which
+        // tab is active.
+        assert_eq!(
+            effects.iter().map(|e| e.kind.clone()).collect::<Vec<_>>(),
+            tabs.iter()
+                .map(|&tab| EffectKind::SaveTab { tab })
+                .collect::<Vec<_>>()
+        );
+        for effect in &effects {
+            assert!(app.is_in_flight(effect.id));
+        }
+        // An empty list saves nothing.
+        assert_eq!(app.dispatch(UiCommand::SaveTabs { tabs: vec![] }), vec![]);
+    }
+
+    #[test]
     fn save_completion_clears_the_conflict_and_failures_record_one() {
         let mut app = app_with_tabs(&["a.md"]);
         let tab = tab_at(&app, 0);
@@ -363,6 +407,30 @@ mod tests {
             text: "fresh".into(),
         });
         assert!(!app.is_in_flight(effects[0].id));
+    }
+
+    #[test]
+    fn a_failed_reload_keeps_the_conflict_and_surfaces_the_reason() {
+        let mut app = app_with_tabs(&["a.md"]);
+        let tab = tab_at(&app, 0);
+        app.state.conflicts.push(tab);
+        let effects = app.dispatch(UiCommand::ResolveConflict {
+            tab,
+            decision: ConflictDecision::ReloadFromDisk,
+        });
+        let id = effects[0].id;
+        app.handle(AppEvent::ReloadFailed {
+            effect: id,
+            error: "reload failed: note not found: a.md".into(),
+        });
+        // The conflict stays open for the user to decide; the reason is
+        // on the error line; the tracking is drained either way.
+        assert!(app.state.is_conflicted(tab));
+        assert_eq!(
+            app.state.last_error.as_deref(),
+            Some("reload failed: note not found: a.md")
+        );
+        assert!(!app.is_in_flight(id));
     }
 
     #[test]

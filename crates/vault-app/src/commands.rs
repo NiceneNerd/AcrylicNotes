@@ -45,6 +45,11 @@ pub enum UiCommand {
     /// Save the active tab's note.
     #[serde(rename = "save-active-tab")]
     SaveActiveTab,
+    /// Save the notes of the listed tabs (the shell decides which: it
+    /// owns the dirty buffers; the kernel tracks the effects). The
+    /// window-close and close-all flows flush dirty tabs through this.
+    #[serde(rename = "save-tabs")]
+    SaveTabs { tabs: Vec<TabId> },
     /// Resolve an external-change conflict for a tab.
     #[serde(rename = "resolve-conflict")]
     ResolveConflict {
@@ -84,6 +89,9 @@ mod tests {
             UiCommand::ActivateTab { position: 2 },
             UiCommand::CloseTab { position: 0 },
             UiCommand::SaveActiveTab,
+            UiCommand::SaveTabs {
+                tabs: vec![crate::ids::TabId::new(9), crate::ids::TabId::new(11)],
+            },
             UiCommand::ResolveConflict {
                 tab: crate::ids::TabId::new(4),
                 decision: crate::persistence::ConflictDecision::ReloadFromDisk,
