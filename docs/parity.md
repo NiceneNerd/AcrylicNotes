@@ -50,6 +50,31 @@ scenarios.
 | MISC-* | Daily note | — | — | Existing (reference) | Not started |
 | STATUS-* | Status bar | — | — | Existing (reference) | Not started |
 
+## APPWIN-* implementation status (Windows frontend)
+
+The matrix above tracks **user-visible feature parity**; its Windows column stays
+"Not started" until native controls exist (p11+). This section tracks the state of
+`frontends/app-windows` itself (WinUI 3 via windows-reactor, pinned `0.100.0`).
+Implementation detail lives in the APPWIN map in
+[feature-inventory.md](feature-inventory.md).
+
+**Native Windows compilation of the UI path is type-checked from Linux**
+(`cargo run -p xtask -- check-windows-ui` plus cross-target clippy
+`-D warnings`, both in CI). **Native execution and UI verification remain
+user-side — never claimed via Wine** (this session has no Windows runner).
+
+| ID | Piece | Status |
+| --- | --- | --- |
+| APPWIN-001 | Kernel wiring (`WindowsApp` over the shared `App`) | Done, Linux-tested |
+| APPWIN-002 | Effect execution against injected services (saves/reloads/external opens) | Done, Linux-tested; p11 services for settings + vault-wide search |
+| APPWIN-003 | Message envelope + window-close flush (`UiCommand::SaveTabs`) | Done, Linux-tested |
+| APPWIN-004 | File tree view over kernel `tree` + `TreeState` | Done, Linux-tested |
+| APPWIN-005 | Source editor caret/find math via `vault_app::editor` | Done, Linux-tested |
+| APPWIN-006 | Reading-mode plain-text projection | Partial; native element construction is p11 |
+| APPWIN-007 | Split layout state in `vault_app::layout` | Done, Linux-tested (kernel) |
+| APPWIN-008 | Native window loop, WinUI controls, live adapters | **Not started (p11+); requires a real Windows machine** |
+| APPWIN-009 | Cross-target verification (xtask + CI) | Done, runs on Linux |
+
 ## Baseline (Phase 0)
 
 - Linux gates on branch `restructure/cross-platform` at commit `871e868` (parent):

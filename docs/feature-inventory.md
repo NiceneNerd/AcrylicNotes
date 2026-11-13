@@ -307,3 +307,40 @@ Everything else — drag-and-drop, watcher, clipboard, settings — is platform-
   now run at the kernel level (editor.rs: 21 tests over footnote
   normalization incl. code fences and caret tracking, find edge cases,
   word motion, byte-exact splices, wikilink byte columns).
+
+## Shared in later phases (Phases 5–10)
+
+- **NAV-009..012, TREE-007** (Phase 5): tree builder, search session,
+  tags/counts, backlinks, outline, and the quick switcher are kernel
+  view models (`vault_app::{tree,search,navigation,fuzzy}`).
+- **Phase 8**: `xtask` workflows (check-shared, test-shared, test-linux,
+  build-linux, test-windows-core, check-windows-ui, parity-report) and
+  CI jobs including x86_64-pc-windows-gnu cross-target checks for the
+  shared crates and for the app-windows UI path.
+- **Phase 10 + remediation**: `vault_app::tree::TreeState` (folder
+  expansion/selection + visible-row flattening) and
+  `vault_app::layout::SplitState` (divider clamp, narrow-width fold,
+  pane assignment) are kernel-owned view models, unit-tested; both
+  frontends bind them to native controls.
+
+## Windows frontend implementation map (APPWIN-*)
+
+Status of `frontends/app-windows` (WinUI 3 via windows-reactor, pinned
+`0.100.0`). Native Windows compilation of the UI path is type-checked
+from Linux (`cargo xtask check-windows-ui`, cross-clippy `-D warnings`);
+**native execution and UI verification remain user-side — never claimed
+via Wine.** User-visible feature parity lives in
+[parity.md](parity.md); the matrix Windows column stays "Not started"
+until native controls exist (p11+).
+
+| ID | Piece | Status | Where |
+| --- | --- | --- | --- |
+| APPWIN-001 | Kernel wiring: `WindowsApp { shared: App, runner, buffers }`; native events become `UiCommand`s, effects feed back as `AppEvent`s; stale completions rejected by the kernel | Done, Linux-tested | app.rs |
+| APPWIN-002 | Effect execution against injected services (`NoteRepository`, `ExternalOpener`): guarded saves, reloads, external opens — the same coverage the cosmic runner has; settings persistence and the vault-wide search backend wait for the Windows vault adapter (p11) | Done, Linux-tested | windows_effect_runner.rs, app.rs |
+| APPWIN-003 | Message envelope: `Command` / `EffectCompleted(AppEvent)` / `Native(NativeEvent)`; window-close flushes dirty buffers via `UiCommand::SaveTabs` (WIN-108 semantics) | Done, Linux-tested | windows_message.rs, app.rs |
+| APPWIN-004 | File tree view: real `vault_app::tree` builder + kernel `TreeState` (expansion/selection/visible rows) | Done, Linux-tested | file_tree.rs |
+| APPWIN-005 | Source editor caret math: shared `Caret` convention via `vault_app::editor::offset_of`/`position_of`; find via `editor::find_matches` | Done, Linux-tested | source_mode.rs |
+| APPWIN-006 | Reading-mode support: toolkit-neutral plain-text projection of the `vault_md` IR + renderer config; **native element construction not started (p11)** | Partial | reading.rs |
+| APPWIN-007 | Split layout state: divider clamp, narrow-width fold, pane assignment in `vault_app::layout::SplitState` | Done, Linux-tested (kernel) | crates/vault-app/src/layout.rs |
+| APPWIN-008 | Native window loop, WinUI 3 controls, live platform adapters (shell launcher, vault repository, dialogs, clipboard), Live mode | **Not started (p11+); requires a real Windows machine** | — |
+| APPWIN-009 | Cross-target verification: `cargo xtask check-windows-ui` + CI job type-check the cfg(windows) code and the windows-reactor pin; cross-clippy `-D warnings` clean | Done, runs on Linux | xtask/src/main.rs, .github/workflows/ci.yml |
