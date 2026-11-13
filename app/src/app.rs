@@ -4463,7 +4463,9 @@ impl cosmic::Application for VaultNotes {
                         self.selected_tag = Some(rest.to_string());
                         Task::none()
                     }
-                    _ => Task::none(),
+                    // Anything else (http, https, mailto, ...): hand it to
+                    // the OS opener through the shared ExternalOpener.
+                    _ => self.update(Message::OpenExternal(uri)),
                 }
             }
             Message::SidePanel(panel) => {
@@ -8323,6 +8325,19 @@ mod platform_tests {
         assert_eq!(
             opener.calls(),
             vec![OpenCall::File(tmp.path().join("assets/cat.png"))]
+        );
+        assert_eq!(app.error, None);
+    }
+    #[test]
+    fn open_uri_with_unknown_scheme_routes_to_platform_opener() {
+        let opener = Arc::new(RecordingOpener::succeeding());
+        let mut app = app_with_opener(opener.clone());
+        let _ = app.update(Message::OpenUri("https://example.com".into()));
+        // An http(s) URL is not a recognized internal scheme, so it falls
+        // through to the OS opener instead of being silently swallowed.
+        assert_eq!(
+            opener.calls(),
+            vec![OpenCall::Url("https://example.com".into())]
         );
         assert_eq!(app.error, None);
     }
