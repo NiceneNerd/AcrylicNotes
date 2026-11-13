@@ -355,8 +355,22 @@ pub enum Message {
     /// Apply inline markdown formatting around the selection (or insert
     /// empty markers when nothing is selected).
     EditorFormat(Format),
-    /// Insert a footnote reference at the cursor and append its definition.
-    EditorFootnote,
+    // --- footnote popup (Ctrl+Alt+F, both editors) ---
+    /// Open the footnote popup: type the footnote's text there, and the
+    /// commit inserts the reference at the caret and the definition
+    /// with that text at the end of the note.
+    FootnoteStart,
+    /// A typed character goes into the footnote popup's text buffer.
+    FootnoteText(char),
+    /// Backspace inside the footnote popup's text buffer.
+    FootnoteBackspace,
+    /// Tab in the footnote popup: swallowed so it cannot type into the
+    /// editor while the popup is open.
+    FootnoteIgnore,
+    /// Enter in the footnote popup: insert reference + definition.
+    FootnoteCommit,
+    /// Escape in the footnote popup: close it, change nothing.
+    FootnoteCancel,
     // --- find in current note (Ctrl+F) ---
     /// Open (or refocus) the find bar, prefilling from the selection.
     FindOpen,
@@ -520,9 +534,6 @@ pub enum Message {
     LiveDismiss,
     /// Apply markdown formatting to the focused region's selection.
     LiveFormat(Format),
-    /// Ctrl+Alt+F in the live editor: insert a footnote reference at
-    /// the region's caret and its definition at the end of the note.
-    LiveFootnote,
     SwitcherToggle,
     SwitcherInput(String),
     SwitcherMove(i32),
@@ -655,6 +666,9 @@ pub struct VaultNotes {
     /// Hex digits collected so far during Unicode codepoint entry
     /// (Ctrl+Shift+U); `None` while the mode is off.
     pub unicode_input: Option<String>,
+    /// Text typed so far into the footnote popup (Ctrl+Alt+F); `None`
+    /// while the popup is closed.
+    pub footnote_input: Option<String>,
     /// Pending inline tree edit (new note / new folder / rename), if any.
     pub tree_edit: Option<tree::TreeEdit>,
     /// The in-note find bar state (Ctrl+F), when open.
@@ -775,6 +789,13 @@ fn attachment_shown(path: &str, extensions: &[String]) -> bool {
         .map(|(_, ext)| ext.to_ascii_lowercase())
         .is_some_and(|ext| extensions.contains(&ext))
 }
+
+// --- footnote popup (Ctrl+Alt+F) --------------------------------------------
+
+/// The footnote popup's text buffer is capped so a pathological input
+/// stream cannot grow the definition unbounded (a footnote is a short
+/// sentence, and the popup reads at a glance).
+const FOOTNOTE_MAX_CHARS: usize = 200;
 
 // --- Unicode codepoint entry (Ctrl+Shift+U) --------------------------------
 
@@ -1266,7 +1287,7 @@ pub(crate) fn editor_shortcut(press: text_editor::KeyPress) -> Option<Message> {
                 ("h", true, false) => Some(Message::EditorFormat(Format::Highlight)),
                 // Footnote lives on Ctrl+Alt+F: Ctrl+Shift+F belongs to the
                 // global vault search.
-                ("f", _, true) => Some(Message::EditorFootnote),
+                ("f", _, true) => Some(Message::FootnoteStart),
                 // GTK-style Unicode codepoint entry.
                 ("u", true, false) => Some(Message::UnicodeStart),
                 _ => None,
@@ -1295,10 +1316,11 @@ pub(crate) fn editor_shortcut(press: text_editor::KeyPress) -> Option<Message> {
 
 /// The markdown formatting shortcut the live block editor shares with
 /// the source editor: Ctrl+B/I/K/`, Ctrl+Shift+X/H. Footnote
-/// (Ctrl+Alt+F) and Unicode entry (Ctrl+Shift+U) are bound directly in
-/// `live_key_binding`: the footnote spans the whole note (reference in
-/// the region, definition at its end), and Unicode entry swallows
-/// typing while it is open — neither fits the `Format` return here.
+/// (Ctrl+Alt+F, the popup) and Unicode entry (Ctrl+Shift+U) are bound
+/// directly in `live_key_binding`: the footnote's commit spans the
+/// whole note (reference in the region, definition at its end), and
+/// Unicode entry swallows typing while it is open — neither fits the
+/// `Format` return here.
 pub(crate) fn live_format_shortcut(press: text_editor::KeyPress) -> Option<Format> {
     if !matches!(press.status, text_editor::Status::Focused { .. }) {
         return None;
@@ -1351,6 +1373,37 @@ pub(crate) fn unicode_entry_binding(
             Named::Backspace => Some(text_editor::Binding::Custom(Message::UnicodeBackspace)),
             Named::Escape => Some(text_editor::Binding::Custom(Message::UnicodeCancel)),
             Named::Tab => Some(text_editor::Binding::Custom(Message::UnicodeIgnore)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// While the footnote popup is open, map an editor key press: typed
+/// characters go into the footnote's text buffer (space included —
+/// unlike codepoint entry, a space is just text here), Backspace
+/// unravels, Enter commits the reference + definition, Esc cancels,
+/// and Tab is ignored. Chords with Ctrl or Alt fall through (`None`)
+/// so shortcuts keep working, as do the arrow keys (the caret stays
+/// where it was; the popup hovers over it).
+pub(crate) fn footnote_entry_binding(
+    press: &text_editor::KeyPress,
+) -> Option<text_editor::Binding<Message>> {
+    if press.modifiers.command() || press.modifiers.alt() {
+        return None;
+    }
+    match &press.key {
+        cosmic::iced::keyboard::Key::Character(c) => {
+            let mut chars = c.chars();
+            let first = chars.next()?;
+            (chars.next().is_none())
+                .then(|| text_editor::Binding::Custom(Message::FootnoteText(first)))
+        }
+        cosmic::iced::keyboard::Key::Named(named) => match named {
+            Named::Enter => Some(text_editor::Binding::Custom(Message::FootnoteCommit)),
+            Named::Backspace => Some(text_editor::Binding::Custom(Message::FootnoteBackspace)),
+            Named::Escape => Some(text_editor::Binding::Custom(Message::FootnoteCancel)),
+            Named::Tab => Some(text_editor::Binding::Custom(Message::FootnoteIgnore)),
             _ => None,
         },
         _ => None,
@@ -1614,6 +1667,7 @@ impl VaultNotes {
     fn dismiss_editor_overlays(&mut self) {
         self.wiki_complete = None;
         self.unicode_input = None;
+        self.footnote_input = None;
     }
 
     /// Resolve a tree attachment path (vault-relative) to an absolute path
@@ -2528,11 +2582,11 @@ impl VaultNotes {
     }
 
     /// Insert a footnote reference at the cursor and its definition at
-    /// the end of the note (Ctrl+Alt+F), as one undoable step.
-    ///
-    /// A selection is replaced by the reference; the definitions are
-    /// normalized (one blank line before each) on the way.
-    fn insert_footnote_at_cursor(&mut self, idx: usize) {
+    /// the end of the note, as one undoable step. `definition` is the
+    /// footnote's text typed into the footnote popup; a selection is
+    /// replaced by the reference; the definitions are normalized (one
+    /// blank line before each) on the way.
+    fn insert_footnote_at_cursor(&mut self, idx: usize, definition: &str) {
         {
             let tab = &mut self.tabs[idx];
             push_undo(tab);
@@ -2544,7 +2598,8 @@ impl VaultNotes {
             let text = tab.content.text();
             let cursor = tab.content.cursor().position;
             let n = next_footnote_number(&text);
-            let (new_text, caret) = insert_footnote(&text, (cursor.line, cursor.column), n);
+            let (new_text, caret) =
+                insert_footnote(&text, (cursor.line, cursor.column), n, definition);
             tab.content = Content::with_text(&new_text);
             tab.content.move_to(Cursor {
                 position: Position {
@@ -2559,15 +2614,16 @@ impl VaultNotes {
         self.update_wiki_complete();
     }
 
-    /// Ctrl+Alt+F in the live editor: the reference goes at the
-    /// region's caret, the definition at the end of the note — the
+    /// The footnote popup's commit in the live editor: the reference
+    /// goes at the region's caret, the definition (with the text typed
+    /// into the popup) at the end of the note — the
     /// whole note is the insertion surface, so the shared
     /// [`Self::insert_footnote_at_cursor`] runs on it (one undoable
     /// step) and the region's buffer is rebuilt from the result, the
     /// same swap [`Self::live_jump_to`] performs between regions. The
     /// definition is appended after the note's last line, so it never
     /// shifts the focused region's line range.
-    fn live_insert_footnote(&mut self) -> Task<Message> {
+    fn live_insert_footnote(&mut self, definition: &str) -> Task<Message> {
         let Some(tab_idx) = self.active_idx() else {
             return Task::none();
         };
@@ -2596,7 +2652,7 @@ impl VaultNotes {
                 }),
             });
         }
-        self.insert_footnote_at_cursor(tab_idx);
+        self.insert_footnote_at_cursor(tab_idx, definition);
         // The region's text changed (the reference). Rebuild its buffer
         // from the updated note and restore the caret; the definition
         // appended at the note's end cannot shift this region's start.
@@ -3678,6 +3734,7 @@ impl cosmic::Application for VaultNotes {
             tree_sort: persisted.tree_sort,
             attachment_input: String::new(),
             unicode_input: None,
+            footnote_input: None,
             tree_edit: None,
             tree_menu_target: None,
             find: None,
@@ -4024,7 +4081,6 @@ impl cosmic::Application for VaultNotes {
                 let actions = format_actions(live.editor.selection(), format);
                 self.live_run(actions)
             }
-            Message::LiveFootnote => self.live_insert_footnote(),
             Message::EditorUndo => {
                 if let Some(idx) = self.active_idx() {
                     // Where the live caret is, so it can re-aim after the
@@ -4075,11 +4131,47 @@ impl cosmic::Application for VaultNotes {
                 }
                 self.sync_preview_scroll()
             }
-            Message::EditorFootnote => {
-                if let Some(idx) = self.active_idx() {
-                    self.insert_footnote_at_cursor(idx);
+            Message::FootnoteStart => {
+                if self.active_idx().is_some() {
+                    self.dismiss_editor_overlays();
+                    self.footnote_input = Some(String::new());
                 }
-                self.sync_preview_scroll()
+                Task::none()
+            }
+            Message::FootnoteText(typed) => {
+                if let Some(definition) = self.footnote_input.as_mut() {
+                    // A hard cap keeps a runaway paste-like input from
+                    // making the popup unreadable; the popup feeds one
+                    // keystroke at a time, so this is only a safety net.
+                    if definition.chars().count() < FOOTNOTE_MAX_CHARS {
+                        definition.push(typed);
+                    }
+                }
+                Task::none()
+            }
+            Message::FootnoteBackspace => {
+                if let Some(definition) = self.footnote_input.as_mut() {
+                    definition.pop();
+                }
+                Task::none()
+            }
+            Message::FootnoteIgnore => Task::none(),
+            Message::FootnoteCommit => {
+                let definition = self.footnote_input.take();
+                if let Some(definition) = definition {
+                    if self.pane() == PaneMode::Live {
+                        return self.live_insert_footnote(&definition);
+                    }
+                    if let Some(idx) = self.active_idx() {
+                        self.insert_footnote_at_cursor(idx, &definition);
+                        return self.sync_preview_scroll();
+                    }
+                }
+                Task::none()
+            }
+            Message::FootnoteCancel => {
+                self.footnote_input = None;
+                Task::none()
             }
             Message::EditorDeleteWord(right) => {
                 if let Some(idx) = self.active_idx() {
@@ -4400,6 +4492,13 @@ impl cosmic::Application for VaultNotes {
                 let hex = self.unicode_input.take();
                 if let (Some(idx), Some(hex)) = (self.active_idx(), hex) {
                     if let Some(ch) = unicode_char(&hex) {
+                        // In live mode the tab buffer's cursor is not the
+                        // caret the user sees: the character belongs at
+                        // the live region's caret, so it goes through the
+                        // region splice like the other live edits.
+                        if self.pane() == PaneMode::Live {
+                            return self.live_run(vec![Action::Edit(Edit::Insert(ch))]);
+                        }
                         self.run_editor_command(idx, vec![Action::Edit(Edit::Insert(ch))]);
                         return self.sync_preview_scroll();
                     }
@@ -5217,6 +5316,7 @@ mod chrome_model_tests {
 #[cfg(test)]
 mod editor_tests {
     use super::*;
+    use cosmic::Application as _;
 
     /// A focused editor key press for shortcut tests.
     fn key_press(key: cosmic::iced::keyboard::Key, modifiers: Modifiers) -> text_editor::KeyPress {
@@ -5316,7 +5416,7 @@ mod editor_tests {
         ));
         assert!(matches!(
             editor_shortcut(key_press(Key::Character("f".into()), ctrl_alt)),
-            Some(Message::EditorFootnote)
+            Some(Message::FootnoteStart)
         ));
         // Ctrl+Shift+F is the global vault search — the editor must not
         // claim it.
@@ -5422,13 +5522,41 @@ mod editor_tests {
             position: Position { line: 0, column: 4 },
             selection: None,
         });
-        app.insert_footnote_at_cursor(0);
+        app.insert_footnote_at_cursor(0, "");
         assert_eq!(app.tabs[0].content.text(), "body[^1]\n\n[^1]: ");
         // The cursor sits right after the reference.
         assert_eq!(app.tabs[0].content.cursor().position.column, 8);
         // And it is one undo step.
         undo_tab(&mut app.tabs[0]);
         assert_eq!(app.tabs[0].content.text(), "body\n");
+    }
+
+    #[test]
+    fn the_footnote_popup_types_the_definition_in_the_source_editor() {
+        let mut app = find_tests::test_app_with_tab("body\n");
+        // The test app defaults to the Live pane; this is the source
+        // editor's path.
+        app.shared.state.pane = PaneMode::Source;
+        app.tabs[0].content.move_to(Cursor {
+            position: Position { line: 0, column: 4 },
+            selection: None,
+        });
+        app.update(Message::FootnoteStart);
+        for ch in "read more".chars() {
+            app.update(Message::FootnoteText(ch));
+        }
+        app.update(Message::FootnoteCommit);
+        // The reference went in at the caret and the definition with the
+        // typed text at the note's end; the popup closed on the commit.
+        assert_eq!(app.tabs[0].content.text(), "body[^1]\n\n[^1]: read more");
+        assert_eq!(app.footnote_input, None);
+        assert!(app.tabs[0].is_dirty());
+        // Escape commits nothing.
+        app.update(Message::FootnoteStart);
+        app.update(Message::FootnoteText('x'));
+        app.update(Message::FootnoteCancel);
+        assert_eq!(app.footnote_input, None);
+        assert_eq!(app.tabs[0].content.text(), "body[^1]\n\n[^1]: read more");
     }
 
     #[test]
@@ -5724,6 +5852,7 @@ mod autopair_tests {
 #[cfg(test)]
 mod find_tests {
     use super::*;
+    use cosmic::Application as _;
 
     #[test]
     fn find_replace_one_replaces_and_advances() {
@@ -5850,6 +5979,7 @@ mod find_tests {
             tree_sort: TreeSort::default(),
             attachment_input: String::new(),
             unicode_input: None,
+            footnote_input: None,
             tree_edit: None,
             tree_menu_target: None,
             find: None,
@@ -6500,6 +6630,9 @@ mod unicode_entry_tests {
     #[test]
     fn commit_inserts_the_codepoint_and_ends_the_mode() {
         let mut app = find_tests::test_app_with_tab("end\n");
+        // The test app defaults to the Live pane; this is the source
+        // editor's commit path (the live one has its own test).
+        app.shared.state.pane = PaneMode::Source;
         let _ = app.update(Message::UnicodeStart);
         for ch in "1F600".chars() {
             let _ = app.update(Message::UnicodeHex(ch));
@@ -7500,10 +7633,22 @@ mod live_tests {
         let mut app = find_tests::test_app_with_tab("alpha\n\nbeta");
         app.live_focus(0);
         aim(&mut app, 0, 5);
-        app.update(Message::LiveFootnote);
+        // The popup flow: start, type the footnote's text, commit.
+        app.update(Message::FootnoteStart);
+        assert_eq!(app.footnote_input.as_deref(), Some(""));
+        for ch in "spoke".chars() {
+            app.update(Message::FootnoteText(ch));
+        }
+        app.update(Message::FootnoteCommit);
         // The reference went in at the region's caret; the definition
-        // landed at the end of the note, past the other region.
-        assert_eq!(app.tabs[0].content.text(), "alpha[^1]\n\nbeta\n\n[^1]: ");
+        // with the typed text landed at the end of the note, past the
+        // other region.
+        assert_eq!(
+            app.tabs[0].content.text(),
+            "alpha[^1]\n\nbeta\n\n[^1]: spoke"
+        );
+        // The popup closed on the commit.
+        assert_eq!(app.footnote_input, None);
         // The region's buffer was rebuilt from the updated note, with
         // the caret right after the reference.
         assert_eq!(app.live.as_ref().unwrap().editor.text(), "alpha[^1]\n");
@@ -7512,6 +7657,10 @@ mod live_tests {
         // The edit is real: dirty, undoable, autosave-timed.
         assert!(app.tabs[0].is_dirty());
         assert!(app.last_edit.is_some());
+        // One undo step removes the reference and the definition.
+        undo_tab(&mut app.tabs[0]);
+        app.tabs[0].refresh_doc();
+        assert_eq!(app.tabs[0].content.text(), "alpha\n\nbeta");
     }
 
     #[test]
@@ -7519,9 +7668,12 @@ mod live_tests {
         let mut app = find_tests::test_app_with_tab("alpha\n\nbeta");
         app.live_focus(0);
         aim(&mut app, 0, 5);
-        app.update(Message::LiveFootnote);
+        // An empty popup text keeps the conventional bare definition.
+        app.update(Message::FootnoteStart);
+        app.update(Message::FootnoteCommit);
         aim(&mut app, 0, 9);
-        app.update(Message::LiveFootnote);
+        app.update(Message::FootnoteStart);
+        app.update(Message::FootnoteCommit);
         assert_eq!(
             app.tabs[0].content.text(),
             "alpha[^1][^2]\n\nbeta\n\n[^1]: \n\n[^2]: "
@@ -7542,11 +7694,47 @@ mod live_tests {
                 column: 10,
             }),
         });
-        app.update(Message::LiveFootnote);
+        app.update(Message::FootnoteStart);
+        app.update(Message::FootnoteCommit);
         // The selected word was replaced by the reference.
         assert_eq!(app.tabs[0].content.text(), "alpha [^1]\n\nbeta\n\n[^1]: ");
         assert_eq!(app.live.as_ref().unwrap().editor.text(), "alpha [^1]\n");
         assert_eq!(caret(&app), (0, 10));
+    }
+
+    #[test]
+    fn live_footnote_popup_escape_commits_nothing() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta");
+        app.live_focus(0);
+        aim(&mut app, 0, 5);
+        app.update(Message::FootnoteStart);
+        app.update(Message::FootnoteText('n'));
+        app.update(Message::FootnoteCancel);
+        assert_eq!(app.footnote_input, None);
+        assert_eq!(app.tabs[0].content.text(), "alpha\n\nbeta");
+        assert!(!app.tabs[0].is_dirty());
+    }
+
+    #[test]
+    fn live_unicode_commit_inserts_at_the_live_caret() {
+        let mut app = find_tests::test_app_with_tab("alpha\n\nbeta");
+        app.live_focus(0);
+        aim(&mut app, 0, 5);
+        app.update(Message::UnicodeStart);
+        for ch in "2764".chars() {
+            app.update(Message::UnicodeHex(ch));
+        }
+        app.update(Message::UnicodeCommit);
+        // The character went in at the region's caret — not wherever the
+        // tab buffer's own (stale) cursor sat, which used to mean the
+        // top of the file. A multi-byte character, so the splice keeps
+        // the columns right too.
+        assert_eq!(app.tabs[0].content.text(), "alpha❤\n\nbeta");
+        assert_eq!(app.unicode_input, None);
+        assert_eq!(app.live.as_ref().unwrap().editor.text(), "alpha❤\n");
+        // iced cursor columns are byte offsets: 5 bytes of "alpha" plus
+        // the 3-byte heart.
+        assert_eq!(caret(&app), (0, 8));
     }
 
     #[test]
@@ -7750,39 +7938,79 @@ mod live_tests {
         let plain = Modifiers::default();
         // Boundary keys route to the app, not the widget.
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::ArrowUp), plain), false, false),
+            crate::view::live_key_binding(
+                press(Key::Named(Named::ArrowUp), plain),
+                false,
+                false,
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::LiveUp))
         ));
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::ArrowDown), plain), false, false),
+            crate::view::live_key_binding(
+                press(Key::Named(Named::ArrowDown), plain),
+                false,
+                false,
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::LiveDown))
         ));
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::Backspace), plain), false, false),
+            crate::view::live_key_binding(
+                press(Key::Named(Named::Backspace), plain),
+                false,
+                false,
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::LiveBackspace))
         ));
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::Delete), plain), false, false),
+            crate::view::live_key_binding(
+                press(Key::Named(Named::Delete), plain),
+                false,
+                false,
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::LiveDelete))
         ));
         // Ctrl+Backspace / Ctrl+Delete delete a word, not one character.
         let ctrl = Modifiers::CTRL;
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::Backspace), ctrl), false, false),
+            crate::view::live_key_binding(
+                press(Key::Named(Named::Backspace), ctrl),
+                false,
+                false,
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::LiveDeleteWord(false)))
         ));
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::Delete), ctrl), false, false),
+            crate::view::live_key_binding(
+                press(Key::Named(Named::Delete), ctrl),
+                false,
+                false,
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::LiveDeleteWord(true)))
         ));
         // Escape commits the region instead of unfocusing.
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::Escape), plain), false, false),
+            crate::view::live_key_binding(
+                press(Key::Named(Named::Escape), plain),
+                false,
+                false,
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::LiveDismiss))
         ));
         // With the wiki dropdown open, Escape dismisses the dropdown.
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::Escape), plain), true, false),
+            crate::view::live_key_binding(
+                press(Key::Named(Named::Escape), plain),
+                true,
+                false,
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::WikiDismiss))
         ));
         // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y stay app-scoped undo/redo.
@@ -7790,6 +8018,7 @@ mod live_tests {
         assert!(matches!(
             crate::view::live_key_binding(
                 press(Key::Character(SmolStr::new("z")), ctrl),
+                false,
                 false,
                 false
             ),
@@ -7799,6 +8028,7 @@ mod live_tests {
             crate::view::live_key_binding(
                 press(Key::Character(SmolStr::new("z")), ctrl | Modifiers::SHIFT),
                 false,
+                false,
                 false
             ),
             Some(text_editor::Binding::Custom(Message::EditorRedo))
@@ -7806,6 +8036,7 @@ mod live_tests {
         assert!(matches!(
             crate::view::live_key_binding(
                 press(Key::Character(SmolStr::new("y")), ctrl),
+                false,
                 false,
                 false
             ),
@@ -7816,6 +8047,7 @@ mod live_tests {
             crate::view::live_key_binding(
                 press_text(Key::Character(SmolStr::new("q")), plain, Some("q")),
                 false,
+                false,
                 false
             ),
             Some(text_editor::Binding::Insert('q'))
@@ -7825,6 +8057,7 @@ mod live_tests {
             crate::view::live_key_binding(
                 press_text(Key::Character(SmolStr::new("(")), plain, Some("(")),
                 false,
+                false,
                 false
             ),
             Some(text_editor::Binding::Custom(Message::EditorAutoPair('(')))
@@ -7832,6 +8065,7 @@ mod live_tests {
         assert!(matches!(
             crate::view::live_key_binding(
                 press_text(Key::Character(SmolStr::new("\"")), plain, Some("\"")),
+                false,
                 false,
                 false
             ),
@@ -7847,6 +8081,7 @@ mod live_tests {
                     Some("(")
                 ),
                 false,
+                false,
                 false
             ),
             Some(text_editor::Binding::Custom(Message::EditorAutoPair('(')))
@@ -7859,23 +8094,26 @@ mod live_tests {
                     Some(")")
                 ),
                 false,
+                false,
                 false
             ),
             Some(text_editor::Binding::Custom(Message::EditorAutoPair(')')))
         ));
-        // Ctrl+Alt+F inserts a footnote like in the source editor.
+        // Ctrl+Alt+F opens the footnote popup like in the source editor.
         assert!(matches!(
             crate::view::live_key_binding(
                 press(Key::Character(SmolStr::new("f")), ctrl | Modifiers::ALT),
                 false,
+                false,
                 false
             ),
-            Some(text_editor::Binding::Custom(Message::LiveFootnote))
+            Some(text_editor::Binding::Custom(Message::FootnoteStart))
         ));
         // Ctrl+Shift+U opens Unicode codepoint entry.
         assert!(matches!(
             crate::view::live_key_binding(
                 press(Key::Character(SmolStr::new("u")), ctrl | Modifiers::SHIFT),
+                false,
                 false,
                 false
             ),
@@ -7887,18 +8125,97 @@ mod live_tests {
             crate::view::live_key_binding(
                 press_text(Key::Character(SmolStr::new("4")), plain, Some("4")),
                 false,
-                true
+                true,
+                false
             ),
             Some(text_editor::Binding::Custom(Message::UnicodeHex('4')))
         ));
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::Escape), plain), false, true),
+            crate::view::live_key_binding(
+                press(Key::Named(Named::Escape), plain),
+                false,
+                true,
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::UnicodeCancel))
+        ));
+        // While the footnote popup is open, typing feeds its text buffer
+        // (space included) instead of the region; Enter commits, Escape
+        // cancels, Tab is swallowed, and Ctrl'd chords fall through so
+        // shortcuts keep working.
+        assert!(matches!(
+            crate::view::live_key_binding(
+                press_text(Key::Character(SmolStr::new("a")), plain, Some("a")),
+                false,
+                false,
+                true
+            ),
+            Some(text_editor::Binding::Custom(Message::FootnoteText('a')))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(
+                press_text(Key::Character(SmolStr::new(" ")), plain, Some(" ")),
+                false,
+                false,
+                true
+            ),
+            Some(text_editor::Binding::Custom(Message::FootnoteText(' ')))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(
+                press(Key::Named(Named::Enter), plain),
+                false,
+                false,
+                true
+            ),
+            Some(text_editor::Binding::Custom(Message::FootnoteCommit))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(
+                press(Key::Named(Named::Backspace), plain),
+                false,
+                false,
+                true
+            ),
+            Some(text_editor::Binding::Custom(Message::FootnoteBackspace))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(
+                press(Key::Named(Named::Escape), plain),
+                false,
+                false,
+                true
+            ),
+            Some(text_editor::Binding::Custom(Message::FootnoteCancel))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(press(Key::Named(Named::Tab), plain), false, false, true),
+            Some(text_editor::Binding::Custom(Message::FootnoteIgnore))
+        ));
+        assert!(matches!(
+            crate::view::live_key_binding(
+                press(Key::Character(SmolStr::new("z")), ctrl),
+                false,
+                false,
+                true
+            ),
+            Some(text_editor::Binding::Custom(Message::EditorUndo))
+        ));
+        // The source editor binds the popup the same way.
+        assert!(matches!(
+            crate::view::editor_key_binding(
+                press_text(Key::Character(SmolStr::new("a")), plain, Some("a")),
+                false,
+                false,
+                true
+            ),
+            Some(text_editor::Binding::Custom(Message::FootnoteText('a')))
         ));
         // Shifted arrows fall through to the widget's select-motion path.
         assert!(matches!(
             crate::view::live_key_binding(
                 press(Key::Named(Named::ArrowDown), Modifiers::SHIFT),
+                false,
                 false,
                 false
             ),
@@ -7917,6 +8234,7 @@ mod live_tests {
                     text: None,
                     status: text_editor::Status::Active,
                 },
+                false,
                 false,
                 false
             ),
@@ -7955,34 +8273,60 @@ mod live_tests {
         // The live editor: the arrows walk the suggestions instead of
         // moving the caret between blocks.
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::ArrowUp), plain), true, false),
+            crate::view::live_key_binding(
+                press(Key::Named(Named::ArrowUp), plain),
+                true,
+                false,
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::WikiCycle(-1)))
         ));
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::ArrowDown), plain), true, false),
+            crate::view::live_key_binding(
+                press(Key::Named(Named::ArrowDown), plain),
+                true,
+                false,
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::WikiCycle(1)))
         ));
         // Without the dropdown, the arrows keep navigating the regions.
         assert!(matches!(
-            crate::view::live_key_binding(press(Key::Named(Named::ArrowUp), plain), false, false),
+            crate::view::live_key_binding(
+                press(Key::Named(Named::ArrowUp), plain),
+                false,
+                false,
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::LiveUp))
         ));
         // The source editor: same, and the arrows leave the caret alone.
         assert!(matches!(
-            crate::view::editor_key_binding(press(Key::Named(Named::ArrowUp), plain), true, false),
+            crate::view::editor_key_binding(
+                press(Key::Named(Named::ArrowUp), plain),
+                true,
+                false,
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::WikiCycle(-1)))
         ));
         assert!(matches!(
             crate::view::editor_key_binding(
                 press(Key::Named(Named::ArrowDown), plain),
                 true,
+                false,
                 false
             ),
             Some(text_editor::Binding::Custom(Message::WikiCycle(1)))
         ));
         // Escape still dismisses the dropdown in both editors.
         assert!(matches!(
-            crate::view::editor_key_binding(press(Key::Named(Named::Escape), plain), true, false),
+            crate::view::editor_key_binding(
+                press(Key::Named(Named::Escape), plain),
+                true,
+                false,
+                false
+            ),
             Some(text_editor::Binding::Custom(Message::WikiDismiss))
         ));
         // Shift+Arrow still extends the selection instead.
@@ -7990,6 +8334,7 @@ mod live_tests {
             crate::view::live_key_binding(
                 press(Key::Named(Named::ArrowDown), Modifiers::SHIFT),
                 true,
+                false,
                 false
             ),
             Some(text_editor::Binding::Select(_))

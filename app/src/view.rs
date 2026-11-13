@@ -15,10 +15,11 @@ use cosmic::widget::{
 use cosmic::Element;
 
 use crate::app::{
-    editor_shortcut, find_matches, parent_of, tab_label_parts, title_of, tree_note_label,
-    unicode_char, unicode_entry_binding, LinkPathFormat, Message, Palette, PaneMode, SidePanel,
-    SortMenuAction, TreeMenuAction, TreeSort, VaultNotes, ATTACHMENT_INPUT, EDITOR_FONT_INPUT,
-    EDITOR_INPUT, FIND_INPUT, READING_FONT_INPUT, SIDEBAR_OPACITY, TREE_EDIT_INPUT,
+    editor_shortcut, find_matches, footnote_entry_binding, parent_of, tab_label_parts, title_of,
+    tree_note_label, unicode_char, unicode_entry_binding, LinkPathFormat, Message, Palette,
+    PaneMode, SidePanel, SortMenuAction, TreeMenuAction, TreeSort, VaultNotes, ATTACHMENT_INPUT,
+    EDITOR_FONT_INPUT, EDITOR_INPUT, FIND_INPUT, READING_FONT_INPUT, SIDEBAR_OPACITY,
+    TREE_EDIT_INPUT,
 };
 use crate::editor_text::{
     editor_font, editor_highlight_format, editor_placeholder_color, editor_value_color,
@@ -989,7 +990,12 @@ fn editor_pane<'a>(
         // word delete. Anything else falls back to the editor's own
         // bindings (copy/cut/paste/select-all, arrows, …).
         .key_binding(move |press: text_editor::KeyPress| {
-            editor_key_binding(press, wiki.is_some(), app.unicode_input.is_some())
+            editor_key_binding(
+                press,
+                wiki.is_some(),
+                app.unicode_input.is_some(),
+                app.footnote_input.is_some(),
+            )
         })
         .style(editor_surface_style);
     let surface: Element<'a, Message> = container(editor)
@@ -1015,11 +1021,15 @@ fn editor_pane<'a>(
     // is clicked again (the "can't type while the dropdown is open"
     // bug). The EDITOR_INPUT id additionally protects focus across the
     // structural changes outside this pane.
-    let overlay: cosmic::Element<'a, Message> = match (&app.unicode_input, wiki) {
-        (Some(_), _) => unicode_entry_overlay(app, palette),
-        (None, Some(wiki)) => wiki_dropdown(wiki, palette),
-        (None, None) => container(column::Column::new()).into(),
-    };
+    // The overlays are mutually exclusive: the footnote popup wins,
+    // then Unicode entry, then the wiki dropdown.
+    let overlay: cosmic::Element<'a, Message> =
+        match (&app.footnote_input, &app.unicode_input, wiki) {
+            (Some(_), _, _) => footnote_entry_overlay(app, palette),
+            (None, Some(_), _) => unicode_entry_overlay(app, palette),
+            (None, None, Some(wiki)) => wiki_dropdown(wiki, palette),
+            (None, None, None) => container(column::Column::new()).into(),
+        };
     let pane: cosmic::Element<'a, Message> = stack([surface, overlay]).into();
     // Right-click anywhere on the pane opens the editor menu.
     context_menu(pane, Some(editor_menu()))
@@ -1179,14 +1189,18 @@ fn live_pane<'a>(
     // The popup layer is ALWAYS the stack's second child, even when no
     // popup is open (an empty placeholder takes its slot) — a structural
     // change would rebuild the subtree and drop the focused editor's
-    // key state, the same trap the source editor's popup avoids. The
-    // Unicode entry overlay takes priority, like in the source pane.
+    // key state, the same trap the source editor's popup avoids.
+    // The overlays are mutually exclusive: the footnote popup wins,
+    // then Unicode entry, then the wiki dropdown — same priority as
+    // the source pane.
     let wiki = app.wiki_complete.as_ref();
-    let overlay: cosmic::Element<'a, Message> = match (&app.unicode_input, wiki) {
-        (Some(_), _) => unicode_entry_overlay(app, palette),
-        (None, Some(wiki)) => wiki_dropdown(wiki, palette),
-        (None, None) => container(column::Column::new()).into(),
-    };
+    let overlay: cosmic::Element<'a, Message> =
+        match (&app.footnote_input, &app.unicode_input, wiki) {
+            (Some(_), _, _) => footnote_entry_overlay(app, palette),
+            (None, Some(_), _) => unicode_entry_overlay(app, palette),
+            (None, None, Some(wiki)) => wiki_dropdown(wiki, palette),
+            (None, None, None) => container(column::Column::new()).into(),
+        };
     let pane: cosmic::Element<'a, Message> = stack([scroll.into(), overlay]).into();
     container(pane)
         .width(Length::Fill)
@@ -1280,6 +1294,7 @@ fn focused_block_editor<'a>(
         .expect("focused editor without live state");
     let wiki_open = app.wiki_complete.is_some();
     let unicode_open = app.unicode_input.is_some();
+    let footnote_open = app.footnote_input.is_some();
     let base_font = editor_font(app.editor_font_mono, &app.editor_font_family);
     set_editor_base_font(base_font);
     // Same highlighter and surface as the source editor (M4 decision 3);
@@ -1313,7 +1328,7 @@ fn focused_block_editor<'a>(
             },
             editor_highlight_format,
         )
-        .key_binding(move |press| live_key_binding(press, wiki_open, unicode_open))
+        .key_binding(move |press| live_key_binding(press, wiki_open, unicode_open, footnote_open))
         .style(editor_surface_style)
         .into()
 }
@@ -1334,7 +1349,16 @@ pub(crate) fn editor_key_binding(
     press: text_editor::KeyPress,
     wiki_open: bool,
     unicode_open: bool,
+    footnote_open: bool,
 ) -> Option<text_editor::Binding<Message>> {
+    // While the footnote popup is open, the editor feeds its text
+    // buffer instead of typing — above every other binding (the
+    // overlays are mutually exclusive, so one wins).
+    if footnote_open {
+        if let Some(binding) = footnote_entry_binding(&press) {
+            return Some(binding);
+        }
+    }
     if unicode_open {
         if let Some(binding) = unicode_entry_binding(&press) {
             return Some(binding);
@@ -1376,8 +1400,9 @@ pub(crate) fn editor_key_binding(
 /// Ctrl+Shift+U opens Unicode codepoint entry exactly like in the
 /// source editor: while it is open, the region's editor feeds the hex
 /// buffer instead of typing (`unicode_entry_binding`, checked first).
-/// Ctrl+Alt+F inserts a footnote: the reference at the region's caret,
-/// the definition at the end of the note.
+/// Ctrl+Alt+F opens the footnote popup (the same one the source editor
+/// uses): the commit puts the reference at the region's caret and the
+/// typed definition at the end of the note.
 ///
 /// Everything else (typing, Enter, copy/paste, selection) falls back to
 /// the editor's own bindings — including Ctrl combos the formatting map
@@ -1386,13 +1411,20 @@ pub(crate) fn live_key_binding(
     press: text_editor::KeyPress,
     wiki_open: bool,
     unicode_open: bool,
+    footnote_open: bool,
 ) -> Option<text_editor::Binding<Message>> {
     if !matches!(press.status, text_editor::Status::Focused { .. }) {
         return None;
     }
-    // While Unicode codepoint entry is open, the editor swallows typing
-    // and feeds the hex buffer — above every other binding, the same
-    // priority the source editor gives it.
+    // While the footnote popup or codepoint entry is open, the editor
+    // swallows typing and feeds the overlay's buffer — above every
+    // other binding, the same priority the source editor gives them
+    // (the overlays are mutually exclusive, so one wins).
+    if footnote_open {
+        if let Some(binding) = footnote_entry_binding(&press) {
+            return Some(binding);
+        }
+    }
     if unicode_open {
         if let Some(binding) = unicode_entry_binding(&press) {
             return Some(binding);
@@ -1429,7 +1461,7 @@ pub(crate) fn live_key_binding(
             let alt = press.modifiers.alt();
             // Footnote shares the source editor's chord: Ctrl+Alt+F.
             if lower == "f" && alt {
-                return Some(text_editor::Binding::Custom(Message::LiveFootnote));
+                return Some(text_editor::Binding::Custom(Message::FootnoteStart));
             }
             // Unicode codepoint entry starts like in the source editor.
             if lower == "u" && shift && !alt {
@@ -1738,14 +1770,22 @@ pub fn settings_view<'a>(app: &'a VaultNotes) -> Element<'a, Message> {
 }
 
 /// Shared style for the editor's floating popups (wikilink dropdown,
-/// Unicode entry indicator).
+/// Unicode entry indicator, footnote popup). The fill is nearly opaque
+/// — a hint of the editor beneath still reads through — and the shadow
+/// lifts the popup off the text, which stands in for the blur the
+/// compositor cannot apply inside the window's own buffer.
 fn popup_style(palette: Palette) -> impl Fn(&cosmic::Theme) -> cosmic::widget::container::Style {
     move |_| cosmic::widget::container::Style {
-        background: Some(Background::Color(with_alpha(palette.surface, 0.94))),
+        background: Some(Background::Color(with_alpha(palette.surface, 0.97))),
         border: border::Border {
             radius: 8.0.into(),
             width: 1.0,
             color: with_alpha(palette.muted, 0.5),
+        },
+        shadow: cosmic::iced::Shadow {
+            color: with_alpha(cosmic::iced::Color::BLACK, 0.4),
+            offset: cosmic::iced::Vector::new(0.0, 2.0),
+            blur_radius: 10.0,
         },
         ..Default::default()
     }
@@ -1764,6 +1804,30 @@ fn unicode_entry_overlay<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'
     if let Some(ch) = unicode_char(hex) {
         col = col.push(text(format!("= {ch}")).size(16));
     }
+    col = col.push(
+        text("Enter insert · Backspace · Esc cancel")
+            .size(11)
+            .class(palette.muted),
+    );
+    container(container(col).padding(6).style(popup_style(palette)))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(alignment::Horizontal::Left)
+        .align_y(alignment::Vertical::Bottom)
+        .padding([0, 12, 4, 12])
+        .into()
+}
+
+/// The footnote popup (Ctrl+Alt+F): the caret's pixel position is not
+/// exposed, so like the other editor popups this anchors to the
+/// editor's bottom edge. It holds the footnote's text as typed so far
+/// and the key hints; Enter commits the reference + definition, Esc
+/// cancels.
+fn footnote_entry_overlay<'a>(app: &'a VaultNotes, palette: Palette) -> Element<'a, Message> {
+    let definition = app.footnote_input.as_deref().unwrap_or("");
+    let mut col = column::Column::new()
+        .spacing(2)
+        .push(text(format!("footnote: {definition}")).size(16));
     col = col.push(
         text("Enter insert · Backspace · Esc cancel")
             .size(11)

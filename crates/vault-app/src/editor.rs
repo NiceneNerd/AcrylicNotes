@@ -130,18 +130,23 @@ pub fn replace_spans(text: &str, spans: &[TextMatch], replacement: &str) -> Stri
 
 // --- footnotes --------------------------------------------------------------
 
-/// Insert a `[^N]` reference at the caret and a `[^N]: ` definition at
-/// the end of the document; N is the first number without a definition.
+/// Insert a `[^N]` reference at the caret and a `[^N]: definition`
+/// line at the end of the document; N is the first number without a
+/// definition.
 ///
 /// The definitions are normalized on the way: every top-level
 /// `[^label]:` line gets exactly one blank line before it. Markdown
 /// needs that blank line — without it the definition is a lazy
 /// continuation of the paragraph above and never becomes a footnote.
 ///
+/// The `definition` is the footnote's text, typed into the footnote
+/// popup before the insert happens (an empty definition leaves the
+/// conventional `[^N]: ` placeholder).
+///
 /// Returns the new text and the caret's place in it (right after the
 /// inserted reference).
 #[must_use]
-pub fn insert_footnote(text: &str, caret: Caret, n: u32) -> (String, Caret) {
+pub fn insert_footnote(text: &str, caret: Caret, n: u32, definition: &str) -> (String, Caret) {
     let lines: Vec<&str> = text.split('\n').collect();
     let (mut lines, cursor_line) = normalise_footnote_definitions(lines, caret.0);
     // The reference goes in at the caret.
@@ -154,7 +159,7 @@ pub fn insert_footnote(text: &str, caret: Caret, n: u32) -> (String, Caret) {
     if lines.last().is_some_and(|last| !last.is_empty()) {
         lines.push(String::new());
     }
-    lines.push(format!("[^{n}]: "));
+    lines.push(format!("[^{n}]: {definition}"));
     (lines.join("\n"), caret)
 }
 
@@ -397,32 +402,41 @@ mod footnote_tests {
 
     #[test]
     fn insert_footnote_puts_the_reference_and_the_definition() {
-        let (text, cursor) = insert_footnote("body\n", (0, 4), 1);
+        let (text, cursor) = insert_footnote("body\n", (0, 4), 1, "");
         // The reference lands at the cursor; the definition at the end,
-        // under a blank line.
+        // under a blank line. An empty definition leaves the
+        // conventional bare placeholder.
         assert_eq!(text, "body[^1]\n\n[^1]: ");
+        assert_eq!(cursor, (0, 8));
+    }
+
+    #[test]
+    fn insert_footnote_carries_the_typed_definition_text() {
+        let (text, cursor) = insert_footnote("body\n", (0, 4), 1, "read more");
+        // The definition holds the text typed into the footnote popup.
+        assert_eq!(text, "body[^1]\n\n[^1]: read more");
         assert_eq!(cursor, (0, 8));
     }
 
     #[test]
     fn insert_footnote_normalizes_the_blank_lines_before_the_definitions() {
         // Two blank lines before a definition become one…
-        let (text, _) = insert_footnote("body\n\n\n[^1]: note\n", (0, 4), 2);
+        let (text, _) = insert_footnote("body\n\n\n[^1]: note\n", (0, 4), 2, "");
         assert_eq!(text, "body[^2]\n\n[^1]: note\n\n[^2]: ");
         // …and none becomes one.
-        let (text, _) = insert_footnote("body\n[^1]: note\n", (0, 4), 2);
+        let (text, _) = insert_footnote("body\n[^1]: note\n", (0, 4), 2, "");
         assert_eq!(text, "body[^2]\n\n[^1]: note\n\n[^2]: ");
     }
 
     #[test]
     fn a_definition_in_a_code_block_is_left_alone() {
-        let (text, _) = insert_footnote("```\n[^1]: code\n```\n", (0, 0), 2);
+        let (text, _) = insert_footnote("```\n[^1]: code\n```\n", (0, 0), 2, "");
         assert_eq!(text, "[^2]```\n[^1]: code\n```\n\n[^2]: ");
     }
 
     #[test]
     fn the_cursor_follows_the_lines_the_normalization_moves() {
-        let (text, cursor) = insert_footnote("body\n\n\n[^1]: note\n\nafter\n", (5, 0), 2);
+        let (text, cursor) = insert_footnote("body\n\n\n[^1]: note\n\nafter\n", (5, 0), 2, "");
         // The blank lines above the definition collapsed, so the cursor
         // moved up with them.
         assert_eq!(cursor, (4, 4));

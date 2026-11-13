@@ -78,7 +78,7 @@ Source of truth: the `Message` enum (`app/src/app.rs:317–541`) and its `update
 | EDIT-006 | Word wrap toggle in both editors | view.rs:1195–1199 |
 | EDIT-007 | Undo/redo — per-tab snapshot stacks (text+cursor), limit 100, redo cleared by edits | app.rs:800–842 |
 | EDIT-008 | Formatting: Bold/Italic/Strike/Code/Highlight/Link — wrap selection or insert empty markers | app.rs:292–314, 847–872 |
-| EDIT-009 | Footnote insertion (Ctrl+Alt+F): `[^N]` + `[^N]: ` definition; N = first undefined; definition blank-line normalization; code-fence aware — the pure text math is **shared** in `vault_app::editor::{insert_footnote, next_footnote_number}` since Phase 6 | crates/vault-app/src/editor.rs, app.rs handler |
+| EDIT-009 | Footnote popup (Ctrl+Alt+F, both editors): type the footnote's text, Enter inserts `[^N]` at the caret and `[^N]: <text>` at the note end as one undo step, Esc cancels; N = first undefined; definition blank-line normalization; code-fence aware — the pure text math is **shared** in `vault_app::editor::{insert_footnote, next_footnote_number}` since Phase 6 | crates/vault-app/src/editor.rs, app.rs handler |
 | EDIT-010 | Word delete (Ctrl+Backspace/Delete): unicode word boundaries, line-break crossing, one undo step — the byte ranges are **shared** in `vault_app::editor::{word_before, word_after}` since Phase 6 (action glue stays in the shell) | crates/vault-app/src/editor.rs, app.rs |
 | EDIT-011 | Auto-pairs `( [ { " ' \` \` \` around selection (stays selected for nesting); step-over closer; boundary-checked quotes; setting off inserts raw — the pair table is **shared** in `vault_app::editor::pair_for` since Phase 6 (the iced-action glue stays in the shell) | crates/vault-app/src/editor.rs, app.rs |
 | EDIT-012 | Clipboard Copy/Cut/Paste/Select-All routed through app messages (join undo/dirty bookkeeping); paste is async | app.rs:4360–4409 |
@@ -94,7 +94,7 @@ Source of truth: the `Message` enum (`app/src/app.rs:317–541`) and its `update
 | EDIT-022 | Unicode entry overlay (Ctrl+Shift+U): hex buffer (max 6), Space/Enter commit, Backspace unravels, Esc cancels | app.rs:1685–1712, 4524–4567 |
 | EDIT-100 | Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y undo/redo | app.rs:1609–1614 |
 | EDIT-101 | Ctrl+B/I/K/\`, Ctrl+Shift+X/H formatting shortcuts | app.rs:1615–1620 |
-| EDIT-102 | Ctrl+Alt+F footnote (Ctrl+Shift+F belongs to vault search) | app.rs:1621–1623 |
+| EDIT-102 | Ctrl+Alt+F footnote popup (Ctrl+Shift+F belongs to vault search) | app.rs:1621–1623 |
 | EDIT-103 | Ctrl+Shift+U Unicode entry | app.rs:1624–1625 |
 | EDIT-104 | Ctrl+Backspace / Ctrl+Delete word delete | app.rs:1629–1634 |
 | EDIT-105 | Plain bracket/quote → auto-pair (uses produced text, layout-independent) | app.rs:1635–1645 |
