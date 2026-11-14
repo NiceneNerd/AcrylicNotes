@@ -14,6 +14,10 @@
 //!   check-windows-ui    cross-compile check of the app-windows frontend
 //!                       (cfg(windows) code incl. the pinned windows-reactor)
 //!                       for x86_64-pc-windows-gnu (target must be installed)
+//!   test-windows-ui     build app-windows UI tests for x86_64-pc-windows-gnu
+//!                       (target must be installed) and run them under Wine:
+//!                       headless windows-reactor RecordingRuntime tests, no
+//!                       Windows machine needed (Wine + mingw required)
 //!   parity-report       summarize docs/parity.md matrix rows by Windows status
 
 use std::process::{exit, Command};
@@ -78,6 +82,13 @@ fn main() {
                 .unwrap_or("x86_64-pc-windows-gnu");
             run_cargo(&["check", "--target", target, "-p", "app-windows"]);
         }
+        Some("test-windows-ui") => {
+            let target = args
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or("x86_64-pc-windows-gnu");
+            run_windows_ui_tests(target);
+        }
         Some("parity-report") => parity_report(),
         Some("help") | Some("--help") | Some("-h") => print_usage(),
         Some(other) => {
@@ -93,11 +104,53 @@ fn main() {
 }
 
 fn run_cargo(cargo_args: &[&str]) -> ! {
-    let status = Command::new("cargo")
-        .args(cargo_args)
-        .status()
-        .expect("cargo not found");
+    run_cargo_env(cargo_args, &[])
+}
+
+/// Runs cargo with extra environment variables. Used by `test-windows-ui` to
+/// set the `CARGO_TARGET_<triple>_RUNNER` shim so cargo itself launches the
+/// windows-gnu test binaries under Wine (cargo cannot exec PE binaries
+/// natively on Linux: "Exec format error").
+fn run_cargo_env(cargo_args: &[&str], envs: &[(String, String)]) -> ! {
+    let mut status = Command::new("cargo");
+    status.args(cargo_args);
+    for (key, value) in envs {
+        status.env(key, value);
+    }
+    let status = status.status().expect("cargo not found");
     exit(status.code().unwrap_or(1));
+}
+
+/// Builds and runs the app-windows UI tests for the Windows target.
+///
+/// On a non-Windows host the test binaries run under Wine (installed
+/// separately): the `CARGO_TARGET_*_RUNNER` env is set to `wine` unless the
+/// caller already provides a runner or a `WINE` executable override. On a
+/// real Windows host cargo runs the tests natively and no runner is needed.
+fn run_windows_ui_tests(target: &str) -> ! {
+    let runner_key = format!(
+        "CARGO_TARGET_{}_RUNNER",
+        target.replace('-', "_").to_uppercase()
+    );
+    let mut envs: Vec<(String, String)> = Vec::new();
+    if std::env::var_os(&runner_key).is_none() && !cfg!(target_os = "windows") {
+        let wine = std::env::var("WINE").unwrap_or_else(|_| String::from("wine"));
+        envs.push((runner_key, wine));
+        // Keep the Wine output readable: only the test harness's lines.
+        let wine_debug = std::env::var("WINEDEBUG").unwrap_or_else(|_| String::from("-all"));
+        envs.push((String::from("WINEDEBUG"), wine_debug));
+    }
+    run_cargo_env(
+        &[
+            "test",
+            "--target",
+            target,
+            "-p",
+            "app-windows",
+            "--no-fail-fast",
+        ],
+        &envs,
+    );
 }
 
 fn print_usage() {
@@ -115,6 +168,11 @@ fn print_usage() {
     println!(
         "  check-windows-ui [target]   cross-compile check of app-windows \
          (cfg(windows) code + windows-reactor pin) for x86_64-pc-windows-gnu (default)"
+    );
+    println!(
+        "  test-windows-ui [target]    build app-windows UI tests for \
+         x86_64-pc-windows-gnu (default) and run them under Wine \
+         (headless RecordingRuntime lane)"
     );
     println!("  parity-report         summarize docs/parity.md matrix rows by Windows status");
     println!();

@@ -18,6 +18,15 @@ vault-platform = { path = "../../crates/vault-platform" }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-reactor = { version = "=0.100.0" }
 
+# Headless UI testing: windows-reactor's `RecordingRuntime` runs the same
+# component code the real WinUI loop runs and records every native command
+# for assertions. Test binaries are built for windows-gnu and executed under
+# Wine via `cargo run -p xtask -- test-windows-ui` (no Windows machine
+# needed); real-Windows verification (rendering, IME, DPI, packaging) stays
+# user-side.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows-reactor = { version = "=0.100.0", features = ["test"] }
+
 [[bin]]
 name = "app-windows"
 path = "src/main.rs"

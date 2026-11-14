@@ -66,3 +66,25 @@ jobs:
       # flow) and the pinned windows-reactor dependency, which no Linux build
       # compiles. Native execution/UI verification stays user-side.
       - run: cargo run -p xtask -- check-windows-ui
+      # Lints the same cross target (cfg(windows) code + tests), catching
+      # clippy violations the Linux clippy job cannot see.
+      - run: cargo clippy --target x86_64-pc-windows-gnu -p app-windows --tests -- -D warnings
+
+  test-windows-ui:
+    name: headless WinUI tests under Wine (x86_64-pc-windows-gnu)
+    runs-on: ubuntu-latest
+    needs: [clippy]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Install Wine and the MinGW cross-linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wine64 g++-mingw-w64-x86-64
+      # Runs the cfg(windows) UI tests (windows-reactor RecordingRuntime,
+      # feature `test`) headlessly: components run the same code the real
+      # WinUI loop runs and assert against the recorded native tree. Wine
+      # cannot verify real rendering/IME/DPI — that stays user-side.
+      - run: cargo run -p xtask -- test-windows-ui

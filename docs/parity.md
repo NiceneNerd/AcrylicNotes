@@ -60,20 +60,26 @@ Implementation detail lives in the APPWIN map in
 
 **Native Windows compilation of the UI path is type-checked from Linux**
 (`cargo run -p xtask -- check-windows-ui` plus cross-target clippy
-`-D warnings`, both in CI). **Native execution and UI verification remain
-user-side — never claimed via Wine** (this session has no Windows runner).
+`-D warnings`, both in CI). **UI logic is additionally exercised headlessly
+on every push**: windows-reactor's `RecordingRuntime` runs the same component
+code the real WinUI loop runs and records every native command for
+assertions — built for `x86_64-pc-windows-gnu` and executed under Wine
+(`cargo run -p xtask -- test-windows-ui`, CI + local; Wine and the mingw
+cross-linker required). What Wine cannot verify — real WinUI rendering, IME,
+DPI, theming, pickers, MSIX packaging — remains user-side on a real Windows
+machine and is never claimed via Wine.
 
 | ID | Piece | Status |
 | --- | --- | --- |
 | APPWIN-001 | Kernel wiring (`WindowsApp` over the shared `App`) | Done, Linux-tested |
 | APPWIN-002 | Effect execution against injected services (saves/reloads/external opens) | Done, Linux-tested; p11 services for settings + vault-wide search |
 | APPWIN-003 | Message envelope + window-close flush (`UiCommand::SaveTabs`) | Done, Linux-tested |
-| APPWIN-004 | File tree view over kernel `tree` + `TreeState` | Done, Linux-tested |
+| APPWIN-004 | File tree view over kernel `tree` + `TreeState` | Done, Linux-tested; rows render headlessly (`tests/ui_headless.rs`) |
 | APPWIN-005 | Source editor caret/find math via `vault_app::editor` | Done, Linux-tested |
 | APPWIN-006 | Reading-mode plain-text projection | Partial; native element construction is p11 |
 | APPWIN-007 | Split layout state in `vault_app::layout` | Done, Linux-tested (kernel) |
-| APPWIN-008 | Native window loop, WinUI controls, live adapters | **Not started (p11+); requires a real Windows machine** |
-| APPWIN-009 | Cross-target verification (xtask + CI) | Done, runs on Linux |
+| APPWIN-008 | Native window loop, WinUI controls, live adapters | Not started (p11+); UI code is written test-first against the headless `RecordingRuntime` lane; real-rendering/IME/DPI/pickers/packaging checks remain user-side |
+| APPWIN-009 | Cross-target verification (xtask + CI) | Done, runs on Linux: cross-target checks + headless Wine UI tests; real-Windows smoke remains user-side |
 
 ## Baseline (Phase 0)
 

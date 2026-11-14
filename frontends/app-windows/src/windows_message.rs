@@ -37,7 +37,7 @@ mod tests {
 
     #[test]
     fn the_message_envelope_carries_each_kind() {
-        let messages = vec![
+        let messages = [
             WindowsMessage::Command(UiCommand::SaveActiveTab),
             WindowsMessage::EffectCompleted(AppEvent::SaveCompleted {
                 effect: vault_app::ids::EffectId::new(7),
