@@ -25,11 +25,12 @@ use vault_app::commands::UiCommand;
 use vault_app::settings::PaneMode;
 use vault_app::tree as kernel_tree;
 use vault_md::parse_note;
+use vault_platform::OpenTarget;
 
 use crate::app::WindowsApp;
 use crate::file_tree::FileTree;
 use crate::reading::WindowsMarkdownRenderer;
-use crate::reading_view::doc_view;
+use crate::reading_view::{doc_view, LinkNav};
 use crate::windows_message::{NativeEvent, WindowsMessage};
 
 /// The shell component's input: a shared handle to the kernel host.
@@ -214,7 +215,20 @@ impl Component for Shell {
         let reading_area = active_buffer
             .map(|buffer| {
                 let doc = parse_note(&buffer.text);
-                doc_view(&doc, &WindowsMarkdownRenderer::default())
+                // Link clicks become kernel commands (plan §10.3): URLs go
+                // through `OpenExternal` (the ExternalOpener service owns
+                // the hand-off), wiki links open or focus their tab.
+                let on_link = |nav: LinkNav| {
+                    context.callback(move |()| match nav.clone() {
+                        LinkNav::Url(url) => WindowsMessage::Command(UiCommand::OpenExternal {
+                            target: OpenTarget::Url(url),
+                        }),
+                        LinkNav::Note(path) => {
+                            WindowsMessage::Command(UiCommand::OpenNote { path })
+                        }
+                    })
+                };
+                doc_view(&doc, &WindowsMarkdownRenderer::default(), &on_link)
             })
             .unwrap_or_else(|| View::from(TextBlock::new().text("(no note open)")));
 

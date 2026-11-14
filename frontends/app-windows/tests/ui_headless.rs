@@ -218,7 +218,7 @@ use app_windows::windows_message::WindowsMessage;
 use app_windows::WindowsApp;
 use vault_app::commands::UiCommand;
 use vault_app::repository::{testing::MemoryRepository, NoteRepository};
-use vault_platform::testing::RecordingOpener;
+use vault_platform::testing::{OpenCall, RecordingOpener};
 use windows_reactor::test::{EventId, EventPayload, QueuedEvent};
 
 /// A kernel host over a memory vault with a succeeding opener.
@@ -778,6 +778,66 @@ fn headless_shell_pane_source_shows_the_editor_only() {
     assert!(
         find_node_with_property_text(rt, window, PropertyId::TextBlockText, "Title").is_none(),
         "the reading view is gone in Source mode"
+    );
+}
+
+#[test]
+fn headless_shell_reading_link_click_opens_the_url_through_the_kernel() {
+    // The full vertical slice: render -> click a link -> kernel
+    // OpenExternal command -> ExternalOpener service records the call.
+    let repo = Rc::new(RefCell::new(MemoryRepository::new()));
+    repo.borrow_mut()
+        .insert("a.md", "see [the docs](https://example.com)\n");
+    let opener = Rc::new(RecordingOpener::succeeding());
+    let app = Rc::new(RefCell::new(WindowsApp::new(
+        repo as Rc<RefCell<dyn NoteRepository>>,
+        opener.clone(),
+    )));
+    shell_open_tab(
+        &app,
+        "a.md",
+        "see [the docs](https://example.com)\n",
+        "see [the docs](https://example.com)\n",
+    );
+
+    let mut pump = mounted_shell(&app);
+    // Live (the boot default) renders the reading view with the link.
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "the docs").expect("link button recorded")
+    };
+    click(&mut pump, target, EventId::HyperlinkButtonClick);
+
+    assert_eq!(
+        opener.calls(),
+        vec![OpenCall::Url(String::from("https://example.com"))],
+        "the kernel handed the URL to the platform opener"
+    );
+    assert_eq!(
+        app.borrow().shared.state.last_error,
+        None,
+        "a successful open raises nothing"
+    );
+}
+
+#[test]
+fn headless_shell_reading_wiki_link_click_opens_the_note() {
+    let app = shell_app_with(&[("a.md", "see [[b.md]]\n"), ("b.md", "b\n")]);
+    shell_open_tab(&app, "a.md", "see [[b.md]]\n", "see [[b.md]]\n");
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "b.md").expect("wiki link button recorded")
+    };
+    click(&mut pump, target, EventId::HyperlinkButtonClick);
+
+    assert_eq!(
+        app.borrow().shared.state.tabs.active_path(),
+        Some("b.md"),
+        "invoking a wiki link opens the target note's tab"
     );
 }
 

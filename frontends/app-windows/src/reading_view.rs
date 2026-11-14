@@ -15,19 +15,37 @@
 use vault_app::markdown::plain_inlines;
 use vault_md::{Block, Doc, Inline};
 use windows_reactor::{
-    ChildrenControl, ContentControl, FontWeight, HyperlinkButton, KeyedView, Orientation,
+    Callback, ChildrenControl, ContentControl, FontWeight, HyperlinkButton, KeyedView, Orientation,
     StackPanel, TextBlock, View,
 };
 
 use super::reading::WindowsMarkdownRenderer;
+
+/// Where a clicked link navigates (plan §10.3's shared link commands,
+/// materialized): the renderer emits the decision, the shell maps it to
+/// kernel commands (`OpenExternal` for URLs, `OpenNote` for wiki links).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkNav {
+    /// An external URL — the kernel hands it to the platform's
+    /// `ExternalOpener` (failures surface on the error line).
+    Url(String),
+    /// A wiki-link target note — the kernel opens or focuses its tab.
+    Note(String),
+}
 
 /// Render a whole document into reading-mode WinUI elements.
 ///
 /// Each top-level block becomes a keyed child of a vertical stack, keyed
 /// by its block index so reconciliation preserves identity across edits.
 /// Footnote definitions are skipped: they are rendered inline via
-/// footnote references, not as standalone blocks.
-pub fn doc_view(doc: &Doc, config: &WindowsMarkdownRenderer) -> View {
+/// footnote references, not as standalone blocks. `on_link` turns a
+/// clicked link's navigation decision into the click callback the shell
+/// wires to kernel commands.
+pub fn doc_view(
+    doc: &Doc,
+    config: &WindowsMarkdownRenderer,
+    on_link: &dyn Fn(LinkNav) -> Callback<()>,
+) -> View {
     let children: Vec<KeyedView> = doc
         .blocks
         .iter()
@@ -36,7 +54,10 @@ pub fn doc_view(doc: &Doc, config: &WindowsMarkdownRenderer) -> View {
             if matches!(block, Block::FootnoteDef { .. }) {
                 None
             } else {
-                Some(KeyedView::new(i.to_string(), block_view(block, config)))
+                Some(KeyedView::new(
+                    i.to_string(),
+                    block_view(block, config, on_link),
+                ))
             }
         })
         .collect();
@@ -46,16 +67,17 @@ pub fn doc_view(doc: &Doc, config: &WindowsMarkdownRenderer) -> View {
 }
 
 /// Render a single block into WinUI elements.
-fn block_view(block: &Block, config: &WindowsMarkdownRenderer) -> View {
+fn block_view(
+    block: &Block,
+    config: &WindowsMarkdownRenderer,
+    on_link: &dyn Fn(LinkNav) -> Callback<()>,
+) -> View {
     match block {
         Block::Paragraph { content, .. } => StackPanel::new()
             .orientation(Orientation::Vertical)
-            .keyed_children(
-                content
-                    .iter()
-                    .enumerate()
-                    .map(|(i, inline)| KeyedView::new(i.to_string(), inline_view(inline, config))),
-            ),
+            .keyed_children(content.iter().enumerate().map(|(i, inline)| {
+                KeyedView::new(i.to_string(), inline_view(inline, config, on_link))
+            })),
         Block::Heading { level, content, .. } => {
             let size = match *level {
                 1 => 28.0,
@@ -68,7 +90,7 @@ fn block_view(block: &Block, config: &WindowsMarkdownRenderer) -> View {
                 .keyed_children(content.iter().enumerate().map(|(i, inline)| {
                     KeyedView::new(
                         i.to_string(),
-                        inline_view_with_style(inline, config, size, None),
+                        inline_view_with_style(inline, config, size, None, on_link),
                     )
                 }))
         }
@@ -83,19 +105,16 @@ fn block_view(block: &Block, config: &WindowsMarkdownRenderer) -> View {
         Block::Rule => TextBlock::new().text("─").into(),
         Block::List { items, .. } => StackPanel::new()
             .orientation(Orientation::Vertical)
-            .keyed_children(
-                items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, item)| KeyedView::new(i.to_string(), list_item_view(item, config))),
-            ),
+            .keyed_children(items.iter().enumerate().map(|(i, item)| {
+                KeyedView::new(i.to_string(), list_item_view(item, config, on_link))
+            })),
         Block::Quote(inner) => StackPanel::new()
             .orientation(Orientation::Vertical)
             .keyed_children(
                 inner
                     .iter()
                     .enumerate()
-                    .map(|(i, b)| KeyedView::new(i.to_string(), block_view(b, config))),
+                    .map(|(i, b)| KeyedView::new(i.to_string(), block_view(b, config, on_link))),
             ),
         Block::Callout { title, body, .. } => {
             let mut children: Vec<KeyedView> = title
@@ -104,14 +123,20 @@ fn block_view(block: &Block, config: &WindowsMarkdownRenderer) -> View {
                 .map(|(i, inline)| {
                     KeyedView::new(
                         format!("title-{i}"),
-                        inline_view_with_style(inline, config, 14.0, Some(FontWeight::SEMI_BOLD)),
+                        inline_view_with_style(
+                            inline,
+                            config,
+                            14.0,
+                            Some(FontWeight::SEMI_BOLD),
+                            on_link,
+                        ),
                     )
                 })
                 .collect();
             children.extend(
-                body.iter()
-                    .enumerate()
-                    .map(|(i, b)| KeyedView::new(format!("body-{i}"), block_view(b, config))),
+                body.iter().enumerate().map(|(i, b)| {
+                    KeyedView::new(format!("body-{i}"), block_view(b, config, on_link))
+                }),
             );
             StackPanel::new()
                 .orientation(Orientation::Vertical)
@@ -137,7 +162,7 @@ fn block_view(block: &Block, config: &WindowsMarkdownRenderer) -> View {
             children.extend(
                 body.iter()
                     .enumerate()
-                    .map(|(i, b)| KeyedView::new(i.to_string(), block_view(b, config))),
+                    .map(|(i, b)| KeyedView::new(i.to_string(), block_view(b, config, on_link))),
             );
             StackPanel::new()
                 .orientation(Orientation::Vertical)
@@ -148,7 +173,11 @@ fn block_view(block: &Block, config: &WindowsMarkdownRenderer) -> View {
 }
 
 /// Render a list item (task checkbox marker + body blocks).
-fn list_item_view(item: &vault_md::ListItem, config: &WindowsMarkdownRenderer) -> View {
+fn list_item_view(
+    item: &vault_md::ListItem,
+    config: &WindowsMarkdownRenderer,
+    on_link: &dyn Fn(LinkNav) -> Callback<()>,
+) -> View {
     let prefix = match item.task {
         Some(true) => "[x] ",
         Some(false) => "[ ] ",
@@ -160,7 +189,7 @@ fn list_item_view(item: &vault_md::ListItem, config: &WindowsMarkdownRenderer) -
         item.body
             .iter()
             .enumerate()
-            .map(|(i, b)| KeyedView::new(i.to_string(), block_view(b, config))),
+            .map(|(i, b)| KeyedView::new(i.to_string(), block_view(b, config, on_link))),
     );
     StackPanel::new()
         .orientation(Orientation::Horizontal)
@@ -186,8 +215,12 @@ fn inline_cells_view(inlines: &[Inline], _config: &WindowsMarkdownRenderer) -> V
 }
 
 /// Render a single inline into WinUI elements (body text size).
-fn inline_view(inline: &Inline, config: &WindowsMarkdownRenderer) -> View {
-    inline_view_with_style(inline, config, 14.0, None)
+fn inline_view(
+    inline: &Inline,
+    config: &WindowsMarkdownRenderer,
+    on_link: &dyn Fn(LinkNav) -> Callback<()>,
+) -> View {
+    inline_view_with_style(inline, config, 14.0, None, on_link)
 }
 
 /// A text block with the size and any explicit weight applied.
@@ -207,6 +240,7 @@ fn inline_view_with_style(
     config: &WindowsMarkdownRenderer,
     size: f64,
     font_weight: Option<FontWeight>,
+    on_link: &dyn Fn(LinkNav) -> Callback<()>,
 ) -> View {
     match inline {
         Inline::Text(t) => View::from(styled_text(t.clone(), size, font_weight)),
@@ -227,13 +261,16 @@ fn inline_view_with_style(
         Inline::Link { url, content, .. } => {
             let label = plain_inlines(content);
             if url.starts_with("http://") || url.starts_with("https://") {
-                // navigate_uri validates and returns the builder; content
-                // (from ContentControl) returns the View, so it goes last.
-                HyperlinkButton::new()
-                    .navigate_uri_optional(Some(url.clone()))
-                    .ok()
-                    .map(|button| button.content(styled_text(label.clone(), size, font_weight)))
-                    .unwrap_or_else(|| View::from(styled_text(label, size, font_weight)))
+                // The kernel owns the open (plan §10.3): the click emits
+                // `OpenExternal`, the effect runs against the injected
+                // ExternalOpener, and failures surface on the error line.
+                // No navigate_uri: the control must not bypass the kernel.
+                let click = on_link(LinkNav::Url(url.clone()));
+                HyperlinkButton::new().on_click(click).content(styled_text(
+                    label,
+                    size,
+                    font_weight,
+                ))
             } else {
                 // Relative link: click handling is wired by the shell when
                 // reading mode is mounted.
@@ -245,7 +282,12 @@ fn inline_view_with_style(
                 Some(alias) => plain_inlines(alias),
                 None => wl.target.note.clone(),
             };
-            View::from(styled_text(label, size, font_weight))
+            // Invoking a wiki link asks the kernel to open (or focus) the
+            // target note's tab — the same command the sidebar tree sends.
+            let click = on_link(LinkNav::Note(wl.target.note.clone()));
+            HyperlinkButton::new()
+                .on_click(click)
+                .content(styled_text(label, size, font_weight))
         }
         Inline::Tag(t) => View::from(styled_text(format!("#{t}"), size, font_weight)),
         Inline::FootnoteRef(r) => View::from(styled_text(format!("^{r}"), size, font_weight)),
@@ -278,7 +320,9 @@ fn inline_view_with_style(
 mod tests {
     use super::*;
     use vault_md::{ListItem, WikiLink, WikiTarget};
-    use windows_reactor::test::{NodeId, PropertyId, PropertyValue, Pump, RecordingRuntime};
+    use windows_reactor::test::{
+        EventId, NodeId, PropertyId, PropertyValue, Pump, RecordingRuntime,
+    };
 
     fn doc_with(blocks: Vec<Block>) -> Doc {
         Doc {
@@ -290,7 +334,10 @@ mod tests {
 
     fn render(doc: &Doc) -> (Pump<RecordingRuntime>, NodeId) {
         let mut pump = Pump::new(RecordingRuntime::default());
-        pump.mount_view(doc_view(doc, &WindowsMarkdownRenderer::default()))
+        // Render tests only assert the tree, not click routing: the stub
+        // factory hands back a do-nothing callback.
+        let on_link = |_nav: LinkNav| Callback::new(|()| ());
+        pump.mount_view(doc_view(doc, &WindowsMarkdownRenderer::default(), &on_link))
             .expect("mount");
         let window = pump.window().expect("window node");
         (pump, window)
@@ -306,22 +353,6 @@ mod tests {
         }
         for &child in node.children() {
             if let Some(found) = find_text(rt, child, expected) {
-                return Some(found);
-            }
-        }
-        None
-    }
-
-    /// Find a HyperlinkButton whose navigate-uri matches `expected`.
-    fn find_link(rt: &RecordingRuntime, from: NodeId, expected: &str) -> Option<NodeId> {
-        let node = rt.node(from)?;
-        if let Some(PropertyValue::Str(u)) = node.property(PropertyId::HyperlinkButtonNavigateUri) {
-            if u == expected {
-                return Some(from);
-            }
-        }
-        for &child in node.children() {
-            if let Some(found) = find_link(rt, child, expected) {
                 return Some(found);
             }
         }
@@ -407,8 +438,27 @@ mod tests {
         );
     }
 
+    /// Find the node owning the TextBlock child whose text is exactly
+    /// `label` (a button's content label makes its owner the button).
+    fn find_owner_of_label(rt: &RecordingRuntime, from: NodeId, label: &str) -> Option<NodeId> {
+        let node = rt.node(from)?;
+        for &child in node.children() {
+            if let Some(child_node) = rt.node(child) {
+                if child_node.property(PropertyId::TextBlockText)
+                    == Some(&PropertyValue::Str(label.to_string()))
+                {
+                    return Some(from);
+                }
+                if let Some(found) = find_owner_of_label(rt, child, label) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
     #[test]
-    fn external_link_renders_as_hyperlink() {
+    fn external_link_renders_as_a_clickable_hyperlink() {
         let doc = doc_with(vec![paragraph(vec![Inline::Link {
             url: "https://example.com".into(),
             title: None,
@@ -416,14 +466,18 @@ mod tests {
         }])]);
         let (pump, window) = render(&doc);
         let rt = pump.runtime();
+        // The label renders (the button's content is a child TextBlock),
+        // and the click event is active on its owner.
+        let button = find_owner_of_label(rt, window, "the docs").expect("link button recorded");
         assert!(
-            find_link(rt, window, "https://example.com").is_some(),
-            "external link has navigate-uri"
+            pump.event_revision(button, EventId::HyperlinkButtonClick)
+                .is_some(),
+            "the external link's click wiring is active"
         );
     }
 
     #[test]
-    fn wiki_link_renders_as_text() {
+    fn wiki_link_renders_clickable() {
         let doc = doc_with(vec![paragraph(vec![Inline::WikiLink(WikiLink {
             target: WikiTarget {
                 note: "Meeting Notes".into(),
@@ -435,6 +489,13 @@ mod tests {
         let (pump, window) = render(&doc);
         let rt = pump.runtime();
         assert!(find_text(rt, window, "Meeting Notes").is_some());
+        let button =
+            find_owner_of_label(rt, window, "Meeting Notes").expect("wiki link button recorded");
+        assert!(
+            pump.event_revision(button, EventId::HyperlinkButtonClick)
+                .is_some(),
+            "the wiki link's click wiring is active"
+        );
     }
 
     #[test]
