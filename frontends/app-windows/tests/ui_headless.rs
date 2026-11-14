@@ -899,10 +899,7 @@ fn headless_shell_pane_typing_in_split_updates_the_reading_view() {
 
 /// Like [`shell_app_with`], over a real vault root (the shared search
 /// engine scans the filesystem, not the repository fake).
-fn shell_app_with_root(
-    notes: &[(&str, &str)],
-    root: &std::path::Path,
-) -> Rc<RefCell<WindowsApp>> {
+fn shell_app_with_root(notes: &[(&str, &str)], root: &std::path::Path) -> Rc<RefCell<WindowsApp>> {
     let repo = Rc::new(RefCell::new(MemoryRepository::new()));
     for (path, text) in notes {
         repo.borrow_mut().insert(path, text);
@@ -938,7 +935,10 @@ fn headless_shell_nav_row_switches_the_sidebar_panel() {
 
     let window = pump.window().expect("window node");
     let rt = pump.runtime();
-    assert_eq!(app.borrow().shared.state.panel, vault_app::navigation::NavSection::Search);
+    assert_eq!(
+        app.borrow().shared.state.panel,
+        vault_app::navigation::NavSection::Search
+    );
     // The search panel replaced the tree, and the nav row marks the
     // active section.
     assert!(
@@ -1016,7 +1016,12 @@ fn headless_shell_search_panel_runs_the_scan_and_opens_a_hit() {
 #[test]
 fn headless_shell_outline_panel_lists_headings_and_follows_edits() {
     let app = shell_app_with(&[("a.md", "# Title\n\n## Sub\n\nbody\n")]);
-    shell_open_tab(&app, "a.md", "# Title\n\n## Sub\n\nbody\n", "# Title\n\n## Sub\n\nbody\n");
+    shell_open_tab(
+        &app,
+        "a.md",
+        "# Title\n\n## Sub\n\nbody\n",
+        "# Title\n\n## Sub\n\nbody\n",
+    );
 
     let mut pump = mounted_shell(&app);
     // Source pane: the reading view would also render the heading text,
@@ -1044,8 +1049,13 @@ fn headless_shell_outline_panel_lists_headings_and_follows_edits() {
     // Editing the buffer re-parses the outline.
     let editor = {
         let rt = pump.runtime();
-        find_node_with_property_text(rt, window, PropertyId::TextBoxText, "# Title\n\n## Sub\n\nbody\n")
-            .expect("editor recorded")
+        find_node_with_property_text(
+            rt,
+            window,
+            PropertyId::TextBoxText,
+            "# Title\n\n## Sub\n\nbody\n",
+        )
+        .expect("editor recorded")
     };
     type_text(&mut pump, editor, "# Fresh\n\nbody\n");
     let window = pump.window().expect("window node");

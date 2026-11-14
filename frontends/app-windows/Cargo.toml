@@ -23,6 +23,9 @@ serde_json = "1"
 # workspace gates stay green here; native Windows compilation is user-side.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-reactor = { version = "=0.100.0" }
+# WinRT projected types for the live platform adapters (Launcher, Uri,
+# StorageFile). Same major line as windows-reactor's windows-core.
+windows = { version = "0.52", features = ["Foundation", "System", "Storage"] }
 
 # Headless UI testing: windows-reactor's `RecordingRuntime` runs the same
 # component code the real WinUI loop runs and records every native command

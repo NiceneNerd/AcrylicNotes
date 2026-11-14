@@ -6,13 +6,15 @@
 pub mod app;
 pub mod file_tree;
 pub mod reading;
-// Imports windows-reactor (target-gated): compiles only on Windows targets.
+// Imports windows-reactor / WinRT (target-gated): compiles only on Windows targets.
 #[cfg(target_os = "windows")]
 pub mod reading_view;
 pub mod settings_store;
 #[cfg(target_os = "windows")]
 pub mod shell;
 pub mod source_mode;
+#[cfg(target_os = "windows")]
+pub mod win_opener;
 pub mod windows_effect_runner;
 pub mod windows_message;
 

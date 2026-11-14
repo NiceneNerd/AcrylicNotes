@@ -22,7 +22,7 @@ use windows_reactor::{
 };
 
 use vault_app::commands::UiCommand;
-use vault_app::navigation::{NavSection, outline};
+use vault_app::navigation::{outline, NavSection};
 use vault_app::settings::PaneMode;
 use vault_app::tree as kernel_tree;
 use vault_md::parse_note;
@@ -202,7 +202,7 @@ impl Component for Shell {
                 .orientation(Orientation::Vertical)
                 .keyed_children([
                     KeyedView::new("search-box", View::from(search_box)),
-                    KeyedView::new("search-run", View::from(run_search)),
+                    KeyedView::new("search-run", run_search),
                     KeyedView::new(
                         "search-hits",
                         StackPanel::new()

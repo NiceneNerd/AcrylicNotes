@@ -219,11 +219,13 @@ mod tests {
         // normal case on the developer machine), then the tree xtask
         // stages next to the test binary on another machine.
         let candidates: Vec<std::path::PathBuf> = vec![
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tests/fixtures"),
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures"),
             std::env::current_exe()
                 .ok()
-                .and_then(|exe| exe.parent().map(|p| p.join("vaultnotes-fixtures").join("fixtures")))
+                .and_then(|exe| {
+                    exe.parent()
+                        .map(|p| p.join("vaultnotes-fixtures").join("fixtures"))
+                })
                 .unwrap_or_default(),
         ];
         for cand in &candidates {

@@ -95,10 +95,7 @@ fn golden_fixtures_match() {
 #[test]
 fn strict_line_breaks_render_soft_breaks_as_newlines() {
     let (index, notes) = fixture_vault();
-    let src = std::fs::read_to_string(
-        tests_dir().join("golden/14-linebreaks.md"),
-    )
-    .unwrap();
+    let src = std::fs::read_to_string(tests_dir().join("golden/14-linebreaks.md")).unwrap();
     let doc = parse_note(&src);
     let mut options = RenderOptions::default();
     options.strict_line_breaks = true; // the real vault's .obsidian/app.json

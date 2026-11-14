@@ -267,12 +267,21 @@ fn run_windows_native_tests(target: &str, include_ui: bool) -> ! {
     if include_ui {
         crates.push("app-windows");
     }
-    let mut build = vec!["test", "--target", target, "--no-run", "--message-format=json"];
+    let mut build = vec![
+        "test",
+        "--target",
+        target,
+        "--no-run",
+        "--message-format=json",
+    ];
     for crate_name in &crates {
         build.push("-p");
         build.push(crate_name);
     }
-    println!("== building test harnesses for {target} ({}) ==", crates.join(", "));
+    println!(
+        "== building test harnesses for {target} ({}) ==",
+        crates.join(", ")
+    );
     let output = Command::new("cargo")
         .args(&build)
         .output()
@@ -294,7 +303,7 @@ fn run_windows_native_tests(target: &str, include_ui: bool) -> ! {
             // (`app-windows.exe`) ends in a non-hex segment and is not a
             // test target (its main exits non-zero by design).
             let stem = exe.trim_end_matches(".exe");
-            let last = stem.split('-').last().unwrap_or("");
+            let last = stem.rsplit('-').next().unwrap_or("");
             if !last.is_empty() && last.chars().all(|c| c.is_ascii_hexdigit()) {
                 Some(exe)
             } else {
@@ -312,21 +321,25 @@ fn run_windows_native_tests(target: &str, include_ui: bool) -> ! {
     //    when their compile-time manifest path is absent (another
     //    machine). PowerShell creates intermediate dirs (cmd's mkdir has
     //    no -p), then `scp -r src/. dst/` avoids nesting on re-runs.
-    let fixtures_remote = format!("vaultnotes-fixtures/vault-md-tests");
+    let fixtures_remote = "vaultnotes-fixtures/vault-md-tests";
     let mkdir_cmd = format!(
         "powershell -Command \"New-Item -ItemType Directory -Path 'C:\\\\Users\\\\{user}\\\\{fixtures_remote}' -Force\""
     );
     let _ = Command::new("ssh")
-        .args(&ssh_opts)
+        .args(ssh_opts)
         .arg(remote.as_str())
         .arg(&mkdir_cmd)
         .status();
     // Stage both fixture trees next to the executables.
-    for (src, dst) in [("vault-md/tests", "vault-md-tests"), ("tests/fixtures", "fixtures")] {
+    for (src, dst) in [
+        ("vault-md/tests", "vault-md-tests"),
+        ("tests/fixtures", "fixtures"),
+    ] {
         let fixtures_remote = format!("vaultnotes-fixtures/{dst}");
         let fixtures = Command::new("scp")
-            .args(&ssh_opts)
-            .arg("-r").arg(format!("{src}/."))
+            .args(ssh_opts)
+            .arg("-r")
+            .arg(format!("{src}/."))
             .arg(format!("{remote}:{fixtures_remote}/"))
             .status()
             .expect("scp not found");
@@ -348,7 +361,7 @@ fn run_windows_native_tests(target: &str, include_ui: bool) -> ! {
 
         println!("== copying {} ==", name);
         let scp = Command::new("scp")
-            .args(&ssh_opts)
+            .args(ssh_opts)
             .arg(exe)
             .arg(format!("{remote}:{remote_path}"))
             .status()
@@ -360,7 +373,7 @@ fn run_windows_native_tests(target: &str, include_ui: bool) -> ! {
 
         println!("== running {name} on {remote} ==");
         let run = Command::new("ssh")
-            .args(&ssh_opts)
+            .args(ssh_opts)
             .arg(remote.as_str())
             .arg(&remote_path)
             .output()
