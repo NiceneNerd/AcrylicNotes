@@ -23,7 +23,7 @@ use windows_reactor::{
 use vault_app::commands::UiCommand;
 
 use crate::app::WindowsApp;
-use crate::windows_message::WindowsMessage;
+use crate::windows_message::{NativeEvent, WindowsMessage};
 
 /// The shell component's input: a shared handle to the kernel host.
 ///
@@ -49,6 +49,14 @@ impl ShellHandle {
 /// The native shell: tabs, editor, and error line over the shared kernel.
 pub struct Shell {
     handle: ShellHandle,
+    /// The editor text as last rendered programmatically. A real WinUI
+    /// control raises `TextChanged` for property sets as well as user
+    /// typing; an incoming change equal to this is that echo of the
+    /// shell's own sync and is suppressed instead of being fed back to
+    /// the buffer (plan §11.1: never route programmatic syncs back as
+    /// replacements). `RefCell` because `view` (which takes `&self`)
+    /// records it while `update` compares against it.
+    rendered_editor: RefCell<String>,
 }
 
 impl Component for Shell {
@@ -58,6 +66,7 @@ impl Component for Shell {
     fn create(input: &Self::Input, _context: &ComponentContext<Self>) -> Self {
         Shell {
             handle: input.clone(),
+            rendered_editor: RefCell::new(String::new()),
         }
     }
 
@@ -66,6 +75,14 @@ impl Component for Shell {
     }
 
     fn update(&mut self, message: Self::Message, _context: &ComponentContext<Self>) {
+        if let WindowsMessage::Native(NativeEvent::EditorEdited { text }) = &message {
+            // Echo suppression: equal to the last rendered text means
+            // the echo of our own programmatic sync (initial text set,
+            // tab switch, reload), not a user edit.
+            if *text == *self.rendered_editor.borrow() {
+                return;
+            }
+        }
         self.handle.0.borrow_mut().handle_native(message);
     }
 
@@ -119,15 +136,23 @@ impl Component for Shell {
                 .unwrap_or_else(|| String::from("(no errors)")),
         );
 
-        // Editor: the active tab's buffer text. The editing adapter
-        // (programmatic sync vs. user edits, revisions, composition) is
-        // the next slice; this displays the buffer.
+        // Editor: the active tab's buffer text. User edits arrive as
+        // `TextBoxTextChanged` callbacks and become `EditorEdited`
+        // native events; the buffer update and echo suppression live in
+        // `update`. Composition state and caret/selection tracking are
+        // later adapter slices (plan §11.1); this is Stage A sync.
         let editor_text = state
             .tabs
             .active()
             .and_then(|tab| app.buffers.get(&tab))
             .map(|buffer| buffer.text.clone())
             .unwrap_or_default();
+        *self.rendered_editor.borrow_mut() = editor_text.clone();
+        let editor = TextBox::new()
+            .on_text_changed(context.callback(|text: String| {
+                WindowsMessage::Native(NativeEvent::EditorEdited { text })
+            }))
+            .text(editor_text);
 
         StackPanel::new()
             .orientation(Orientation::Vertical)
@@ -149,7 +174,7 @@ impl Component for Shell {
                         )
                         .content(TextBlock::new().text("save")),
                 ),
-                KeyedView::new("editor", TextBox::new().text(editor_text)),
+                KeyedView::new("editor", editor),
             ])
     }
 }

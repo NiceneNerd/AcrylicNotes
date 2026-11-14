@@ -216,6 +216,21 @@ impl WindowsApp {
                 let effects = self.shared.dispatch(UiCommand::SaveTabs { tabs: dirty });
                 self.run_effects(effects);
             }
+            NativeEvent::EditorEdited { text } => self.set_active_buffer_text(text),
+        }
+    }
+
+    /// Take a genuine user edit from the editor control: the active
+    /// tab's buffer takes the text. The base (disk) text is untouched —
+    /// dirtiness stays exactly "buffer text differs from disk text".
+    /// Edits with no active tab or no buffer yet (open still in flight)
+    /// are dropped, not buffered for later.
+    pub fn set_active_buffer_text(&mut self, text: String) {
+        let Some(tab) = self.shared.state.tabs.active() else {
+            return;
+        };
+        if let Some(buffer) = self.buffers.get_mut(&tab) {
+            buffer.text = text;
         }
     }
 }
@@ -271,6 +286,61 @@ mod tests {
             base: "same".into(),
         };
         assert!(dirty.is_dirty());
+    }
+
+    #[test]
+    fn an_editor_edit_lands_in_the_active_buffer_and_tracks_dirtiness() {
+        let (mut app, _repo, _opener) = app_with(&[("a.md", "old\n")]);
+        open_tab(&mut app, "a.md", "old\n", "old\n");
+
+        app.handle_native(WindowsMessage::Native(NativeEvent::EditorEdited {
+            text: "typed\n".into(),
+        }));
+        let tab = app.shared.state.tabs.id_of("a.md").unwrap();
+        let buffer = &app.buffers[&tab];
+        assert_eq!(buffer.text, "typed\n");
+        assert_eq!(buffer.base, "old\n", "disk truth is untouched");
+        assert!(buffer.is_dirty());
+        // No error, no effect: an edit is buffer-level state only.
+        assert_eq!(app.shared.state.last_error, None);
+    }
+
+    #[test]
+    fn an_editor_edit_is_dropped_without_an_active_buffer() {
+        let (mut app, _repo, _opener) = app_with(&[]);
+        // No tabs at all.
+        app.set_active_buffer_text("orphan\n".into());
+        assert!(app.buffers.is_empty());
+
+        // A tab open but its buffer not inserted yet (open in flight).
+        app.handle_native(WindowsMessage::Command(UiCommand::OpenNote {
+            path: "b.md".into(),
+        }));
+        app.set_active_buffer_text("orphan\n".into());
+        assert!(app.buffers.is_empty(), "no buffer was created for the edit");
+    }
+
+    #[test]
+    fn an_editor_edit_applies_to_whichever_tab_is_active() {
+        let (mut app, _repo, _opener) = app_with(&[("a.md", "a\n"), ("b.md", "b\n")]);
+        open_tab(&mut app, "a.md", "a text\n", "a\n");
+        open_tab(&mut app, "b.md", "b text\n", "b\n");
+        // open_or_focus focused b.md; edits land in b.
+        app.handle_native(WindowsMessage::Native(NativeEvent::EditorEdited {
+            text: "edited b\n".into(),
+        }));
+        let b = app.shared.state.tabs.id_of("b.md").unwrap();
+        assert_eq!(app.buffers[&b].text, "edited b\n");
+
+        // Switch back to a; edits now land in a.
+        app.handle_native(WindowsMessage::Command(UiCommand::ActivateTab {
+            position: 0,
+        }));
+        app.handle_native(WindowsMessage::Native(NativeEvent::EditorEdited {
+            text: "edited a\n".into(),
+        }));
+        let a = app.shared.state.tabs.id_of("a.md").unwrap();
+        assert_eq!(app.buffers[&a].text, "edited a\n");
     }
 
     #[test]

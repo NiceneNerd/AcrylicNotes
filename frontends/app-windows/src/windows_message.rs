@@ -23,12 +23,20 @@ pub enum WindowsMessage {
 }
 
 /// A raw native event with no direct `UiCommand` equivalent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NativeEvent {
     /// The user asked to close the window. Dirty buffers are flushed
     /// through the same guarded-save path the tab-close workflow uses
     /// (WIN-108 semantics: closing never silently discards edits).
     WindowClosing,
+    /// The editor control's text changed (the WinUI `TextChanged`
+    /// echo). The shell suppresses echoes of its own programmatic
+    /// syncs (§11.1: a real control raises `TextChanged` for property
+    /// sets too) before this reaches the buffer; what remains is a
+    /// genuine user edit, taken by the active tab's buffer. The base
+    /// (disk) text is untouched — dirtiness stays exactly "buffer text
+    /// differs from disk text".
+    EditorEdited { text: String },
 }
 
 #[cfg(test)]

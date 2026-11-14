@@ -317,6 +317,122 @@ fn headless_shell_renders_tabs_editor_and_error_line() {
     );
 }
 
+/// Inject one `TextBoxTextChanged` on the editor node (the payload the
+/// real runtime sends: the control's full text).
+fn type_text(pump: &mut Pump<RecordingRuntime>, editor: NodeId, text: &str) {
+    let revision = pump
+        .event_revision(editor, EventId::TextBoxTextChanged)
+        .expect("text-changed event active");
+    pump.queue_event(QueuedEvent::new(
+        editor,
+        EventId::TextBoxTextChanged,
+        revision,
+        EventPayload::Str(text.to_string()),
+    ));
+    pump.dispatch_events().expect("dispatch events");
+    pump.dispatch_components(10).expect("dispatch components");
+}
+
+#[test]
+fn headless_shell_editor_typing_reaches_the_buffer_and_rerenders() {
+    let app = shell_app_with(&[("a.md", "old\n")]);
+    shell_open_tab(&app, "a.md", "a body\n", "old\n");
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let editor = {
+        let rt = pump.runtime();
+        find_node_with_property_text(rt, window, PropertyId::TextBoxText, "a body\n")
+            .expect("editor recorded")
+    };
+
+    // The user types: the control reports its full text.
+    type_text(&mut pump, editor, "typed by the user\n");
+
+    // The edit landed in the active buffer: text moved, base (disk
+    // truth) untouched, so the buffer is dirty and would be saved.
+    let borrowed = app.borrow();
+    let tab = borrowed.shared.state.tabs.id_of("a.md").unwrap();
+    let buffer = &borrowed.buffers[&tab];
+    assert_eq!(buffer.text, "typed by the user\n");
+    assert_eq!(buffer.base, "old\n");
+    assert!(buffer.is_dirty());
+    assert_eq!(borrowed.shared.state.last_error, None);
+}
+
+#[test]
+fn headless_shell_tab_switch_syncs_the_editor_programmatically() {
+    let app = shell_app_with(&[("a.md", "a\n"), ("b.md", "b\n")]);
+    shell_open_tab(&app, "a.md", "a text\n", "a\n");
+    shell_open_tab(&app, "b.md", "b text\n", "b\n");
+
+    let mut pump = mounted_shell(&app);
+
+    // b.md is focused (last opened); click a.md's tab button.
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "a.md").expect("a.md tab button recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    // The editor is a property update (programmatic sync): the
+    // reconciled control now shows a.md's buffer, and b.md's buffer is
+    // untouched by the switch.
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    let editor = find_node_with_property_text(rt, window, PropertyId::TextBoxText, "a text\n")
+        .expect("editor re-rendered with the newly active buffer");
+    assert_eq!(
+        rt.node(editor).unwrap().property(PropertyId::TextBoxText),
+        Some(&PropertyValue::Str(String::from("a text\n")))
+    );
+    let borrowed = app.borrow();
+    let b = borrowed.shared.state.tabs.id_of("b.md").unwrap();
+    assert_eq!(borrowed.buffers[&b].text, "b text\n");
+}
+
+#[test]
+fn headless_shell_editor_echo_of_the_rendered_text_is_suppressed() {
+    let app = shell_app_with(&[("a.md", "old\n")]);
+    shell_open_tab(&app, "a.md", "a body\n", "old\n");
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let editor = {
+        let rt = pump.runtime();
+        find_node_with_property_text(rt, window, PropertyId::TextBoxText, "a body\n")
+            .expect("editor recorded")
+    };
+
+    // Simulate a programmatic buffer change that has NOT been rendered
+    // yet (out of band, like a mid-flight effect result): the shell's
+    // "last rendered" tracker still holds the old text.
+    {
+        let mut borrowed = app.borrow_mut();
+        let tab = borrowed.shared.state.tabs.id_of("a.md").unwrap();
+        borrowed.buffers.get_mut(&tab).unwrap().text = "outside\n".into();
+    }
+
+    // The echo of the last programmatic sync arrives ("a body\n" equals
+    // the last rendered text). It must be suppressed: without the §11.1
+    // guard it would clobber the pending buffer change.
+    type_text(&mut pump, editor, "a body\n");
+    {
+        let borrowed = app.borrow();
+        let tab = borrowed.shared.state.tabs.id_of("a.md").unwrap();
+        assert_eq!(borrowed.buffers[&tab].text, "outside\n");
+    }
+
+    // A genuine user edit (text different from the last render) still
+    // flows to the buffer.
+    type_text(&mut pump, editor, "typed by the user\n");
+    let borrowed = app.borrow();
+    let tab = borrowed.shared.state.tabs.id_of("a.md").unwrap();
+    assert_eq!(borrowed.buffers[&tab].text, "typed by the user\n");
+    assert!(borrowed.buffers[&tab].is_dirty());
+}
+
 #[test]
 fn headless_shell_click_activates_the_clicked_tab() {
     let app = shell_app_with(&[("a.md", "a\n"), ("b.md", "b\n")]);
