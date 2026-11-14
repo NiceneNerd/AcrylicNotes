@@ -294,6 +294,18 @@ fn click(pump: &mut Pump<RecordingRuntime>, node: NodeId, event: EventId) {
     pump.dispatch_components(10).expect("dispatch components");
 }
 
+/// Switch the kernel pane mode by clicking its layout button (the pane
+/// defaults to Live, which renders no source TextBox).
+fn switch_pane(pump: &mut Pump<RecordingRuntime>, label: &str) {
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, label)
+            .unwrap_or_else(|| panic!("{label} pane button recorded"))
+    };
+    click(pump, target, EventId::ButtonClick);
+}
+
 #[test]
 fn headless_shell_renders_tabs_editor_and_error_line() {
     let app = shell_app_with(&[("a.md", "a body\n")]);
@@ -301,7 +313,10 @@ fn headless_shell_renders_tabs_editor_and_error_line() {
     // order: the shell renders existing state).
     shell_open_tab(&app, "a.md", "a body\n", "a body\n");
 
-    let pump = mounted_shell(&app);
+    let mut pump = mounted_shell(&app);
+    // The pane defaults to Live (reading view only); the source editor
+    // exists in Source mode.
+    switch_pane(&mut pump, "source");
     let window = pump.window().expect("window node");
     let rt = pump.runtime();
     // Active tab renders bracketed; the editor shows the buffer text.
@@ -339,6 +354,7 @@ fn headless_shell_editor_typing_reaches_the_buffer_and_rerenders() {
     shell_open_tab(&app, "a.md", "a body\n", "old\n");
 
     let mut pump = mounted_shell(&app);
+    switch_pane(&mut pump, "source");
     let window = pump.window().expect("window node");
     let editor = {
         let rt = pump.runtime();
@@ -367,6 +383,7 @@ fn headless_shell_tab_switch_syncs_the_editor_programmatically() {
     shell_open_tab(&app, "b.md", "b text\n", "b\n");
 
     let mut pump = mounted_shell(&app);
+    switch_pane(&mut pump, "source");
 
     // b.md is focused (last opened); click a.md's tab button.
     let window = pump.window().expect("window node");
@@ -398,6 +415,7 @@ fn headless_shell_editor_echo_of_the_rendered_text_is_suppressed() {
     shell_open_tab(&app, "a.md", "a body\n", "old\n");
 
     let mut pump = mounted_shell(&app);
+    switch_pane(&mut pump, "source");
     let window = pump.window().expect("window node");
     let editor = {
         let rt = pump.runtime();
@@ -651,10 +669,11 @@ fn headless_shell_invoke_note_row_opens_it() {
     );
 }
 
-// --- reading-mode toggle -----------------------------------------------------
+// --- pane-mode layout (kernel-driven) ----------------------------------------
 
 #[test]
-fn headless_shell_reading_toggle_renders_the_parsed_doc() {
+fn headless_shell_live_pane_renders_the_reading_view_only() {
+    // Live is the settings default, so the boot render is the reading view.
     let app = shell_app_with(&[("a.md", "# Title\n\nbody text\n")]);
     shell_open_tab(
         &app,
@@ -663,25 +682,12 @@ fn headless_shell_reading_toggle_renders_the_parsed_doc() {
         "# Title\n\nbody text\n",
     );
 
-    let mut pump = mounted_shell(&app);
-    let window = pump.window().expect("window node");
-    let target = {
-        let rt = pump.runtime();
-        find_owner_of_label(rt, window, "reading").expect("reading toggle recorded")
-    };
-    click(&mut pump, target, EventId::ButtonClick);
-
-    // The editor area now renders the parsed doc: heading and paragraph
-    // as TextBlocks, and the source TextBox is gone.
+    let pump = mounted_shell(&app);
     let window = pump.window().expect("window node");
     let rt = pump.runtime();
     assert!(
         find_node_with_property_text(rt, window, PropertyId::TextBlockText, "Title").is_some(),
-        "h1 renders as a TextBlock"
-    );
-    assert!(
-        find_node_with_property_text(rt, window, PropertyId::TextBlockText, "body text").is_some(),
-        "paragraph renders as a TextBlock"
+        "the parsed heading renders"
     );
     assert!(
         find_node_with_property_text(
@@ -691,17 +697,14 @@ fn headless_shell_reading_toggle_renders_the_parsed_doc() {
             "# Title\n\nbody text\n"
         )
         .is_none(),
-        "the source TextBox is replaced by the reading view"
+        "Live shows no source TextBox (block editing is plan 11.4)"
     );
-    // The toggle now offers the way back.
-    assert!(
-        find_owner_of_label(rt, window, "source").is_some(),
-        "toggle flips its label to source"
-    );
+    // The active mode renders bracketed.
+    assert!(find_owner_of_label(rt, window, "[live]").is_some());
 }
 
 #[test]
-fn headless_shell_reading_toggle_returns_to_source() {
+fn headless_shell_pane_split_shows_source_and_reading() {
     let app = shell_app_with(&[("a.md", "# Title\n\nbody text\n")]);
     shell_open_tab(
         &app,
@@ -714,44 +717,85 @@ fn headless_shell_reading_toggle_returns_to_source() {
     let window = pump.window().expect("window node");
     let target = {
         let rt = pump.runtime();
-        find_owner_of_label(rt, window, "reading").expect("reading toggle recorded")
+        find_owner_of_label(rt, window, "split").expect("split button recorded")
     };
     click(&mut pump, target, EventId::ButtonClick);
-    // Toggle back: the button now says "source".
+
+    // Both panes: the source TextBox and the parsed reading view.
+    assert_eq!(
+        app.borrow().shared.state.pane,
+        vault_app::settings::PaneMode::Split
+    );
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(
+        find_node_with_property_text(
+            rt,
+            window,
+            PropertyId::TextBoxText,
+            "# Title\n\nbody text\n"
+        )
+        .is_some(),
+        "the source TextBox renders"
+    );
+    assert!(
+        find_node_with_property_text(rt, window, PropertyId::TextBlockText, "Title").is_some(),
+        "the reading view renders"
+    );
+    assert!(find_owner_of_label(rt, window, "[split]").is_some());
+}
+
+#[test]
+fn headless_shell_pane_source_shows_the_editor_only() {
+    let app = shell_app_with(&[("a.md", "# Title\n\nbody text\n")]);
+    shell_open_tab(
+        &app,
+        "a.md",
+        "# Title\n\nbody text\n",
+        "# Title\n\nbody text\n",
+    );
+
+    let mut pump = mounted_shell(&app);
     let window = pump.window().expect("window node");
     let target = {
         let rt = pump.runtime();
-        find_owner_of_label(rt, window, "source").expect("source toggle recorded")
+        find_owner_of_label(rt, window, "source").expect("source button recorded")
     };
     click(&mut pump, target, EventId::ButtonClick);
 
     let window = pump.window().expect("window node");
     let rt = pump.runtime();
-    let editor = find_node_with_property_text(
-        rt,
-        window,
-        PropertyId::TextBoxText,
-        "# Title\n\nbody text\n",
-    )
-    .expect("source TextBox back with the buffer text");
-    assert_eq!(
-        rt.node(editor).unwrap().property(PropertyId::TextBoxText),
-        Some(&PropertyValue::Str(String::from("# Title\n\nbody text\n")))
+    assert!(
+        find_node_with_property_text(
+            rt,
+            window,
+            PropertyId::TextBoxText,
+            "# Title\n\nbody text\n"
+        )
+        .is_some(),
+        "the source TextBox renders"
     );
     assert!(
-        find_node_with_property_text(rt, window, PropertyId::TextBlockText, "body text").is_none(),
-        "the reading view is gone"
+        find_node_with_property_text(rt, window, PropertyId::TextBlockText, "Title").is_none(),
+        "the reading view is gone in Source mode"
     );
 }
 
 #[test]
-fn headless_shell_reading_view_reflects_the_current_buffer() {
+fn headless_shell_pane_typing_in_split_updates_the_reading_view() {
     let app = shell_app_with(&[("a.md", "old body\n")]);
     shell_open_tab(&app, "a.md", "old body\n", "old body\n");
 
     let mut pump = mounted_shell(&app);
+    // Switch to Split so both panes are mounted.
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "split").expect("split button recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
 
-    // The user edits while in source mode, then switches to reading.
+    // Type into the source TextBox.
     let window = pump.window().expect("window node");
     let editor = {
         let rt = pump.runtime();
@@ -759,24 +803,17 @@ fn headless_shell_reading_view_reflects_the_current_buffer() {
             .expect("editor recorded")
     };
     type_text(&mut pump, editor, "# Fresh\n\ntyped text\n");
-    let window = pump.window().expect("window node");
-    let target = {
-        let rt = pump.runtime();
-        find_owner_of_label(rt, window, "reading").expect("reading toggle recorded")
-    };
-    click(&mut pump, target, EventId::ButtonClick);
 
-    // The reading view parses the CURRENT buffer text, not a snapshot
-    // from when the tab was opened.
+    // The reading view re-parses the CURRENT buffer text.
     let window = pump.window().expect("window node");
     let rt = pump.runtime();
     assert!(
         find_node_with_property_text(rt, window, PropertyId::TextBlockText, "Fresh").is_some(),
-        "the edited heading renders"
+        "the edited heading renders in the reading view"
     );
     assert!(
         find_node_with_property_text(rt, window, PropertyId::TextBlockText, "typed text").is_some(),
-        "the edited paragraph renders"
+        "the edited paragraph renders in the reading view"
     );
 }
 

@@ -223,10 +223,6 @@ impl WindowsApp {
                 self.run_effects(effects);
             }
             NativeEvent::EditorEdited { text } => self.set_active_buffer_text(text),
-            // Shell-local presentation state: the Shell component
-            // intercepts `ToggleReading` in its `update` and never
-            // forwards it here. This arm only keeps the match total.
-            NativeEvent::ToggleReading => {}
         }
     }
 
@@ -250,6 +246,7 @@ mod tests {
     use super::*;
     use vault_app::persistence::ConflictDecision;
     use vault_app::repository::testing::MemoryRepository;
+    use vault_app::settings::PaneMode;
     use vault_platform::testing::{OpenCall, RecordingOpener};
     use vault_platform::OpenError;
 
@@ -408,23 +405,21 @@ mod tests {
     }
 
     #[test]
-    fn a_reading_toggle_is_shell_local_and_reaches_no_kernel_state() {
-        let (mut app, repo, _opener) = app_with(&[("a.md", "# Title\n\nbody\n")]);
-        open_tab(&mut app, "a.md", "# Title\n\nbody\n", "# Title\n\nbody\n");
+    fn pane_mode_commands_drive_the_kernel_layout() {
+        let (mut app, _repo, _opener) = app_with(&[("a.md", "a\n")]);
+        // The default pane is Live (the settings default).
+        assert_eq!(app.shared.state.pane, PaneMode::Live);
 
-        app.handle_native(WindowsMessage::Native(NativeEvent::ToggleReading));
-
-        // The toggle is presentation state the shell owns: the kernel
-        // host absorbs it without touching tabs, buffers, or errors.
-        assert_eq!(app.shared.state.tabs.active_path(), Some("a.md"));
-        let tab = app.shared.state.tabs.id_of("a.md").unwrap();
-        assert_eq!(app.buffers[&tab].text, "# Title\n\nbody\n");
-        assert!(!app.buffers[&tab].is_dirty());
+        app.handle_native(WindowsMessage::Command(UiCommand::SetPaneMode {
+            mode: PaneMode::Split,
+        }));
+        assert_eq!(app.shared.state.pane, PaneMode::Split);
         assert_eq!(app.shared.state.last_error, None);
-        assert_eq!(
-            repo.borrow().note_text("a.md"),
-            Some("# Title\n\nbody\n".to_string())
-        );
+
+        app.handle_native(WindowsMessage::Command(UiCommand::SetPaneMode {
+            mode: PaneMode::Source,
+        }));
+        assert_eq!(app.shared.state.pane, PaneMode::Source);
     }
 
     #[test]

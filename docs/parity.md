@@ -76,9 +76,9 @@ machine and is never claimed via Wine.
 | APPWIN-003 | Message envelope + window-close flush (`UiCommand::SaveTabs`) | Done, Linux-tested |
 | APPWIN-004 | File tree view over kernel `tree` + `TreeState` | Done, Linux-tested; rows render headlessly (`tests/ui_headless.rs`) |
 | APPWIN-005 | Source editor caret/find math via `vault_app::editor` | Done, Linux-tested |
-| APPWIN-006 | Reading-mode plain-text projection | Partial; native element construction (`reading_view.rs`) headless-tested (RecordingRuntime under Wine) — blocks/inlines render as TextBlocks/HyperlinkButtons; not yet mounted in the shell (reading-mode toggle is next) |
-| APPWIN-007 | Split layout state in `vault_app::layout` | Done, Linux-tested (kernel) |
-| APPWIN-008 | Native window loop, WinUI controls, live adapters | In progress (p11): `Shell` component renders tabs/editor/error line from kernel state and routes clicks back as `WindowsMessage` commands (headless-verified: RecordingRuntime under Wine); `main.rs` window loop, native TreeView, and the editing adapter are next; real-rendering/IME/DPI/pickers/packaging checks remain user-side |
+| APPWIN-006 | Reading-mode plain-text projection | Mostly done: native element construction (`reading_view.rs`) headless-tested and mounted in the shell — the kernel's pane modes (Live/Split/Reading) render the parsed buffer as TextBlocks/HyperlinkButtons; block-level Live editing (plan 11.4), image rendering, and link-click routing to the kernel remain |
+| APPWIN-007 | Split layout state in `vault_app::layout` | Done, Linux-tested (kernel); rendered by the Windows shell (Source/Split/Live/Reading pane buttons -> SetPaneMode, headless-tested) |
+| APPWIN-008 | Native window loop, WinUI controls, live adapters | In progress (p11): `Shell` renders TreeView sidebar, tab bar, pane-mode buttons, source editor, reading view, and error line from kernel state, all headless-verified (RecordingRuntime under Wine); `main.rs` window loop awaits the p11 platform adapters; keyboard routing is blocked by windows-reactor 0.100.0's limited AcceleratorKey set; real-rendering/IME/DPI/pickers/packaging checks remain user-side |
 | APPWIN-009 | Cross-target verification (xtask + CI) | Done, runs on Linux: cross-target checks + headless Wine UI tests; real-Windows smoke remains user-side |
 
 ## Baseline (Phase 0)
