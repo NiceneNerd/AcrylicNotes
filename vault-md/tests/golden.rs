@@ -6,7 +6,6 @@
 //! output dump. Never regenerate blindly.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use vault_core::{NoteSource, VaultIndex};
 use vault_md::{parse_note, render_html, RenderContext, RenderOptions};
@@ -19,8 +18,31 @@ impl NoteSource for FixtureNotes {
     }
 }
 
+/// The crate's test data directory.
+///
+/// Normally the compile-time manifest dir. When the test binary runs on
+/// another machine (the native Windows lane), xtask stages the fixtures
+/// next to the executable instead, so the compile-time path does not
+/// exist there.
+fn tests_dir() -> std::path::PathBuf {
+    let compiled = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    if compiled.is_dir() {
+        return compiled;
+    }
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    {
+        let staged = dir.join("vaultnotes-fixtures").join("vault-md-tests");
+        if staged.is_dir() {
+            return staged;
+        }
+    }
+    compiled
+}
+
 fn fixture_vault() -> (VaultIndex, FixtureNotes) {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/vault");
+    let dir = tests_dir().join("golden/vault");
     let mut files = Vec::new();
     let mut notes = HashMap::new();
     for entry in std::fs::read_dir(&dir).expect("fixture vault dir") {
@@ -40,7 +62,7 @@ fn fixture_vault() -> (VaultIndex, FixtureNotes) {
 
 #[test]
 fn golden_fixtures_match() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    let dir = tests_dir().join("golden");
     let (index, notes) = fixture_vault();
     let mut names: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
@@ -74,7 +96,7 @@ fn golden_fixtures_match() {
 fn strict_line_breaks_render_soft_breaks_as_newlines() {
     let (index, notes) = fixture_vault();
     let src = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/14-linebreaks.md"),
+        tests_dir().join("golden/14-linebreaks.md"),
     )
     .unwrap();
     let doc = parse_note(&src);

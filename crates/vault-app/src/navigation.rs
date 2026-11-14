@@ -204,7 +204,35 @@ impl NavSection {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+
+    /// The crate's test data directory.
+    ///
+    /// Normally the compile-time manifest dir. When the test binary runs
+    /// on another machine (the native Windows lane), xtask stages the
+    /// fixtures next to the executable instead, so the compile-time path
+    /// does not exist there.
+    fn tests_dir() -> std::path::PathBuf {
+        // Candidates, in order: the workspace-relative fixture tree (the
+        // normal case on the developer machine), then the tree xtask
+        // stages next to the test binary on another machine.
+        let candidates: Vec<std::path::PathBuf> = vec![
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures"),
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|p| p.join("vaultnotes-fixtures").join("fixtures")))
+                .unwrap_or_default(),
+        ];
+        for cand in &candidates {
+            if cand.is_dir() {
+                return cand.clone();
+            }
+        }
+        candidates.into_iter().next().unwrap_or_default()
+    }
     use std::time::{Duration, SystemTime};
 
     fn note(path: &str, age_secs_ago: u64) -> vault_core::Note {
@@ -307,8 +335,7 @@ mod tests {
     #[test]
     fn backlink_and_tag_view_models_read_a_real_vault() {
         // The repo's basic fixture: Welcome <-> Deep Note link both ways.
-        let root =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/basic");
+        let root = tests_dir().join("basic");
         let vault = vault_core::Vault::open(&root).expect("fixture vault opens");
 
         let backlinks = sorted_backlinks(&vault, "notes/sub/Deep Note.md");

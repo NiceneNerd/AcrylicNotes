@@ -13,8 +13,31 @@ use std::path::{Path, PathBuf};
 use vault_core::{NoteSource, Vault};
 use vault_md::{parse_note, render_html, RenderContext, RenderOptions};
 
+/// The crate's test data directory.
+///
+/// Normally the compile-time manifest dir. When the test binary runs on
+/// another machine (the native Windows lane), xtask stages the fixtures
+/// next to the executable instead, so the compile-time path does not
+/// exist there.
+fn tests_dir() -> std::path::PathBuf {
+    let compiled = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    if compiled.is_dir() {
+        return compiled;
+    }
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    {
+        let staged = dir.join("vaultnotes-fixtures").join("vault-md-tests");
+        if staged.is_dir() {
+            return staged;
+        }
+    }
+    compiled
+}
+
 fn corpus_source() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vault")
+    tests_dir().join("vault")
 }
 
 /// Copy the corpus tree (files and folders, any depth) into a temp dir.

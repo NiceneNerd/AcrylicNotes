@@ -895,6 +895,171 @@ fn headless_shell_pane_typing_in_split_updates_the_reading_view() {
     );
 }
 
+// --- navigation panels -------------------------------------------------------
+
+/// Like [`shell_app_with`], over a real vault root (the shared search
+/// engine scans the filesystem, not the repository fake).
+fn shell_app_with_root(
+    notes: &[(&str, &str)],
+    root: &std::path::Path,
+) -> Rc<RefCell<WindowsApp>> {
+    let repo = Rc::new(RefCell::new(MemoryRepository::new()));
+    for (path, text) in notes {
+        repo.borrow_mut().insert(path, text);
+    }
+    let app = WindowsApp::new(
+        repo as Rc<RefCell<dyn NoteRepository>>,
+        Rc::new(RecordingOpener::succeeding()),
+        Rc::new(RefCell::new(MemorySettingsStore::default())),
+        root,
+    );
+    Rc::new(RefCell::new(app))
+}
+
+#[test]
+fn headless_shell_nav_row_switches_the_sidebar_panel() {
+    let app = shell_app_with(&[("a.md", "body\n")]);
+    shell_open_tab(&app, "a.md", "body\n", "body\n");
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    {
+        let rt = pump.runtime();
+        // Files is the default panel: the tree is mounted and bracketed.
+        assert!(find_tree_view(rt, window).is_some());
+        assert!(find_owner_of_label(rt, window, "[files]").is_some());
+    }
+
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "search").expect("search nav button")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert_eq!(app.borrow().shared.state.panel, vault_app::navigation::NavSection::Search);
+    // The search panel replaced the tree, and the nav row marks the
+    // active section.
+    assert!(
+        find_tree_view(rt, window).is_none(),
+        "the file tree is replaced by the search panel"
+    );
+    assert!(find_owner_of_label(rt, window, "[search]").is_some());
+    // The query box exists (empty until the user types; Live mounts no
+    // source editor, so it is the only TextBox).
+    assert!(
+        find_node_with_property_text(rt, window, PropertyId::TextBoxText, "").is_some(),
+        "the search query box is mounted"
+    );
+}
+
+#[test]
+fn headless_shell_search_panel_runs_the_scan_and_opens_a_hit() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("a.md"), "alpha\nneedle here\n").unwrap();
+    let app = shell_app_with_root(&[("a.md", "alpha\nneedle here\n")], dir.path());
+    shell_open_tab(&app, "a.md", "alpha\nneedle here\n", "alpha\nneedle here\n");
+
+    let mut pump = mounted_shell(&app);
+    // Switch the sidebar to Search.
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "search").expect("search nav button")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    // Type the query into the kernel-bound box, then run the scan.
+    let window = pump.window().expect("window node");
+    let search_box = {
+        let rt = pump.runtime();
+        find_node_with_property_text(rt, window, PropertyId::TextBoxText, "")
+            .expect("search box recorded")
+    };
+    type_text(&mut pump, search_box, "needle");
+    assert_eq!(
+        app.borrow().shared.state.search.query(),
+        "needle",
+        "typing updates the kernel session"
+    );
+
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "search").expect("run-search button")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    // The runner's shared engine fed the session; the panel lists the hit.
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert_eq!(app.borrow().shared.state.search.hits().len(), 1);
+    assert!(
+        find_owner_of_label(rt, window, "a.md:2 needle here").is_some(),
+        "the hit row renders path:line and text"
+    );
+
+    // Clicking the hit opens (or focuses) its note.
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "a.md:2 needle here").expect("hit row recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+    assert_eq!(
+        app.borrow().shared.state.tabs.active_path(),
+        Some("a.md"),
+        "clicking a hit opens its note"
+    );
+}
+
+#[test]
+fn headless_shell_outline_panel_lists_headings_and_follows_edits() {
+    let app = shell_app_with(&[("a.md", "# Title\n\n## Sub\n\nbody\n")]);
+    shell_open_tab(&app, "a.md", "# Title\n\n## Sub\n\nbody\n", "# Title\n\n## Sub\n\nbody\n");
+
+    let mut pump = mounted_shell(&app);
+    // Source pane: the reading view would also render the heading text,
+    // and this test asserts the outline rows specifically.
+    switch_pane(&mut pump, "source");
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "outline").expect("outline nav button")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    // Heading rows, indented by level.
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(
+        find_node_with_property_text(rt, window, PropertyId::TextBlockText, "Title").is_some(),
+        "h1 row renders"
+    );
+    assert!(
+        find_node_with_property_text(rt, window, PropertyId::TextBlockText, "  Sub").is_some(),
+        "h2 row renders indented"
+    );
+
+    // Editing the buffer re-parses the outline.
+    let editor = {
+        let rt = pump.runtime();
+        find_node_with_property_text(rt, window, PropertyId::TextBoxText, "# Title\n\n## Sub\n\nbody\n")
+            .expect("editor recorded")
+    };
+    type_text(&mut pump, editor, "# Fresh\n\nbody\n");
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(
+        find_node_with_property_text(rt, window, PropertyId::TextBlockText, "Fresh").is_some(),
+        "the outline follows the edited buffer"
+    );
+    assert!(
+        find_node_with_property_text(rt, window, PropertyId::TextBlockText, "  Sub").is_none(),
+        "the removed heading leaves the outline"
+    );
+}
+
 fn collect_texts(rt: &RecordingRuntime, from: NodeId, out: &mut Vec<String>) {
     if let Some(node) = rt.node(from) {
         if let Some(PropertyValue::Str(text)) = node.property(PropertyId::TextBlockText) {

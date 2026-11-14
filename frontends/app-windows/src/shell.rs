@@ -22,6 +22,7 @@ use windows_reactor::{
 };
 
 use vault_app::commands::UiCommand;
+use vault_app::navigation::{NavSection, outline};
 use vault_app::settings::PaneMode;
 use vault_app::tree as kernel_tree;
 use vault_md::parse_note;
@@ -99,12 +100,22 @@ impl Component for Shell {
                 return;
             }
         }
+        if let WindowsMessage::Command(UiCommand::SetSearchQuery { query }) = &message {
+            // The search box is controlled by the kernel session; a real
+            // TextBox raises `TextChanged` for property sets too, so the
+            // echo of our own programmatic sync must not re-enter the
+            // kernel (it would bounce on every keystroke).
+            if *query == self.handle.0.borrow().shared.state.search.query() {
+                return;
+            }
+        }
         self.handle.0.borrow_mut().handle_native(message);
     }
 
     fn view(&self, _input: &Self::Input, context: &mut ViewContext<Self>) -> View {
         let app = self.handle.0.borrow();
         let state = &app.shared.state;
+        let active_buffer = state.tabs.active().and_then(|tab| app.buffers.get(&tab));
 
         // File-tree sidebar: one TreeView node per vault folder/note,
         // keyed by vault path. Invoking a note row asks the kernel to
@@ -117,6 +128,131 @@ impl Component for Shell {
                     .callback(|path: String| WindowsMessage::Command(UiCommand::OpenNote { path })),
             )
             .nodes(build_tree_nodes(&self.file_tree));
+
+        // Sidebar navigation (kernel-owned via `state.panel`): one button
+        // per section the shell can render today. Tags and backlinks need
+        // the vault index adapter (a later p11 slice) and stay off the
+        // row; their panels render an honest placeholder if the kernel is
+        // ever switched to them by another command.
+        let nav_buttons: Vec<KeyedView> = [
+            ("files", NavSection::Files),
+            ("search", NavSection::Search),
+            ("outline", NavSection::Outline),
+        ]
+        .iter()
+        .map(|&(label, section)| {
+            let text = if state.panel == section {
+                format!("[{label}]")
+            } else {
+                label.to_string()
+            };
+            KeyedView::new(
+                format!("nav-{label}"),
+                Button::new()
+                    .on_click(context.callback(move |()| {
+                        WindowsMessage::Command(UiCommand::SetNavSection { section })
+                    }))
+                    .content(TextBlock::new().text(text)),
+            )
+        })
+        .collect();
+        let nav_row = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .keyed_children(nav_buttons);
+
+        // Search panel: the query box mirrors the kernel session (text
+        // changes are `SetSearchQuery`), the button runs the vault scan
+        // (`SearchVault` -> the runner's shared engine -> the session's
+        // hits), and each hit opens its note. Stage A runs the scan
+        // synchronously per submit (the Linux shell debounces off-thread);
+        // a result row opens the note but does not scroll to the hit yet.
+        let search_panel = {
+            let query = state.search.query().to_string();
+            let search_box = TextBox::new()
+                .on_text_changed(context.callback(|query: String| {
+                    WindowsMessage::Command(UiCommand::SetSearchQuery { query })
+                }))
+                .text(query.clone());
+            let run_search = Button::new()
+                .on_click(context.callback(move |()| {
+                    WindowsMessage::Command(UiCommand::SearchVault {
+                        query: query.clone(),
+                    })
+                }))
+                .content(TextBlock::new().text("search"));
+            let hits: Vec<KeyedView> = state
+                .search
+                .hits()
+                .iter()
+                .enumerate()
+                .map(|(i, hit)| {
+                    let path = hit.path.clone();
+                    let label = format!("{}:{} {}", hit.path, hit.line_no, hit.line);
+                    KeyedView::new(
+                        i.to_string(),
+                        Button::new()
+                            .on_click(context.callback(move |()| {
+                                WindowsMessage::Command(UiCommand::OpenNote { path: path.clone() })
+                            }))
+                            .content(TextBlock::new().text(label)),
+                    )
+                })
+                .collect();
+            StackPanel::new()
+                .orientation(Orientation::Vertical)
+                .keyed_children([
+                    KeyedView::new("search-box", View::from(search_box)),
+                    KeyedView::new("search-run", View::from(run_search)),
+                    KeyedView::new(
+                        "search-hits",
+                        StackPanel::new()
+                            .orientation(Orientation::Vertical)
+                            .keyed_children(hits),
+                    ),
+                ])
+        };
+
+        // Outline panel: the active buffer's headings (the shared
+        // `vault_app::navigation::outline` view model), indented by
+        // level. Parsed per render like the reading view; clicking an
+        // entry scrolls the reading pane in a later slice (the kernel has
+        // no scroll command yet).
+        let outline_panel = active_buffer
+            .map(|buffer| {
+                let doc = parse_note(&buffer.text);
+                let rows: Vec<KeyedView> = outline(&doc)
+                    .iter()
+                    .map(|entry| {
+                        let indent = "  ".repeat(usize::from(entry.level.saturating_sub(1)));
+                        KeyedView::new(
+                            entry.block.to_string(),
+                            TextBlock::new().text(format!("{indent}{}", entry.text)),
+                        )
+                    })
+                    .collect();
+                StackPanel::new()
+                    .orientation(Orientation::Vertical)
+                    .keyed_children(rows)
+            })
+            .unwrap_or_else(|| View::from(TextBlock::new().text("(no note open)")));
+
+        // The active panel. Files is the default; the placeholder arms
+        // keep the match total for sections whose data source has not
+        // landed (tags/backlinks need the vault index adapter).
+        let sidebar_panel = match state.panel {
+            NavSection::Files => tree_view,
+            NavSection::Search => search_panel,
+            NavSection::Outline => outline_panel,
+            NavSection::Tags | NavSection::Links => {
+                View::from(TextBlock::new().text("(panel needs the vault index adapter)"))
+            }
+        };
+        let sidebar = StackPanel::new()
+            .orientation(Orientation::Vertical)
+            .keyed_children([
+                KeyedView::new("nav-row", nav_row),
+                KeyedView::new("sidebar-panel", sidebar_panel),
+            ]);
 
         // Tab bar: one activate button and one close button per tab,
         // keyed by tab id so reconciliation preserves identity as tabs
@@ -200,7 +336,6 @@ impl Component for Shell {
         // caching is a later slice). Live renders the reading view too —
         // block-level editing inside Live is plan §11.4 and lands last.
         // With no active buffer the source editor renders empty.
-        let active_buffer = state.tabs.active().and_then(|tab| app.buffers.get(&tab));
         let show_source = !matches!(state.pane, PaneMode::Live | PaneMode::Reading);
         let show_reading = !matches!(state.pane, PaneMode::Source);
         if show_source {
@@ -241,7 +376,7 @@ impl Component for Shell {
         }
 
         let mut children = vec![
-            KeyedView::new("tree-view", tree_view),
+            KeyedView::new("sidebar", sidebar),
             KeyedView::new("error-line", error_line),
             KeyedView::new(
                 "tab-bar",

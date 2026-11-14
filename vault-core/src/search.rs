@@ -73,11 +73,15 @@ pub fn search(root: &Path, query: &str, max_hits: usize) -> Result<Vec<SearchHit
             break;
         }
 
+        // Vault paths are slash-separated on every platform (the same
+        // normalization `Vault` applies when it indexes notes); the raw
+        // Windows path would otherwise leak `\` into tabs, the tree, and
+        // search hits.
         let rel = path
             .strip_prefix(root)
             .unwrap_or(path)
             .to_string_lossy()
-            .into_owned();
+            .replace('\\', "/");
         let mut sink = UTF8(|line_no, line| {
             if hits.len() < max_hits {
                 hits.push(SearchHit {
