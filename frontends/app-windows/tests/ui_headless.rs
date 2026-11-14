@@ -651,6 +651,135 @@ fn headless_shell_invoke_note_row_opens_it() {
     );
 }
 
+// --- reading-mode toggle -----------------------------------------------------
+
+#[test]
+fn headless_shell_reading_toggle_renders_the_parsed_doc() {
+    let app = shell_app_with(&[("a.md", "# Title\n\nbody text\n")]);
+    shell_open_tab(
+        &app,
+        "a.md",
+        "# Title\n\nbody text\n",
+        "# Title\n\nbody text\n",
+    );
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "reading").expect("reading toggle recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    // The editor area now renders the parsed doc: heading and paragraph
+    // as TextBlocks, and the source TextBox is gone.
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(
+        find_node_with_property_text(rt, window, PropertyId::TextBlockText, "Title").is_some(),
+        "h1 renders as a TextBlock"
+    );
+    assert!(
+        find_node_with_property_text(rt, window, PropertyId::TextBlockText, "body text").is_some(),
+        "paragraph renders as a TextBlock"
+    );
+    assert!(
+        find_node_with_property_text(
+            rt,
+            window,
+            PropertyId::TextBoxText,
+            "# Title\n\nbody text\n"
+        )
+        .is_none(),
+        "the source TextBox is replaced by the reading view"
+    );
+    // The toggle now offers the way back.
+    assert!(
+        find_owner_of_label(rt, window, "source").is_some(),
+        "toggle flips its label to source"
+    );
+}
+
+#[test]
+fn headless_shell_reading_toggle_returns_to_source() {
+    let app = shell_app_with(&[("a.md", "# Title\n\nbody text\n")]);
+    shell_open_tab(
+        &app,
+        "a.md",
+        "# Title\n\nbody text\n",
+        "# Title\n\nbody text\n",
+    );
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "reading").expect("reading toggle recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+    // Toggle back: the button now says "source".
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "source").expect("source toggle recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    let editor = find_node_with_property_text(
+        rt,
+        window,
+        PropertyId::TextBoxText,
+        "# Title\n\nbody text\n",
+    )
+    .expect("source TextBox back with the buffer text");
+    assert_eq!(
+        rt.node(editor).unwrap().property(PropertyId::TextBoxText),
+        Some(&PropertyValue::Str(String::from("# Title\n\nbody text\n")))
+    );
+    assert!(
+        find_node_with_property_text(rt, window, PropertyId::TextBlockText, "body text").is_none(),
+        "the reading view is gone"
+    );
+}
+
+#[test]
+fn headless_shell_reading_view_reflects_the_current_buffer() {
+    let app = shell_app_with(&[("a.md", "old body\n")]);
+    shell_open_tab(&app, "a.md", "old body\n", "old body\n");
+
+    let mut pump = mounted_shell(&app);
+
+    // The user edits while in source mode, then switches to reading.
+    let window = pump.window().expect("window node");
+    let editor = {
+        let rt = pump.runtime();
+        find_node_with_property_text(rt, window, PropertyId::TextBoxText, "old body\n")
+            .expect("editor recorded")
+    };
+    type_text(&mut pump, editor, "# Fresh\n\ntyped text\n");
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "reading").expect("reading toggle recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    // The reading view parses the CURRENT buffer text, not a snapshot
+    // from when the tab was opened.
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(
+        find_node_with_property_text(rt, window, PropertyId::TextBlockText, "Fresh").is_some(),
+        "the edited heading renders"
+    );
+    assert!(
+        find_node_with_property_text(rt, window, PropertyId::TextBlockText, "typed text").is_some(),
+        "the edited paragraph renders"
+    );
+}
+
 fn collect_texts(rt: &RecordingRuntime, from: NodeId, out: &mut Vec<String>) {
     if let Some(node) = rt.node(from) {
         if let Some(PropertyValue::Str(text)) = node.property(PropertyId::TextBlockText) {

@@ -37,6 +37,12 @@ pub enum NativeEvent {
     /// (disk) text is untouched — dirtiness stays exactly "buffer text
     /// differs from disk text".
     EditorEdited { text: String },
+    /// The reading/source toggle was clicked. This is shell-local
+    /// presentation state: the kernel tracks pane layout, not which of
+    /// source editor or rendered reading view the editor area shows.
+    /// The shell intercepts this in `update` (flips its own flag and
+    /// re-renders); the kernel never sees it.
+    ToggleReading,
 }
 
 #[cfg(test)]
@@ -51,10 +57,12 @@ mod tests {
                 effect: vault_app::ids::EffectId::new(7),
             }),
             WindowsMessage::Native(NativeEvent::WindowClosing),
+            WindowsMessage::Native(NativeEvent::ToggleReading),
         ];
         // A smoke pass over the variants; behavior lives in app.rs tests.
         assert!(matches!(messages[0], WindowsMessage::Command(_)));
         assert!(matches!(messages[1], WindowsMessage::EffectCompleted(_)));
         assert!(matches!(messages[2], WindowsMessage::Native(_)));
+        assert!(matches!(messages[3], WindowsMessage::Native(_)));
     }
 }

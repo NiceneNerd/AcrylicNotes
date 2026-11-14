@@ -223,6 +223,10 @@ impl WindowsApp {
                 self.run_effects(effects);
             }
             NativeEvent::EditorEdited { text } => self.set_active_buffer_text(text),
+            // Shell-local presentation state: the Shell component
+            // intercepts `ToggleReading` in its `update` and never
+            // forwards it here. This arm only keeps the match total.
+            NativeEvent::ToggleReading => {}
         }
     }
 
@@ -401,6 +405,26 @@ mod tests {
         // The buffer keeps its edits (nothing was written).
         assert_eq!(app.buffers[&tab].text, "new body\n");
         assert_eq!(repo.borrow().note_text("a.md"), Some("old\n".to_string()));
+    }
+
+    #[test]
+    fn a_reading_toggle_is_shell_local_and_reaches_no_kernel_state() {
+        let (mut app, repo, _opener) = app_with(&[("a.md", "# Title\n\nbody\n")]);
+        open_tab(&mut app, "a.md", "# Title\n\nbody\n", "# Title\n\nbody\n");
+
+        app.handle_native(WindowsMessage::Native(NativeEvent::ToggleReading));
+
+        // The toggle is presentation state the shell owns: the kernel
+        // host absorbs it without touching tabs, buffers, or errors.
+        assert_eq!(app.shared.state.tabs.active_path(), Some("a.md"));
+        let tab = app.shared.state.tabs.id_of("a.md").unwrap();
+        assert_eq!(app.buffers[&tab].text, "# Title\n\nbody\n");
+        assert!(!app.buffers[&tab].is_dirty());
+        assert_eq!(app.shared.state.last_error, None);
+        assert_eq!(
+            repo.borrow().note_text("a.md"),
+            Some("# Title\n\nbody\n".to_string())
+        );
     }
 
     #[test]
