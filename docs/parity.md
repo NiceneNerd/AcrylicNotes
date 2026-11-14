@@ -78,7 +78,7 @@ machine and is never claimed via Wine.
 | APPWIN-005 | Source editor caret/find math via `vault_app::editor` | Done, Linux-tested |
 | APPWIN-006 | Reading-mode plain-text projection | Partial; native element construction is p11 |
 | APPWIN-007 | Split layout state in `vault_app::layout` | Done, Linux-tested (kernel) |
-| APPWIN-008 | Native window loop, WinUI controls, live adapters | Not started (p11+); UI code is written test-first against the headless `RecordingRuntime` lane; real-rendering/IME/DPI/pickers/packaging checks remain user-side |
+| APPWIN-008 | Native window loop, WinUI controls, live adapters | In progress (p11): `Shell` component renders tabs/editor/error line from kernel state and routes clicks back as `WindowsMessage` commands (headless-verified: RecordingRuntime under Wine); `main.rs` window loop, native TreeView, and the editing adapter are next; real-rendering/IME/DPI/pickers/packaging checks remain user-side |
 | APPWIN-009 | Cross-target verification (xtask + CI) | Done, runs on Linux: cross-target checks + headless Wine UI tests; real-Windows smoke remains user-side |
 
 ## Baseline (Phase 0)

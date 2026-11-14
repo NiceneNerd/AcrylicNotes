@@ -1,0 +1,155 @@
+//! The native WinUI shell component (p11).
+//!
+//! One Reactor component over the shared [`WindowsApp`] kernel: native
+//! events become [`WindowsMessage`]s (the same envelope the runner
+//! consumes), `update` hands them to `WindowsApp::handle_native`, and
+//! `view` renders kernel state into WinUI controls. This file holds no
+//! feature logic — decisions stay in the kernel reducer; the shell only
+//! maps controls to commands.
+//!
+//! Headless verification lives in `tests/ui_headless.rs`: the shell runs
+//! under the `RecordingRuntime` (built for windows-gnu, executed under
+//! Wine via `cargo xtask test-windows-ui`), where clicks are injected as
+//! recorded events and the reconciled tree is asserted.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use windows_reactor::{
+    Button, ChildrenControl, Component, ComponentContext, ContentControl, KeyedView, Orientation,
+    StackPanel, TextBlock, TextBox, View, ViewContext,
+};
+
+use vault_app::commands::UiCommand;
+
+use crate::app::WindowsApp;
+use crate::windows_message::WindowsMessage;
+
+/// The shell component's input: a shared handle to the kernel host.
+///
+/// Pointer equality (the component never re-creates when the same app
+/// handle is re-passed).
+#[derive(Clone)]
+pub struct ShellHandle(Rc<RefCell<WindowsApp>>);
+
+impl PartialEq for ShellHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl ShellHandle {
+    /// Wrap the kernel host for shell construction.
+    #[must_use]
+    pub fn new(app: Rc<RefCell<WindowsApp>>) -> Self {
+        Self(app)
+    }
+}
+
+/// The native shell: tabs, editor, and error line over the shared kernel.
+pub struct Shell {
+    handle: ShellHandle,
+}
+
+impl Component for Shell {
+    type Input = ShellHandle;
+    type Message = WindowsMessage;
+
+    fn create(input: &Self::Input, _context: &ComponentContext<Self>) -> Self {
+        Shell {
+            handle: input.clone(),
+        }
+    }
+
+    fn input_changed(&mut self, input: &Self::Input, _context: &ComponentContext<Self>) {
+        self.handle = input.clone();
+    }
+
+    fn update(&mut self, message: Self::Message, _context: &ComponentContext<Self>) {
+        self.handle.0.borrow_mut().handle_native(message);
+    }
+
+    fn view(&self, _input: &Self::Input, context: &mut ViewContext<Self>) -> View {
+        let app = self.handle.0.borrow();
+        let state = &app.shared.state;
+
+        // Tab bar: one activate button and one close button per tab,
+        // keyed by tab id so reconciliation preserves identity as tabs
+        // open and close. The active tab's label is bracketed.
+        let tabs: Vec<KeyedView> = state
+            .tabs
+            .order()
+            .iter()
+            .map(|&tab| {
+                let path = state.tabs.path(tab).unwrap_or("?").to_string();
+                let is_active = state.tabs.active() == Some(tab);
+                let label = if is_active {
+                    format!("[{path}]")
+                } else {
+                    path.clone()
+                };
+                let position = state.tabs.position(tab).unwrap_or(0);
+                let activate = Button::new()
+                    .on_click(context.callback(move |()| {
+                        WindowsMessage::Command(UiCommand::ActivateTab { position })
+                    }))
+                    .content(TextBlock::new().text(label));
+                let close = Button::new()
+                    .on_click(context.callback(move |()| {
+                        WindowsMessage::Command(UiCommand::CloseTab { position })
+                    }))
+                    .content(TextBlock::new().text(format!("close {path}")));
+                // The tab path doubles as the key: the kernel never
+                // holds two tabs for one path (open_or_focus dedupes).
+                KeyedView::new(
+                    path.clone(),
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .children([activate, close]),
+                )
+            })
+            .collect();
+
+        // Error line: the kernel's last actionable error (empty when
+        // everything is fine).
+        let error_line = TextBlock::new().text(
+            state
+                .last_error
+                .clone()
+                .unwrap_or_else(|| String::from("(no errors)")),
+        );
+
+        // Editor: the active tab's buffer text. The editing adapter
+        // (programmatic sync vs. user edits, revisions, composition) is
+        // the next slice; this displays the buffer.
+        let editor_text = state
+            .tabs
+            .active()
+            .and_then(|tab| app.buffers.get(&tab))
+            .map(|buffer| buffer.text.clone())
+            .unwrap_or_default();
+
+        StackPanel::new()
+            .orientation(Orientation::Vertical)
+            .keyed_children([
+                KeyedView::new("error-line", error_line),
+                KeyedView::new(
+                    "tab-bar",
+                    StackPanel::new()
+                        .orientation(Orientation::Vertical)
+                        .keyed_children(tabs),
+                ),
+                // Save button (the toolbar stand-in for Ctrl+S).
+                KeyedView::new(
+                    "save",
+                    Button::new()
+                        .on_click(
+                            context
+                                .callback(|()| WindowsMessage::Command(UiCommand::SaveActiveTab)),
+                        )
+                        .content(TextBlock::new().text("save")),
+                ),
+                KeyedView::new("editor", TextBox::new().text(editor_text)),
+            ])
+    }
+}

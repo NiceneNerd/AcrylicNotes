@@ -210,7 +210,257 @@ fn headless_file_tree_rows_render_and_collapse() {
     }
 }
 
-// --- helpers ----------------------------------------------------------------
+// --- the shell component over the kernel ------------------------------------
+
+use app_windows::app::NoteBuffer;
+use app_windows::shell::{Shell, ShellHandle};
+use app_windows::windows_message::WindowsMessage;
+use app_windows::WindowsApp;
+use vault_app::commands::UiCommand;
+use vault_app::repository::{testing::MemoryRepository, NoteRepository};
+use vault_platform::testing::RecordingOpener;
+use windows_reactor::test::{EventId, EventPayload, QueuedEvent};
+
+/// A kernel host over a memory vault with a succeeding opener.
+fn shell_app_with(notes: &[(&str, &str)]) -> Rc<RefCell<WindowsApp>> {
+    let repo = Rc::new(RefCell::new(MemoryRepository::new()));
+    for (path, text) in notes {
+        repo.borrow_mut().insert(path, text);
+    }
+    let app = WindowsApp::new(
+        repo as Rc<RefCell<dyn NoteRepository>>,
+        Rc::new(RecordingOpener::succeeding()),
+    );
+    Rc::new(RefCell::new(app))
+}
+
+/// Open `path` through the kernel (the shell's own message path) and give
+/// it a buffer with the given text over the given base (disk) text.
+fn shell_open_tab(app: &Rc<RefCell<WindowsApp>>, path: &str, text: &str, base: &str) {
+    app.borrow_mut()
+        .handle_native(WindowsMessage::Command(UiCommand::OpenNote {
+            path: path.to_string(),
+        }));
+    let tab = app
+        .borrow()
+        .shared
+        .state
+        .tabs
+        .id_of(path)
+        .unwrap_or_else(|| panic!("tab opened: {path}"));
+    app.borrow_mut().buffers.insert(
+        tab,
+        NoteBuffer {
+            text: text.to_string(),
+            base: base.to_string(),
+        },
+    );
+}
+
+/// Mount the shell over the app and pump its initial render.
+fn mounted_shell(app: &Rc<RefCell<WindowsApp>>) -> Pump<RecordingRuntime> {
+    let mut pump = Pump::new(RecordingRuntime::default());
+    pump.mount_view(View::component::<Shell>(ShellHandle::new(app.clone())))
+        .expect("mount");
+    pump.dispatch_components(10).expect("dispatch");
+    pump
+}
+
+/// Find the node owning the TextBlock child whose text is exactly
+/// `label` (a button's content label makes its owner the button node).
+fn find_owner_of_label(rt: &RecordingRuntime, from: NodeId, label: &str) -> Option<NodeId> {
+    let node = rt.node(from)?;
+    for &child in node.children() {
+        if let Some(child_node) = rt.node(child) {
+            if child_node.property(PropertyId::TextBlockText)
+                == Some(&PropertyValue::Str(label.to_string()))
+            {
+                return Some(from);
+            }
+            if let Some(found) = find_owner_of_label(rt, child, label) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Inject one click on the node (event revision from the pump, empty
+/// payload like the real runtime sends for button clicks).
+fn click(pump: &mut Pump<RecordingRuntime>, node: NodeId, event: EventId) {
+    let revision = pump.event_revision(node, event).expect("event active");
+    pump.queue_event(QueuedEvent::new(node, event, revision, EventPayload::Unit));
+    pump.dispatch_events().expect("dispatch events");
+    pump.dispatch_components(10).expect("dispatch components");
+}
+
+#[test]
+fn headless_shell_renders_tabs_editor_and_error_line() {
+    let app = shell_app_with(&[("a.md", "a body\n")]);
+    // Open the note through the kernel before mounting (real startup
+    // order: the shell renders existing state).
+    shell_open_tab(&app, "a.md", "a body\n", "a body\n");
+
+    let pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    // Active tab renders bracketed; the editor shows the buffer text.
+    assert!(
+        find_owner_of_label(rt, window, "[a.md]").is_some(),
+        "active tab button recorded"
+    );
+    let editor = find_node_with_property_text(rt, window, PropertyId::TextBoxText, "a body\n")
+        .expect("editor recorded");
+    assert_eq!(
+        rt.node(editor).unwrap().property(PropertyId::TextBoxText),
+        Some(&PropertyValue::Str(String::from("a body\n")))
+    );
+}
+
+#[test]
+fn headless_shell_click_activates_the_clicked_tab() {
+    let app = shell_app_with(&[("a.md", "a\n"), ("b.md", "b\n")]);
+    shell_open_tab(&app, "a.md", "a\n", "a\n");
+    shell_open_tab(&app, "b.md", "b\n", "b\n");
+
+    let mut pump = mounted_shell(&app);
+
+    // The last opened tab is focused (open_or_focus), so b.md is active
+    // and a.md's button is unbracketed. Click it to switch back.
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "a.md").expect("a.md tab button recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    // The kernel switched, and the shell re-rendered: a is bracketed, b
+    // is not.
+    assert_eq!(
+        app.borrow().shared.state.tabs.active_path(),
+        Some("a.md"),
+        "kernel switched tabs"
+    );
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(find_owner_of_label(rt, window, "[a.md]").is_some());
+    assert!(find_owner_of_label(rt, window, "b.md").is_some());
+}
+
+#[test]
+fn headless_shell_click_closes_a_tab() {
+    let app = shell_app_with(&[("a.md", "a\n"), ("b.md", "b\n")]);
+    shell_open_tab(&app, "a.md", "a\n", "a\n");
+    shell_open_tab(&app, "b.md", "b\n", "b\n");
+
+    let mut pump = mounted_shell(&app);
+
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "close a.md").expect("close button recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    assert_eq!(
+        app.borrow().shared.state.tabs.active_path(),
+        Some("b.md"),
+        "kernel closed a.md and b.md stays"
+    );
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(
+        find_owner_of_label(rt, window, "a.md").is_none(),
+        "the closed tab vanished from the render"
+    );
+}
+
+#[test]
+fn headless_shell_save_click_surfaces_the_kernel_error_line() {
+    let repo = Rc::new(RefCell::new(MemoryRepository::new()));
+    repo.borrow_mut().insert("a.md", "old\n");
+    repo.borrow_mut().fail_saves_with("io broke");
+    let app = Rc::new(RefCell::new(WindowsApp::new(
+        repo as Rc<RefCell<dyn NoteRepository>>,
+        Rc::new(RecordingOpener::succeeding()),
+    )));
+    shell_open_tab(&app, "a.md", "edited\n", "old\n");
+
+    let mut pump = mounted_shell(&app);
+
+    // Click save: the guarded save fails, the kernel records the error,
+    // and the shell re-renders the error line.
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "save").expect("save button recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    assert_eq!(
+        app.borrow().shared.state.last_error.as_deref(),
+        Some("save failed: io broke")
+    );
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    let error_line = find_node_with_property_text(
+        rt,
+        window,
+        PropertyId::TextBlockText,
+        "save failed: io broke",
+    )
+    .expect("error line re-rendered");
+    // The error line is its own TextBlock node (not the button content).
+    assert_ne!(error_line, target, "error line is a distinct node");
+}
+
+#[test]
+fn headless_shell_save_click_persists_the_buffer() {
+    // The full vertical slice: render -> click save -> repository write.
+    let app = shell_app_with(&[("a.md", "old\n")]);
+    shell_open_tab(&app, "a.md", "typed on Windows\n", "old\n");
+
+    let mut pump = mounted_shell(&app);
+
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "save").expect("save button recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    let borrowed = app.borrow();
+    assert_eq!(
+        borrowed.shared.state.last_error, None,
+        "clean save raises nothing"
+    );
+    // The buffer's base moved with the save (clean); the repository
+    // assert lives with the kernel tests (MemoryRepository is not shared
+    // through this handle).
+    let buffer = &borrowed.buffers[&borrowed.shared.state.tabs.id_of("a.md").unwrap()];
+    assert_eq!(buffer.text, "typed on Windows\n");
+    assert_eq!(buffer.base, "typed on Windows\n");
+    assert!(!buffer.is_dirty());
+}
+
+/// Depth-first search for a node with a given property text value.
+fn find_node_with_property_text(
+    rt: &RecordingRuntime,
+    from: NodeId,
+    property: PropertyId,
+    value: &str,
+) -> Option<NodeId> {
+    let node = rt.node(from)?;
+    if node.property(property) == Some(&PropertyValue::Str(value.to_string())) {
+        return Some(from);
+    }
+    for &child in node.children() {
+        if let Some(found) = find_node_with_property_text(rt, child, property, value) {
+            return Some(found);
+        }
+    }
+    None
+}
 
 fn find_text(rt: &RecordingRuntime, from: NodeId) -> Option<NodeId> {
     let node = rt.node(from)?;
