@@ -17,12 +17,15 @@ use std::rc::Rc;
 
 use windows_reactor::{
     Button, ChildrenControl, Component, ComponentContext, ContentControl, KeyedView, Orientation,
-    StackPanel, TextBlock, TextBox, View, ViewContext,
+    StackPanel, TextBlock, TextBox, TreeNode, TreeView, TreeViewExt, TreeViewSelectionMode, View,
+    ViewContext,
 };
 
 use vault_app::commands::UiCommand;
+use vault_app::tree as kernel_tree;
 
 use crate::app::WindowsApp;
+use crate::file_tree::FileTree;
 use crate::windows_message::{NativeEvent, WindowsMessage};
 
 /// The shell component's input: a shared handle to the kernel host.
@@ -53,10 +56,13 @@ pub struct Shell {
     /// control raises `TextChanged` for property sets as well as user
     /// typing; an incoming change equal to this is that echo of the
     /// shell's own sync and is suppressed instead of being fed back to
-    /// the buffer (plan §11.1: never route programmatic syncs back as
-    /// replacements). `RefCell` because `view` (which takes `&self`)
-    /// records it while `update` compares against it.
+    /// the buffer (plan §11.1). `RefCell` because `view` (which takes
+    /// `&self`) records it while `update` compares against it.
     rendered_editor: RefCell<String>,
+    /// The vault's file tree: kernel `TreeNode`s plus `TreeState`
+    /// (expansion/selection). Built once from the vault's note paths;
+    /// expansion state persists across renders here.
+    file_tree: FileTree,
 }
 
 impl Component for Shell {
@@ -64,9 +70,11 @@ impl Component for Shell {
     type Message = WindowsMessage;
 
     fn create(input: &Self::Input, _context: &ComponentContext<Self>) -> Self {
+        let file_tree = FileTree::from_paths(&input.0.borrow().note_paths());
         Shell {
             handle: input.clone(),
             rendered_editor: RefCell::new(String::new()),
+            file_tree,
         }
     }
 
@@ -89,6 +97,18 @@ impl Component for Shell {
     fn view(&self, _input: &Self::Input, context: &mut ViewContext<Self>) -> View {
         let app = self.handle.0.borrow();
         let state = &app.shared.state;
+
+        // File-tree sidebar: one TreeView node per vault folder/note,
+        // keyed by vault path. Invoking a note row asks the kernel to
+        // open it (`UiCommand::OpenNote`); expansion state lives in
+        // `FileTree`'s `TreeState` and persists across renders.
+        let tree_view = TreeView::new()
+            .selection_mode(TreeViewSelectionMode::Single)
+            .on_item_invoked(
+                context
+                    .callback(|path: String| WindowsMessage::Command(UiCommand::OpenNote { path })),
+            )
+            .nodes(build_tree_nodes(&self.file_tree));
 
         // Tab bar: one activate button and one close button per tab,
         // keyed by tab id so reconciliation preserves identity as tabs
@@ -157,6 +177,7 @@ impl Component for Shell {
         StackPanel::new()
             .orientation(Orientation::Vertical)
             .keyed_children([
+                KeyedView::new("tree-view", tree_view),
                 KeyedView::new("error-line", error_line),
                 KeyedView::new(
                     "tab-bar",
@@ -177,4 +198,26 @@ impl Component for Shell {
                 KeyedView::new("editor", editor),
             ])
     }
+}
+
+/// Convert the kernel tree (folders + notes, expansion state from
+/// `TreeState`) into the hierarchy the native TreeView renders. Folder
+/// and note keys are their vault paths; invoking a note row reports its
+/// path to `on_item_invoked`.
+fn build_tree_nodes(tree: &FileTree) -> Vec<TreeNode> {
+    fn convert(node: &kernel_tree::TreeNode, tree: &FileTree) -> TreeNode {
+        match node {
+            kernel_tree::TreeNode::Folder {
+                name,
+                path,
+                children,
+            } => TreeNode::new(path.as_str(), name.as_str())
+                .expanded(tree.state.is_expanded(path))
+                .children(children.iter().map(|child| convert(child, tree))),
+            kernel_tree::TreeNode::Note { name, path } => {
+                TreeNode::new(path.as_str(), name.as_str())
+            }
+        }
+    }
+    tree.nodes.iter().map(|node| convert(node, tree)).collect()
 }

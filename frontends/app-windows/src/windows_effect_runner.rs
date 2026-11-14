@@ -59,6 +59,12 @@ impl WindowsEffectRunner {
             })
     }
 
+    /// Every note path in the vault, sorted vault-relative. Builds the
+    /// file-tree sidebar's node list.
+    pub fn note_paths(&self) -> Vec<String> {
+        self.repo.borrow().note_paths()
+    }
+
     /// Hand an open target to the platform's default handler. Success is
     /// fire-and-forget (the reducer drains the tracking on
     /// `OpenCompleted`); spawn-level failures surface as `OpenFailed`.

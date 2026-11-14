@@ -84,6 +84,12 @@ impl WindowsApp {
         }
     }
 
+    /// Every note path in the vault, sorted vault-relative. Builds the
+    /// file-tree sidebar's node list.
+    pub fn note_paths(&self) -> Vec<String> {
+        self.runner.note_paths()
+    }
+
     /// Handle one message from the native UI: dispatch commands, absorb
     /// late effect outcomes, and translate raw native events. Effects
     /// never come back out — the runner's outcomes go straight into the
@@ -395,6 +401,23 @@ mod tests {
         // The buffer keeps its edits (nothing was written).
         assert_eq!(app.buffers[&tab].text, "new body\n");
         assert_eq!(repo.borrow().note_text("a.md"), Some("old\n".to_string()));
+    }
+
+    #[test]
+    fn note_paths_lists_every_vault_note_sorted() {
+        let (app, _repo, _opener) =
+            app_with(&[("z.md", "z\n"), ("a.md", "a\n"), ("Notes/b.md", "b\n")]);
+        assert_eq!(
+            app.note_paths(),
+            vec![
+                "Notes/b.md".to_string(),
+                "a.md".to_string(),
+                "z.md".to_string(),
+            ]
+        );
+        // An empty vault lists nothing.
+        let (empty, _repo, _opener) = app_with(&[]);
+        assert!(empty.note_paths().is_empty());
     }
 
     #[test]

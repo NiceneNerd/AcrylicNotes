@@ -591,6 +591,66 @@ fn find_text(rt: &RecordingRuntime, from: NodeId) -> Option<NodeId> {
     None
 }
 
+/// Find the TreeView node by probing for the node the recording runtime
+/// tracks `tree_nodes` for (`MountedKind` is not publicly exported, so
+/// we detect the TreeView via `RecordingRuntime::tree_nodes`).
+fn find_tree_view(rt: &RecordingRuntime, from: NodeId) -> Option<NodeId> {
+    if rt.tree_nodes(from).is_some() {
+        return Some(from);
+    }
+    for &child in rt.node(from)?.children() {
+        if let Some(found) = find_tree_view(rt, child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+#[test]
+fn headless_shell_tree_renders_vault_notes_and_folders() {
+    let app = shell_app_with(&[("notes/b.md", "b\n"), ("a.md", "a\n")]);
+    let pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    let tree_view = find_tree_view(rt, window).expect("tree view recorded");
+    // Two top-level nodes: the "notes" folder and "a.md".
+    assert_eq!(
+        rt.tree_nodes(tree_view).map(|nodes| nodes.len()),
+        Some(2),
+        "folder plus note rendered as top-level tree nodes"
+    );
+}
+
+#[test]
+fn headless_shell_invoke_note_row_opens_it() {
+    let app = shell_app_with(&[("notes/b.md", "b\n"), ("a.md", "a\n")]);
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let tree_view = {
+        let rt = pump.runtime();
+        find_tree_view(rt, window).expect("tree view recorded")
+    };
+    let revision = pump
+        .event_revision(tree_view, EventId::TreeViewItemInvoked)
+        .expect("item-invoked event active");
+    // The user invokes the "notes/b.md" row: the control echoes its key
+    // (the vault path) as `TreeViewItemInvoked`.
+    pump.queue_event(QueuedEvent::new(
+        tree_view,
+        EventId::TreeViewItemInvoked,
+        revision,
+        EventPayload::Str(String::from("notes/b.md")),
+    ));
+    pump.dispatch_events().expect("dispatch events");
+    pump.dispatch_components(10).expect("dispatch components");
+
+    assert_eq!(
+        app.borrow().shared.state.tabs.active_path(),
+        Some("notes/b.md"),
+        "invoking a note row opens it"
+    );
+}
+
 fn collect_texts(rt: &RecordingRuntime, from: NodeId, out: &mut Vec<String>) {
     if let Some(node) = rt.node(from) {
         if let Some(PropertyValue::Str(text)) = node.property(PropertyId::TextBlockText) {

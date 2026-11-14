@@ -61,6 +61,12 @@ pub trait NoteRepository {
         original: &str,
         content: &str,
     ) -> Result<(), RepositoryError>;
+
+    /// Every note path in the vault, sorted vault-relative. Used by the
+    /// Windows file-tree sidebar to enumerate the vault; the shared
+    /// builder (`vault_app::tree::build_with_folders`) re-sorts and adds
+    /// folder chains, so callers need only list the leaf notes.
+    fn note_paths(&self) -> Vec<String>;
 }
 
 /// Map a vault-core failure onto the repository error family: the
@@ -98,6 +104,13 @@ impl NoteRepository for Vault {
         self.save_note_full(path, original, content)
             .map(|_| ())
             .map_err(map_error)
+    }
+
+    fn note_paths(&self) -> Vec<String> {
+        self.notes_sorted()
+            .iter()
+            .map(|note| note.path.clone())
+            .collect()
     }
 }
 
@@ -234,6 +247,12 @@ pub mod testing {
             content: &str,
         ) -> Result<(), RepositoryError> {
             self.write(path, original, content, true)
+        }
+
+        fn note_paths(&self) -> Vec<String> {
+            let mut paths: Vec<String> = self.notes.keys().cloned().collect();
+            paths.sort();
+            paths
         }
     }
 
