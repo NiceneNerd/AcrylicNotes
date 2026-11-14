@@ -14,10 +14,12 @@
 //! (`Rc`/`RefCell`); the native window loop runs the UI on one thread.
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use vault_app::repository::{NoteRepository, RepositoryError};
+use vault_app::search::{SearchHitView, SEARCH_MAX_HITS};
+use vault_app::settings::{PaneMode, SettingsStore};
 use vault_app::workflow::SaveOutcome;
 use vault_platform::{ExternalOpener, OpenError, OpenTarget};
 
@@ -25,13 +27,28 @@ use vault_platform::{ExternalOpener, OpenError, OpenTarget};
 pub struct WindowsEffectRunner {
     repo: Rc<RefCell<dyn NoteRepository>>,
     opener: Rc<dyn ExternalOpener>,
+    settings: Rc<RefCell<dyn SettingsStore>>,
+    /// The vault root the shared search engine scans (the Linux shell
+    /// reads it from the open `Vault`; here it is injected, since the
+    /// repository trait deliberately hides its backing store).
+    root: PathBuf,
 }
 
 impl WindowsEffectRunner {
     /// Construct a runner around injected services.
     #[must_use]
-    pub fn new(repo: Rc<RefCell<dyn NoteRepository>>, opener: Rc<dyn ExternalOpener>) -> Self {
-        Self { repo, opener }
+    pub fn new(
+        repo: Rc<RefCell<dyn NoteRepository>>,
+        opener: Rc<dyn ExternalOpener>,
+        settings: Rc<RefCell<dyn SettingsStore>>,
+        root: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            repo,
+            opener,
+            settings,
+            root: root.into(),
+        }
     }
 
     /// Perform a guarded save of `text` at `path`, with `base` as the
@@ -82,5 +99,26 @@ impl WindowsEffectRunner {
         self.opener
             .reveal_path(path)
             .map_err(|error| error.to_string())
+    }
+
+    /// Persist the kernel's settings snapshot: load-modify-store, so
+    /// every field the kernel does not own survives the write. This is
+    /// the `EffectKind::PersistSettings` arm's work.
+    pub fn persist_settings(&mut self, default_pane: PaneMode) {
+        let mut document = self.settings.borrow().load();
+        document.default_pane = default_pane;
+        self.settings.borrow_mut().store(&document);
+    }
+
+    /// Run the vault-wide search over the vault root with the shared
+    /// engine and cap (the same literal ripgrep scan the Linux shell
+    /// runs off-thread). A scan failure yields no hits, matching the
+    /// Linux shell's `unwrap_or_default`.
+    pub fn search(&self, query: &str) -> Vec<SearchHitView> {
+        vault_core::search::search(&self.root, query, SEARCH_MAX_HITS)
+            .unwrap_or_default()
+            .into_iter()
+            .map(SearchHitView::from)
+            .collect()
     }
 }

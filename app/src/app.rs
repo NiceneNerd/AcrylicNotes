@@ -124,7 +124,7 @@ pub struct LiveEdit {
 const WIKI_MAX_ITEMS: usize = 8;
 
 /// Cap on vault-wide search results shown.
-pub const SEARCH_MAX_HITS: usize = 200;
+pub use vault_app::search::SEARCH_MAX_HITS;
 
 /// Colors derived once per view pass from the active cosmic theme, so the
 /// reading renderer and views stay theme-agnostic (M4 decision 6: the

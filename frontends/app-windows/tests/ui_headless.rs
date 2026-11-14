@@ -218,20 +218,34 @@ use app_windows::windows_message::WindowsMessage;
 use app_windows::WindowsApp;
 use vault_app::commands::UiCommand;
 use vault_app::repository::{testing::MemoryRepository, NoteRepository};
+use vault_app::settings::MemorySettingsStore;
 use vault_platform::testing::{OpenCall, RecordingOpener};
 use windows_reactor::test::{EventId, EventPayload, QueuedEvent};
 
 /// A kernel host over a memory vault with a succeeding opener.
 fn shell_app_with(notes: &[(&str, &str)]) -> Rc<RefCell<WindowsApp>> {
+    let (app, _settings) = shell_app_with_settings(notes);
+    app
+}
+
+/// Like [`shell_app_with`], also handing back the settings store so a
+/// test can assert what the shell persisted. The search root is the
+/// system temp dir (the headless tests do not search).
+fn shell_app_with_settings(
+    notes: &[(&str, &str)],
+) -> (Rc<RefCell<WindowsApp>>, Rc<RefCell<MemorySettingsStore>>) {
     let repo = Rc::new(RefCell::new(MemoryRepository::new()));
     for (path, text) in notes {
         repo.borrow_mut().insert(path, text);
     }
+    let settings = Rc::new(RefCell::new(MemorySettingsStore::default()));
     let app = WindowsApp::new(
         repo as Rc<RefCell<dyn NoteRepository>>,
         Rc::new(RecordingOpener::succeeding()),
+        settings.clone(),
+        std::env::temp_dir(),
     );
-    Rc::new(RefCell::new(app))
+    (Rc::new(RefCell::new(app)), settings)
 }
 
 /// Open `path` through the kernel (the shell's own message path) and give
@@ -517,6 +531,8 @@ fn headless_shell_save_click_surfaces_the_kernel_error_line() {
     let app = Rc::new(RefCell::new(WindowsApp::new(
         repo as Rc<RefCell<dyn NoteRepository>>,
         Rc::new(RecordingOpener::succeeding()),
+        Rc::new(RefCell::new(MemorySettingsStore::default())),
+        std::env::temp_dir(),
     )));
     shell_open_tab(&app, "a.md", "edited\n", "old\n");
 
@@ -792,6 +808,8 @@ fn headless_shell_reading_link_click_opens_the_url_through_the_kernel() {
     let app = Rc::new(RefCell::new(WindowsApp::new(
         repo as Rc<RefCell<dyn NoteRepository>>,
         opener.clone(),
+        Rc::new(RefCell::new(MemorySettingsStore::default())),
+        std::env::temp_dir(),
     )));
     shell_open_tab(
         &app,

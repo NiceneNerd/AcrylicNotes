@@ -304,6 +304,67 @@ impl Default for AppSettings {
     }
 }
 
+/// The platform service owning the settings document's storage.
+///
+/// The kernel decides *what* to persist (its snapshot, e.g.
+/// `AppState::default_pane`); the store decides *where and how* (a JSON
+/// file in the platform config dir, an in-memory fake in tests).
+/// Persistence is load-modify-store at the call site — the runner loads,
+/// applies the kernel's snapshot, and stores back — so fields this build
+/// does not own survive every write.
+pub trait SettingsStore {
+    /// The stored document, or defaults when nothing valid is stored.
+    fn load(&self) -> AppSettings;
+
+    /// Persist the whole document. The real store writes atomically;
+    /// failures are non-fatal (settings are a convenience), the store
+    /// keeps serving its last good document on load.
+    fn store(&mut self, settings: &AppSettings);
+}
+
+/// A deterministic in-memory [`SettingsStore`] for tests: it starts from
+/// a known document and records every write so tests can assert exactly
+/// what the runner persisted.
+#[derive(Debug, Clone, Default)]
+pub struct MemorySettingsStore {
+    current: AppSettings,
+    writes: usize,
+}
+
+impl MemorySettingsStore {
+    /// A store already holding `settings` (e.g. a previous session's).
+    #[must_use]
+    pub fn starting_with(settings: AppSettings) -> Self {
+        Self {
+            current: settings,
+            writes: 0,
+        }
+    }
+
+    /// How many documents were stored.
+    #[must_use]
+    pub fn writes(&self) -> usize {
+        self.writes
+    }
+
+    /// The document a load would return right now.
+    #[must_use]
+    pub fn last(&self) -> &AppSettings {
+        &self.current
+    }
+}
+
+impl SettingsStore for MemorySettingsStore {
+    fn load(&self) -> AppSettings {
+        self.current.clone()
+    }
+
+    fn store(&mut self, settings: &AppSettings) {
+        self.current = settings.clone();
+        self.writes += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +491,22 @@ mod tests {
         let text = r#"{"sidebar_width": 320.0, "sidebar_solid": true, "unknown": 1}"#;
         let loaded: AppSettings = serde_json::from_str(text).unwrap();
         assert_eq!(loaded, AppSettings::default());
+    }
+
+    #[test]
+    fn the_memory_settings_store_round_trips_and_counts_writes() {
+        let mut store = MemorySettingsStore::starting_with(AppSettings {
+            default_pane: PaneMode::Reading,
+            ..AppSettings::default()
+        });
+        assert_eq!(store.load().default_pane, PaneMode::Reading);
+
+        let mut document = store.load();
+        document.default_pane = PaneMode::Split;
+        store.store(&document);
+
+        assert_eq!(store.writes(), 1);
+        assert_eq!(store.last().default_pane, PaneMode::Split);
     }
 
     #[test]

@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{IdAllocator, SearchRequestId};
 
+/// The most hits one search may report (the shared "literal ripgrep,
+/// capped" behavior; the Linux shell used the same cap).
+pub const SEARCH_MAX_HITS: usize = 200;
+
 /// One search result row as both frontends render it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchHitView {
@@ -20,6 +24,16 @@ pub struct SearchHitView {
     pub line_no: u64,
     /// The matching line's text.
     pub line: String,
+}
+
+impl From<vault_core::search::SearchHit> for SearchHitView {
+    fn from(hit: vault_core::search::SearchHit) -> Self {
+        Self {
+            path: hit.path,
+            line_no: hit.line_no,
+            line: hit.line,
+        }
+    }
 }
 
 /// The vault-wide search panel's state.

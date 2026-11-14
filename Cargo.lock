@@ -236,7 +236,11 @@ dependencies = [
 name = "app-windows"
 version = "0.1.0"
 dependencies = [
+ "dirs",
+ "serde_json",
+ "tempfile",
  "vault-app",
+ "vault-core",
  "vault-md",
  "vault-platform",
  "windows-reactor",

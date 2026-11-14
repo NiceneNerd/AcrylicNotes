@@ -20,6 +20,7 @@ use vault_app::commands::UiCommand;
 use vault_app::effects::{AppEvent, Effect, EffectKind};
 use vault_app::ids::{EffectId, TabId};
 use vault_app::repository::NoteRepository;
+use vault_app::settings::SettingsStore;
 use vault_app::workflow::SaveOutcome;
 use vault_app::App;
 use vault_platform::ExternalOpener;
@@ -72,14 +73,21 @@ pub struct WindowsApp {
 impl WindowsApp {
     /// Construct an application around injected services.
     ///
-    /// Production (Windows) wiring passes the live vault adapter and
-    /// shell launcher; tests inject a memory repository and a recording
-    /// opener, so the whole flow runs on Linux.
+    /// Production (Windows) wiring passes the live vault adapter, the
+    /// shell launcher, the file settings store, and the vault root the
+    /// search engine scans; tests inject a memory repository, a
+    /// recording opener, a memory settings store, and a tempdir root,
+    /// so the whole flow runs on Linux.
     #[must_use]
-    pub fn new(repo: Rc<RefCell<dyn NoteRepository>>, opener: Rc<dyn ExternalOpener>) -> Self {
+    pub fn new(
+        repo: Rc<RefCell<dyn NoteRepository>>,
+        opener: Rc<dyn ExternalOpener>,
+        settings: Rc<RefCell<dyn SettingsStore>>,
+        root: impl Into<std::path::PathBuf>,
+    ) -> Self {
         Self {
             shared: App::new(),
-            runner: WindowsEffectRunner::new(repo, opener),
+            runner: WindowsEffectRunner::new(repo, opener, settings, root),
             buffers: HashMap::new(),
         }
     }
@@ -131,7 +139,23 @@ impl WindowsApp {
                     };
                     self.shared.handle(event);
                 }
-                EffectKind::PersistSettings | EffectKind::SearchVault { .. } => {}
+                EffectKind::PersistSettings => {
+                    // The kernel owns the snapshot; the runner owns the
+                    // storage (load-modify-store through the platform
+                    // settings service).
+                    let pane = self.shared.state.default_pane;
+                    self.runner.persist_settings(pane);
+                }
+                EffectKind::SearchVault { request, query } => {
+                    // The shared engine scans the vault root; the session
+                    // rejects stale completions kernel-side, so the
+                    // runner reports every outcome keyed by its request.
+                    let hits = self.runner.search(query);
+                    self.shared.handle(AppEvent::SearchCompleted {
+                        request: *request,
+                        hits,
+                    });
+                }
             }
         }
     }
@@ -246,7 +270,7 @@ mod tests {
     use super::*;
     use vault_app::persistence::ConflictDecision;
     use vault_app::repository::testing::MemoryRepository;
-    use vault_app::settings::PaneMode;
+    use vault_app::settings::{MemorySettingsStore, PaneMode, ThemeChoice};
     use vault_platform::testing::{OpenCall, RecordingOpener};
     use vault_platform::OpenError;
 
@@ -259,12 +283,36 @@ mod tests {
         Rc<RefCell<MemoryRepository>>,
         Rc<RecordingOpener>,
     ) {
+        let (app, repo, opener, _settings) = app_with_settings(notes);
+        (app, repo, opener)
+    }
+
+    /// The services [`app_with_settings`] hands back alongside the app.
+    type AppServices = (
+        WindowsApp,
+        Rc<RefCell<MemoryRepository>>,
+        Rc<RecordingOpener>,
+        Rc<RefCell<MemorySettingsStore>>,
+    );
+
+    /// Like [`app_with`], also handing back the settings store so tests
+    /// can assert what `PersistSettings` wrote. The search root is the
+    /// system temp dir: the tests that search build their own app over a
+    /// tempdir vault.
+    fn app_with_settings(notes: &[(&str, &str)]) -> AppServices {
         let repo = Rc::new(RefCell::new(MemoryRepository::new()));
         for (path, text) in notes {
             repo.borrow_mut().insert(path, text);
         }
         let opener = Rc::new(RecordingOpener::succeeding());
-        (WindowsApp::new(repo.clone(), opener.clone()), repo, opener)
+        let settings = Rc::new(RefCell::new(MemorySettingsStore::default()));
+        let app = WindowsApp::new(
+            repo.clone(),
+            opener.clone(),
+            settings.clone(),
+            std::env::temp_dir(),
+        );
+        (app, repo, opener, settings)
     }
 
     /// Open `path` as a tab and give it a buffer with the given text over
@@ -423,6 +471,82 @@ mod tests {
     }
 
     #[test]
+    fn setting_the_default_pane_persists_the_snapshot_without_changing_the_pane() {
+        let (mut app, _repo, _opener, settings) = app_with_settings(&[("a.md", "a\n")]);
+        assert_eq!(app.shared.state.pane, PaneMode::Live);
+        assert_eq!(app.shared.state.default_pane, PaneMode::Live);
+        assert_eq!(settings.borrow().writes(), 0);
+
+        app.handle_native(WindowsMessage::Command(UiCommand::SetDefaultPane {
+            mode: PaneMode::Reading,
+        }));
+
+        // The snapshot moved and was persisted; the session pane did not.
+        assert_eq!(app.shared.state.default_pane, PaneMode::Reading);
+        assert_eq!(app.shared.state.pane, PaneMode::Live);
+        assert_eq!(settings.borrow().writes(), 1);
+        assert_eq!(settings.borrow().last().default_pane, PaneMode::Reading);
+        assert_eq!(app.shared.state.last_error, None);
+    }
+
+    #[test]
+    fn persisting_the_default_pane_keeps_fields_the_kernel_does_not_own() {
+        // A previous session stored a theme; the kernel only owns the
+        // pane snapshot, so its write must load-modify-store.
+        let repo = Rc::new(RefCell::new(MemoryRepository::new()));
+        let settings = Rc::new(RefCell::new(MemorySettingsStore::starting_with(
+            vault_app::settings::AppSettings {
+                theme: ThemeChoice::Dark,
+                ..vault_app::settings::AppSettings::default()
+            },
+        )));
+        let mut app = WindowsApp::new(
+            repo,
+            Rc::new(RecordingOpener::succeeding()),
+            settings.clone(),
+            std::env::temp_dir(),
+        );
+
+        app.handle_native(WindowsMessage::Command(UiCommand::SetDefaultPane {
+            mode: PaneMode::Split,
+        }));
+
+        assert_eq!(settings.borrow().last().default_pane, PaneMode::Split);
+        assert_eq!(
+            settings.borrow().last().theme,
+            ThemeChoice::Dark,
+            "the other persisted fields survive"
+        );
+    }
+
+    #[test]
+    fn the_search_effect_runs_the_shared_engine_and_feeds_the_session() {
+        // A real vault on disk: the shared engine scans .md notes only
+        // (the .txt decoy must not match), and hits carry the line.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.md"), "alpha\nneedle here\n").unwrap();
+        std::fs::write(dir.path().join("b.md"), "nothing to see\n").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "needle but not a note\n").unwrap();
+
+        let mut app = WindowsApp::new(
+            Rc::new(RefCell::new(MemoryRepository::new())),
+            Rc::new(RecordingOpener::succeeding()),
+            Rc::new(RefCell::new(MemorySettingsStore::default())),
+            dir.path(),
+        );
+        app.handle_native(WindowsMessage::Command(UiCommand::SearchVault {
+            query: "needle".into(),
+        }));
+
+        let hits = app.shared.state.search.hits();
+        assert_eq!(hits.len(), 1, "one .md hit; the .txt is out of scope");
+        assert_eq!(hits[0].path, "a.md");
+        assert_eq!(hits[0].line_no, 2);
+        assert_eq!(hits[0].line, "needle here");
+        assert_eq!(app.shared.state.last_error, None);
+    }
+
+    #[test]
     fn note_paths_lists_every_vault_note_sorted() {
         let (app, _repo, _opener) =
             app_with(&[("z.md", "z\n"), ("a.md", "a\n"), ("Notes/b.md", "b\n")]);
@@ -525,7 +649,8 @@ mod tests {
         let opener = Rc::new(RecordingOpener::failing(OpenError::NotFound {
             program: "xdg-open".into(),
         }));
-        let mut app = WindowsApp::new(repo, opener.clone());
+        let settings = Rc::new(RefCell::new(MemorySettingsStore::default()));
+        let mut app = WindowsApp::new(repo, opener.clone(), settings, std::env::temp_dir());
 
         app.handle_native(WindowsMessage::Command(UiCommand::OpenExternal {
             target: vault_platform::OpenTarget::File("/tmp/attachment.png".into()),

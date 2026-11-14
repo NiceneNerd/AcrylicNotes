@@ -11,6 +11,12 @@ vault-app = { path = "../../crates/vault-app" }
 vault-md = { path = "../../vault-md" }
 # Platform service contracts (ExternalOpener, etc.) consumed by the effect runner.
 vault-platform = { path = "../../crates/vault-platform" }
+# The shared vault-wide search engine (literal ripgrep over .md notes).
+vault-core = { path = "../../vault-core" }
+# Platform config directory resolution for the settings store (XDG / %APPDATA%).
+dirs = "6.0"
+# Settings document serialization (the JSON file store).
+serde_json = "1"
 
 # windows-reactor (WinUI 3) is pinned to an exact version and only pulled in
 # on Windows targets. This crate compiles to a skeleton on Linux/macOS so the
@@ -26,6 +32,9 @@ windows-reactor = { version = "=0.100.0" }
 # user-side.
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 windows-reactor = { version = "=0.100.0", features = ["test"] }
+
+[dev-dependencies]
+tempfile = "3.22"
 
 [[bin]]
 name = "app-windows"

@@ -58,6 +58,11 @@ impl App {
                 let id = self.effect_ids.allocate();
                 vec![Effect::new(id, EffectKind::SearchVault { request, query })]
             }
+            UiCommand::SetDefaultPane { mode } => {
+                self.state.default_pane = mode;
+                let id = self.effect_ids.allocate();
+                vec![Effect::new(id, EffectKind::PersistSettings)]
+            }
             UiCommand::OpenNote { path } => {
                 self.state.tabs.open_or_focus(&path);
                 Vec::new()
@@ -209,6 +214,27 @@ mod tests {
 
     fn tab_at(app: &App, position: usize) -> TabId {
         app.state.tabs.id_at(position).unwrap()
+    }
+
+    #[test]
+    fn setting_the_default_pane_updates_the_snapshot_and_emits_persist_settings() {
+        let mut app = App::new();
+        assert_eq!(app.state.pane, crate::settings::PaneMode::Live);
+        assert_eq!(app.state.default_pane, crate::settings::PaneMode::Live);
+
+        let effects = app.dispatch(UiCommand::SetDefaultPane {
+            mode: crate::settings::PaneMode::Reading,
+        });
+
+        // The snapshot moved; the rendered pane did not.
+        assert_eq!(app.state.default_pane, crate::settings::PaneMode::Reading);
+        assert_eq!(app.state.pane, crate::settings::PaneMode::Live);
+        // Exactly one persistence request for the runner.
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0].kind,
+            crate::effects::EffectKind::PersistSettings
+        ));
     }
 
     #[test]

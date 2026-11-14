@@ -18,6 +18,10 @@ pub struct AppState {
     pub tabs: Tabs,
     /// The pane layout currently rendered (not the startup default).
     pub pane: PaneMode,
+    /// The pane mode new sessions start in (the settings snapshot the
+    /// `PersistSettings` effect writes; changing it does not change the
+    /// currently rendered pane, mirroring the Linux shell's split).
+    pub default_pane: PaneMode,
     /// Whether the sidebar is shown. The default matches `AppSettings`.
     pub sidebar_open: bool,
     /// Which sidebar panel is active.
@@ -36,6 +40,7 @@ impl Default for AppState {
         Self {
             tabs: Tabs::new(),
             pane: PaneMode::default(),
+            default_pane: PaneMode::default(),
             sidebar_open: true,
             panel: NavSection::default(),
             search: SearchSession::default(),

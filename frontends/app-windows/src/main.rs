@@ -9,11 +9,14 @@
 //!
 //! which blocks until the application window closes.
 //!
-//! The live platform adapters (the vault repository and the external
-//! opener) are the p11 platform services and land on a real Windows
-//! machine; they do not exist yet, so this binary is a skeleton that
-//! exits with an explanatory message. Native execution and UI
-//! verification are user-side, never claimed via Wine.
+//! The live platform adapters (the vault repository, the external
+//! opener, and the settings store) are the p11 platform services and
+//! land on a real Windows machine; they do not exist yet, so this binary
+//! is a skeleton that exits with an explanatory message. The settings
+//! store's file-backed adapter already exists
+//! (`FileSettingsStore::in_config_dir`); the vault adapter must also
+//! supply the vault root the search engine scans. Native execution and
+//! UI verification are user-side, never claimed via Wine.
 //!
 //! On non-Windows targets this binary is a skeleton; the library code is
 //! compiled and unit-tested on every target.

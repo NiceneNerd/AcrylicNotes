@@ -63,6 +63,12 @@ pub enum UiCommand {
     /// scan and reports `AppEvent::SearchCompleted`).
     #[serde(rename = "search-vault")]
     SearchVault { query: String },
+    /// Change the pane mode new sessions start in (the settings
+    /// snapshot), emitting `EffectKind::PersistSettings`. Unlike
+    /// [`UiCommand::SetPaneMode`] this does not change the currently
+    /// rendered pane — the Linux shell's `SettingsDefaultPane` split.
+    #[serde(rename = "set-default-pane")]
+    SetDefaultPane { mode: crate::settings::PaneMode },
     /// Hand a URL or file to the platform's default handler
     /// (`EffectKind::OpenExternal`, reported via `AppEvent::Open…`).
     #[serde(rename = "open-external")]

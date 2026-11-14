@@ -72,7 +72,7 @@ machine and is never claimed via Wine.
 | ID | Piece | Status |
 | --- | --- | --- |
 | APPWIN-001 | Kernel wiring (`WindowsApp` over the shared `App`) | Done, Linux-tested |
-| APPWIN-002 | Effect execution against injected services (saves/reloads/external opens) | Done, Linux-tested; p11 services for settings + vault-wide search |
+| APPWIN-002 | Effect execution against injected services (saves/reloads/external opens/settings persistence/vault search) | Done, Linux-tested: settings persist through the `SettingsStore` service (kernel `SetDefaultPane` -> `PersistSettings`; file adapter in `settings_store.rs`) and the vault-wide search runs the shared engine (`vault_core::search`, 200-hit cap) feeding `SearchCompleted` |
 | APPWIN-003 | Message envelope + window-close flush (`UiCommand::SaveTabs`) | Done, Linux-tested |
 | APPWIN-004 | File tree view over kernel `tree` + `TreeState` | Done, Linux-tested; rows render headlessly (`tests/ui_headless.rs`) |
 | APPWIN-005 | Source editor caret/find math via `vault_app::editor` | Done, Linux-tested |
