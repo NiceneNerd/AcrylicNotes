@@ -8,6 +8,8 @@ pub mod file_tree;
 pub mod reading;
 // Imports windows-reactor (target-gated): compiles only on Windows targets.
 #[cfg(target_os = "windows")]
+pub mod reading_view;
+#[cfg(target_os = "windows")]
 pub mod shell;
 pub mod source_mode;
 pub mod windows_effect_runner;
