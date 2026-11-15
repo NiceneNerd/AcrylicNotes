@@ -42,6 +42,16 @@ pub enum NativeEvent {
     /// clearing a tag never touches the vault, so it stays out of the
     /// kernel (the same split the file tree's expansion state uses).
     TagToggled { tag: String },
+    /// A file-tree folder row was clicked. Shell-local view state: the
+    /// native TreeView raises no expansion events, so the shell's
+    /// `FileTree` stays the authority and a row click toggles the
+    /// folder's expansion directly (the chevron still works natively
+    /// until the next re-render).
+    FolderToggled { path: String },
+    /// A native event with no shell reaction. The TreeView can only
+    /// report labels this shell rendered; an unknown label (never
+    /// expected) lands here instead of mis-routing to a wrong note.
+    Noop,
 }
 
 #[cfg(test)]
@@ -59,6 +69,10 @@ mod tests {
             WindowsMessage::Native(NativeEvent::TagToggled {
                 tag: "work".to_string(),
             }),
+            WindowsMessage::Native(NativeEvent::FolderToggled {
+                path: "notes".to_string(),
+            }),
+            WindowsMessage::Native(NativeEvent::Noop),
         ];
         // A smoke pass over the variants; behavior lives in app.rs tests.
         assert!(matches!(messages[0], WindowsMessage::Command(_)));

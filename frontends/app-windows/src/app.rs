@@ -292,9 +292,12 @@ impl WindowsApp {
                 self.run_effects(effects);
             }
             NativeEvent::EditorEdited { text } => self.set_active_buffer_text(text),
-            // Tag toggles never reach the kernel host: the shell handles
-            // them in its own update (shell-local view state).
+            // Tag toggles and folder toggles never reach the kernel host:
+            // the shell handles them in its own update (shell-local view
+            // state — the tag drill-down and the tree's expansion state).
             NativeEvent::TagToggled { .. } => {}
+            NativeEvent::FolderToggled { .. } => {}
+            NativeEvent::Noop => {}
         }
     }
 

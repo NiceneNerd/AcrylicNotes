@@ -809,13 +809,14 @@ fn headless_shell_invoke_note_row_opens_it() {
     let revision = pump
         .event_revision(tree_view, EventId::TreeViewItemInvoked)
         .expect("item-invoked event active");
-    // The user invokes the "notes/b.md" row: the control echoes its key
-    // (the vault path) as `TreeViewItemInvoked`.
+    // The user invokes the "notes/b.md" row: the control echoes the row's
+    // label (its Content), not its key. "b.md" is unique in this vault, so
+    // the label is the bare name and the shell maps it back to the path.
     pump.queue_event(QueuedEvent::new(
         tree_view,
         EventId::TreeViewItemInvoked,
         revision,
-        EventPayload::Str(String::from("notes/b.md")),
+        EventPayload::Str(String::from("b.md")),
     ));
     pump.dispatch_events().expect("dispatch events");
     pump.dispatch_components(10).expect("dispatch components");
@@ -824,6 +825,104 @@ fn headless_shell_invoke_note_row_opens_it() {
         app.borrow().shared.state.tabs.active_path(),
         Some("notes/b.md"),
         "invoking a note row opens it"
+    );
+}
+
+#[test]
+fn headless_shell_tree_duplicate_basenames_open_the_exact_note() {
+    // Two notes share the basename "b.md". The native TreeView echoes the
+    // row's label, so the shell labels each row with its full path;
+    // invoking one must open that exact note, not a proximity-ranked
+    // basename match.
+    let app = shell_app_with(&[
+        ("notes/b.md", "b in notes\n"),
+        ("archive/b.md", "b in archive\n"),
+    ]);
+    // An active note inside notes/ would win the old proximity ranking —
+    // exactly the trap exact-path routing removes.
+    shell_open_tab(&app, "notes/b.md", "b in notes\n", "b in notes\n");
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let tree_view = {
+        let rt = pump.runtime();
+        find_tree_view(rt, window).expect("tree view recorded")
+    };
+    // Both rows are labeled with their full paths (the shared basename is
+    // ambiguous, so neither row keeps the bare name).
+    {
+        let rt = pump.runtime();
+        let debug = format!("{:?}", rt.tree_nodes(tree_view).expect("tree nodes"));
+        assert!(
+            debug.contains("text: \"notes/b.md\""),
+            "the notes row is labeled with its path: {debug}"
+        );
+        assert!(
+            debug.contains("text: \"archive/b.md\""),
+            "the archive row is labeled with its path: {debug}"
+        );
+    }
+    let revision = pump
+        .event_revision(tree_view, EventId::TreeViewItemInvoked)
+        .expect("item-invoked event active");
+    pump.queue_event(QueuedEvent::new(
+        tree_view,
+        EventId::TreeViewItemInvoked,
+        revision,
+        EventPayload::Str(String::from("archive/b.md")),
+    ));
+    pump.dispatch_events().expect("dispatch events");
+    pump.dispatch_components(10).expect("dispatch components");
+    assert_eq!(
+        app.borrow().shared.state.tabs.active_path(),
+        Some("archive/b.md"),
+        "the exact clicked note opens despite the shared basename"
+    );
+}
+
+#[test]
+fn headless_shell_tree_folder_click_toggles_expansion_without_opening_a_tab() {
+    // Invoking a folder row used to dispatch OpenNote with the folder's
+    // name, opening a bogus tab. It must only toggle the tree expansion.
+    let app = shell_app_with(&[("notes/b.md", "b\n"), ("a.md", "a\n")]);
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let tree_view = {
+        let rt = pump.runtime();
+        find_tree_view(rt, window).expect("tree view recorded")
+    };
+    // Folders start collapsed (kernel default).
+    {
+        let rt = pump.runtime();
+        let debug = format!("{:?}", rt.tree_nodes(tree_view).expect("tree nodes"));
+        assert!(
+            !debug.contains("expanded: true"),
+            "folders start collapsed: {debug}"
+        );
+    }
+    let revision = pump
+        .event_revision(tree_view, EventId::TreeViewItemInvoked)
+        .expect("item-invoked event active");
+    pump.queue_event(QueuedEvent::new(
+        tree_view,
+        EventId::TreeViewItemInvoked,
+        revision,
+        EventPayload::Str(String::from("notes")),
+    ));
+    pump.dispatch_events().expect("dispatch events");
+    pump.dispatch_components(10).expect("dispatch components");
+    // No tab opened; the folder is now expanded.
+    assert!(
+        app.borrow().shared.state.tabs.order().is_empty(),
+        "a folder click must not open a tab"
+    );
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    let tree_view = find_tree_view(rt, window).expect("tree view after toggle");
+    let debug = format!("{:?}", rt.tree_nodes(tree_view).expect("tree nodes"));
+    assert!(
+        debug.contains("expanded: true"),
+        "the folder expanded: {debug}"
     );
 }
 

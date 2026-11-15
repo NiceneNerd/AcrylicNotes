@@ -13,6 +13,7 @@
 //! recorded events and the reconciled tree is asserted.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use windows_reactor::{
@@ -103,6 +104,14 @@ impl Component for Shell {
     }
 
     fn update(&mut self, message: Self::Message, _context: &ComponentContext<Self>) {
+        // Folder rows toggle expansion in the shell's own tree state (the
+        // native TreeView raises no expansion events, so the FileTree stays
+        // the authority — the same shell-local split the tag drill-down
+        // uses). Clicking a folder row must never open a note.
+        if let WindowsMessage::Native(NativeEvent::FolderToggled { path }) = &message {
+            self.file_tree.toggle_folder(path);
+            return;
+        }
         // Tag drill-down is shell-local view state (never touches the
         // vault): selecting a tag shows its notes, clicking the selected
         // tag again clears the filter — the filter stays out of the
@@ -173,16 +182,28 @@ impl Component for Shell {
         context.window_title("VaultNotes");
 
         // File-tree sidebar: one TreeView node per vault folder/note,
-        // keyed by vault path. Invoking a note row asks the kernel to
-        // open it (`UiCommand::OpenNote`); expansion state lives in
-        // `FileTree`'s `TreeState` and persists across renders.
+        // keyed by vault path. The native control reports the invoked
+        // row's label (its content string), not its key, so
+        // `build_tree_nodes` also returns a label→row map: a note label
+        // routes to `OpenNote` with its exact path, a folder label toggles
+        // the row's expansion (shell-local state), and expansion flags
+        // persist in `FileTree`'s `TreeState` across renders.
+        let (tree_nodes, tree_targets) = build_tree_nodes(&self.file_tree);
         let tree_view = TreeView::new()
             .selection_mode(TreeViewSelectionMode::Single)
-            .on_item_invoked(
-                context
-                    .callback(|path: String| WindowsMessage::Command(UiCommand::OpenNote { path })),
-            )
-            .nodes(build_tree_nodes(&self.file_tree));
+            .on_item_invoked(context.callback(
+                move |label: String| match tree_targets.get(&label) {
+                    Some(TreeRowTarget::Note(path)) => {
+                        WindowsMessage::Command(UiCommand::OpenNote { path: path.clone() })
+                    }
+                    Some(TreeRowTarget::Folder(path)) => {
+                        WindowsMessage::Native(NativeEvent::FolderToggled { path: path.clone() })
+                    }
+                    None => WindowsMessage::Native(NativeEvent::Noop),
+                },
+            ))
+            .grid_row(1)
+            .nodes(tree_nodes);
 
         // Sidebar navigation (kernel-owned via `state.panel`): one
         // button per section, the active one bracketed. Tags and links
@@ -208,6 +229,7 @@ impl Component for Shell {
             })
             .collect();
         let nav_row = StackPanel::new()
+            .grid_row(0)
             .orientation(Orientation::Horizontal)
             .keyed_children(nav_buttons);
 
@@ -393,16 +415,21 @@ impl Component for Shell {
             })
             .unwrap_or_else(|| View::from(TextBlock::new().text("(no note open)")));
 
-        // The active panel. Files is the default.
-        let sidebar_panel = match state.panel {
+        // The active panel. Files is the default. Only the tree scrolls
+        // itself (the native TreeView owns its viewport); the other panels
+        // need an explicit ScrollViewer. Every panel sits in a Star grid
+        // row so it gets a bounded height — a StackPanel would hand its
+        // children infinite height and nothing would ever scroll.
+        let sidebar_panel: View = match state.panel {
             NavSection::Files => tree_view,
-            NavSection::Search => search_panel,
-            NavSection::Tags => tags_panel,
-            NavSection::Links => links_panel,
-            NavSection::Outline => outline_panel,
+            NavSection::Search => ScrollViewer::new().grid_row(1).content(search_panel),
+            NavSection::Tags => ScrollViewer::new().grid_row(1).content(tags_panel),
+            NavSection::Links => ScrollViewer::new().grid_row(1).content(links_panel),
+            NavSection::Outline => ScrollViewer::new().grid_row(1).content(outline_panel),
         };
-        let sidebar = StackPanel::new()
-            .orientation(Orientation::Vertical)
+        let sidebar = Grid::new()
+            .rows([GridLength::Auto, GridLength::STAR])
+            .columns([GridLength::STAR])
             .keyed_children([
                 KeyedView::new("nav-row", nav_row),
                 KeyedView::new("sidebar-panel", sidebar_panel),
@@ -614,36 +641,49 @@ impl Component for Shell {
             })
             .unwrap_or_else(|| View::from(TextBlock::new().text("(no note open)")));
 
-        // Note area: everything that renders inside the SplitView's content
-        // pane — the tab strip, the editor/reading view, and (in a later
-        // slice) the status bar. The save button, the pane-mode switcher,
-        // and the appearance row have moved into the title bar's toolbar.
-        let mut note_area: Vec<KeyedView> = Vec::new();
-        note_area.push(KeyedView::new(
-            "tab-bar",
-            StackPanel::new()
-                .orientation(Orientation::Vertical)
-                .keyed_children(tabs),
-        ));
-        if show_source {
-            note_area.push(KeyedView::new(
-                "editor",
-                ScrollViewer::new()
-                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                    .content(source_editor),
-            ));
-        }
-        if show_reading {
-            note_area.push(KeyedView::new(
-                "reading-view",
-                ScrollViewer::new()
-                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                    .content(reading_area),
-            ));
-        }
-        let note_area = StackPanel::new()
+        // Note area: the tab strip on top, the pane body filling the rest.
+        // The body sits in a Star grid row so the ScrollViewers get a
+        // bounded viewport — a StackPanel would hand them infinite height
+        // and nothing would ever scroll. Split shows both panes side by
+        // side (Linux's fixed 50/50, no divider).
+        let tab_bar = StackPanel::new()
+            .grid_row(0)
             .orientation(Orientation::Vertical)
-            .keyed_children(note_area);
+            .keyed_children(tabs);
+        let pane_body: View = if show_source && show_reading {
+            let editor = ScrollViewer::new()
+                .grid_column(0)
+                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                .content(source_editor);
+            let reading = ScrollViewer::new()
+                .grid_column(1)
+                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                .content(reading_area);
+            Grid::new()
+                .grid_row(1)
+                .columns([GridLength::STAR, GridLength::STAR])
+                .keyed_children([
+                    KeyedView::new("editor", editor),
+                    KeyedView::new("reading-view", reading),
+                ])
+        } else if show_source {
+            ScrollViewer::new()
+                .grid_row(1)
+                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                .content(source_editor)
+        } else {
+            ScrollViewer::new()
+                .grid_row(1)
+                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                .content(reading_area)
+        };
+        let note_area = Grid::new()
+            .rows([GridLength::Auto, GridLength::STAR])
+            .columns([GridLength::STAR])
+            .keyed_children([
+                KeyedView::new("tab-bar", tab_bar),
+                KeyedView::new("pane-body", pane_body),
+            ]);
 
         // Toolbar row hosted in the title bar's Content slot: save, the
         // pane-mode switcher, and the appearance controls. Icon-only in the
@@ -719,24 +759,101 @@ impl Component for Shell {
     }
 }
 
+/// What invoking a file-tree row means. The native TreeView reports the
+/// invoked row's label (its content string), not its key, so the shell
+/// maps each label back to the row it rendered. Labels are made unique
+/// up front, which keeps the mapping exact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TreeRowTarget {
+    /// Open this note (its exact vault-relative path).
+    Note(String),
+    /// Toggle the folder's expansion (shell-local tree state).
+    Folder(String),
+}
+
 /// Convert the kernel tree (folders + notes, expansion state from
-/// `TreeState`) into the hierarchy the native TreeView renders. Folder
-/// and note keys are their vault paths; invoking a note row reports its
-/// path to `on_item_invoked`.
-fn build_tree_nodes(tree: &FileTree) -> Vec<TreeNode> {
-    fn convert(node: &kernel_tree::TreeNode, tree: &FileTree) -> TreeNode {
+/// `TreeState`) into the hierarchy the native TreeView renders, plus the
+/// label→row map `on_item_invoked` routes through.
+///
+/// A row's label must identify it exactly: a name that appears once in
+/// the vault stays bare, while a shared name is shown as its full
+/// vault-relative path. Paths cannot collide with single-segment names
+/// (a filename never contains a separator) and are unique among
+/// themselves, so the resulting labels are all distinct.
+fn build_tree_nodes(tree: &FileTree) -> (Vec<TreeNode>, Rc<HashMap<String, TreeRowTarget>>) {
+    /// Collect every row as (path, name, is-folder), depth-first.
+    fn flatten(node: &kernel_tree::TreeNode, rows: &mut Vec<(String, String, bool)>) {
         match node {
             kernel_tree::TreeNode::Folder {
                 name,
                 path,
                 children,
-            } => TreeNode::new(path.as_str(), name.as_str())
-                .expanded(tree.state.is_expanded(path))
-                .children(children.iter().map(|child| convert(child, tree))),
+            } => {
+                rows.push((path.clone(), name.clone(), true));
+                for child in children {
+                    flatten(child, rows);
+                }
+            }
             kernel_tree::TreeNode::Note { name, path } => {
-                TreeNode::new(path.as_str(), name.as_str())
+                rows.push((path.clone(), name.clone(), false));
             }
         }
     }
-    tree.nodes.iter().map(|node| convert(node, tree)).collect()
+
+    let mut rows: Vec<(String, String, bool)> = Vec::new();
+    for node in &tree.nodes {
+        flatten(node, &mut rows);
+    }
+    // A name shared by two or more rows is ambiguous on its own.
+    let mut name_counts: HashMap<&str, usize> = HashMap::new();
+    for (_, name, _) in &rows {
+        *name_counts.entry(name.as_str()).or_default() += 1;
+    }
+    // path → label: the bare name when unique, the full path when shared.
+    let labels: HashMap<String, String> = rows
+        .iter()
+        .map(|(path, name, _)| {
+            let label = if name_counts[name.as_str()] == 1 {
+                name.clone()
+            } else {
+                path.clone()
+            };
+            (path.clone(), label)
+        })
+        .collect();
+    let targets: HashMap<String, TreeRowTarget> = rows
+        .iter()
+        .map(|(path, _, is_folder)| {
+            let target = if *is_folder {
+                TreeRowTarget::Folder(path.clone())
+            } else {
+                TreeRowTarget::Note(path.clone())
+            };
+            (labels[path].clone(), target)
+        })
+        .collect();
+
+    fn convert(
+        node: &kernel_tree::TreeNode,
+        tree: &FileTree,
+        labels: &HashMap<String, String>,
+    ) -> TreeNode {
+        match node {
+            kernel_tree::TreeNode::Folder { path, children, .. } => {
+                TreeNode::new(path.as_str(), labels[path].as_str())
+                    .expanded(tree.state.is_expanded(path))
+                    .children(children.iter().map(|child| convert(child, tree, labels)))
+            }
+            kernel_tree::TreeNode::Note { path, .. } => {
+                TreeNode::new(path.as_str(), labels[path].as_str())
+            }
+        }
+    }
+
+    let nodes = tree
+        .nodes
+        .iter()
+        .map(|node| convert(node, tree, &labels))
+        .collect();
+    (nodes, Rc::new(targets))
 }
