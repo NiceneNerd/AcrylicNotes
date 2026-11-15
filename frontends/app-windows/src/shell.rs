@@ -17,12 +17,12 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use windows_reactor::{
-    Button, ChildrenControl, Component, ComponentContext, ContentControl, Grid, GridChildExt,
-    GridLength, HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, Orientation,
+    Brush, Button, ChildrenControl, Component, ComponentContext, ContentControl, Grid,
+    GridChildExt, GridLength, HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, Orientation,
     ScrollBarVisibility, ScrollViewer, SlotView, SlotsControl, SplitView, SplitViewDisplayMode,
-    SplitViewSlot, StackPanel, TextBlock, TextBox, TitleBar, TitleBarSlot, TreeNode, TreeView,
-    TreeViewExt, TreeViewSelectionMode, View, ViewContext, WindowBackdrop, WindowTheme,
-    WindowTitleBarHeight, WindowVisuals,
+    SplitViewSlot, StackPanel, TextBlock, TextBox, TextWrapping, ThemeBrush, TitleBar,
+    TitleBarSlot, TreeNode, TreeView, TreeViewExt, TreeViewSelectionMode, View, ViewContext,
+    WindowBackdrop, WindowTheme, WindowTitleBarHeight, WindowVisuals,
 };
 
 use vault_app::commands::UiCommand;
@@ -574,6 +574,8 @@ impl Component for Shell {
             *self.rendered_editor.borrow_mut() = editor_text.clone();
         }
         let source_editor = TextBox::new()
+            .accepts_return(true)
+            .text_wrapping(TextWrapping::Wrap)
             .on_text_changed(context.callback(|text: String| {
                 WindowsMessage::Native(NativeEvent::EditorEdited { text })
             }))
@@ -677,7 +679,18 @@ impl Component for Shell {
                 .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                 .content(reading_area)
         };
+        // Surface follows the app theme (Dark/Light/System), not the OS
+        // theme — `RequestedTheme` only reaches text colors in this
+        // toolkit version, so the chrome could look right while the note
+        // area stayed white-on-light-OS or black-on-dark-OS.
+        let note_area_bg = if state.glass_enabled {
+            // Glass covers the backdrop; keep the surface translucent.
+            Brush::Theme(ThemeBrush::CardBackground)
+        } else {
+            Brush::Theme(ThemeBrush::SolidBackground)
+        };
         let note_area = Grid::new()
+            .background(note_area_bg)
             .rows([GridLength::Auto, GridLength::STAR])
             .columns([GridLength::STAR])
             .keyed_children([
