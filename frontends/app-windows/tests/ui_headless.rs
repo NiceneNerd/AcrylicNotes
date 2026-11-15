@@ -328,6 +328,19 @@ fn child_ids(rt: &RecordingRuntime, node: NodeId) -> Vec<NodeId> {
     out
 }
 
+/// The immediate parent of `target` in the recorded tree, or `None`.
+fn find_parent_of(rt: &RecordingRuntime, from: NodeId, target: NodeId) -> Option<NodeId> {
+    for child in child_ids(rt, from) {
+        if child == target {
+            return Some(from);
+        }
+        if let Some(found) = find_parent_of(rt, child, target) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Find the node owning the TextBlock child whose text is exactly
 /// `label` (a button's content label makes its owner the button node).
 fn find_owner_of_label(rt: &RecordingRuntime, from: NodeId, label: &str) -> Option<NodeId> {
@@ -1075,10 +1088,11 @@ fn headless_shell_pane_source_shows_the_editor_only() {
 }
 
 #[test]
-fn headless_shell_source_editor_stretches_to_fill_viewport() {
-    // The source TextBox must stretch vertically to fill the ScrollViewer's
-    // viewport on first render, otherwise multi-line content shows only one
-    // line until a tab switch forces remeasure.
+fn headless_shell_source_editor_fills_its_grid_cell() {
+    // The source TextBox must sit directly in the bounded STAR grid cell and
+    // stretch to fill it. Wrapping it in a ScrollViewer made the ScrollViewer
+    // size to the TextBox's one-line desired height on the first pass, which
+    // clipped multi-line notes until a tab switch forced a remeasure.
     let app = shell_app_with(&[("a.md", "line one\nline two\nline three\n")]);
     shell_open_tab(
         &app,
@@ -1111,7 +1125,17 @@ fn headless_shell_source_editor_stretches_to_fill_viewport() {
         Some(&PropertyValue::VerticalAlignment(
             VerticalAlignment::Stretch
         )),
-        "the source TextBox stretches to fill the ScrollViewer viewport"
+        "the source TextBox stretches to fill its grid cell"
+    );
+    // Its parent must be the pane grid, not a ScrollViewer: a ScrollViewer
+    // records a scroll-bar-visibility property, the grid does not.
+    let parent = find_parent_of(rt, window, editor).expect("editor has a parent");
+    assert!(
+        rt.node(parent)
+            .unwrap()
+            .property(PropertyId::ScrollViewerVerticalScrollBarVisibility)
+            .is_none(),
+        "the source TextBox sits directly in the grid cell, not inside a ScrollViewer"
     );
 }
 

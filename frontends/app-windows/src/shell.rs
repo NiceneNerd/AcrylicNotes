@@ -714,11 +714,17 @@ impl Component for Shell {
                     .spacing(2.0)
                     .keyed_children(tabs),
             );
+        // The source editor is a multiline TextBox that scrolls internally,
+        // so it goes straight into the bounded STAR grid cell. Wrapping it
+        // in a ScrollViewer was wrong: a vertical ScrollViewer measures its
+        // content with infinite height, so the TextBox kept its one-line
+        // desired height on the first pass (and `VerticalAlignment::Stretch`
+        // could not apply), clipping multi-line notes until a tab switch
+        // forced a remeasure. As a direct grid child the row gives it a
+        // bounded height and Stretch fills it immediately. The reading view
+        // keeps its ScrollViewer — its element tree has no internal scroller.
         let pane_body: View = if show_source && show_reading {
-            let editor = ScrollViewer::new()
-                .grid_column(0)
-                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                .content(source_editor);
+            let editor = View::from(source_editor.grid_column(0));
             let reading = ScrollViewer::new()
                 .grid_column(1)
                 .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
@@ -731,10 +737,7 @@ impl Component for Shell {
                     KeyedView::new("reading-view", reading),
                 ])
         } else if show_source {
-            ScrollViewer::new()
-                .grid_row(1)
-                .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                .content(source_editor)
+            View::from(source_editor.grid_row(1))
         } else {
             ScrollViewer::new()
                 .grid_row(1)
