@@ -1147,6 +1147,36 @@ fn headless_shell_pane_split_shows_source_and_reading() {
 }
 
 #[test]
+fn headless_shell_pane_split_then_source_reseeds_full_text() {
+    // Switching Split -> Source recreates the native TextBox; the seed flag
+    // must reset and re-render the full buffer (no first-line truncation).
+    let app = shell_app_with(&[("a.md", "line one\nline two\nline three\n")]);
+    shell_open_tab(
+        &app,
+        "a.md",
+        "line one\nline two\nline three\n",
+        "line one\nline two\nline three\n",
+    );
+
+    let mut pump = mounted_shell(&app);
+    switch_pane(&mut pump, "split");
+    switch_pane(&mut pump, "source");
+
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(
+        find_node_with_property_text(
+            rt,
+            window,
+            PropertyId::TextBoxText,
+            "line one\nline two\nline three\n"
+        )
+        .is_some(),
+        "the recreated source TextBox shows the full buffer"
+    );
+}
+
+#[test]
 fn headless_shell_pane_source_shows_the_editor_only() {
     let app = shell_app_with(&[("a.md", "# Title\n\nbody text\n")]);
     shell_open_tab(

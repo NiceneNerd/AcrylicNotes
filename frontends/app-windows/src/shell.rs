@@ -165,6 +165,12 @@ pub struct Shell {
     /// is still `false`. We render empty text on the first pass, let
     /// `AcceptsReturn`/`Wrap` apply, then re-render with the full text.
     source_text_seeded: Cell<bool>,
+    /// The pane mode last rendered with a source TextBox. Switching into a
+    /// source-bearing mode (Split/Source) from a different mode recreates the
+    /// native control, so the seed flag must reset and re-seed; otherwise a
+    /// fresh TextBox receives full text while `AcceptsReturn` is still false
+    /// and WinUI truncates it to the first line.
+    last_pane: Cell<Option<PaneMode>>,
     /// The vault's file tree: kernel `TreeNode`s plus `TreeState`
     /// (expansion/selection). Built once from the vault's note paths;
     /// expansion state persists across renders here.
@@ -199,6 +205,7 @@ impl Component for Shell {
             selected_tag: None,
             restore_split: false,
             image_cache: Rc::new(RefCell::new(HashMap::new())),
+            last_pane: Cell::new(None),
         }
     }
 
@@ -757,6 +764,13 @@ impl Component for Shell {
         if !show_source {
             self.source_text_seeded.set(false);
         }
+        // Entering a source-bearing mode from a different pane recreates the
+        // native TextBox, so it needs a fresh seed pass: full text on a fresh
+        // control would be truncated while `AcceptsReturn` is still false.
+        if show_source && self.last_pane.get() != Some(state.pane) {
+            self.source_text_seeded.set(false);
+        }
+        self.last_pane.set(Some(state.pane));
         // windows-reactor applies `TextBoxText` before `TextBoxAcceptsReturn`
         // (fixed enum order, not builder-call order), so on the very first
         // render multiline text is truncated to one line while
@@ -798,10 +812,15 @@ impl Component for Shell {
         // path. Remote URLs and paths escaping the root keep the text
         // placeholder. The cache is shared across renders.
         let vault_root = self.handle.0.borrow().runner.root().to_path_buf();
+        // The active note's folder, splitting on either path separator so
+        // Windows backslash paths resolve images relative to the note too.
         let note_folder = state
             .tabs
             .active_path()
-            .and_then(|path| path.rsplit_once('/').map(|(folder, _)| folder.to_string()))
+            .and_then(|path| {
+                path.rsplit_once(['/', '\\'])
+                    .map(|(folder, _)| folder.to_string())
+            })
             .unwrap_or_default();
         let image_resolver: ImageResolver = {
             let cache = self.image_cache.clone();
@@ -1146,6 +1165,8 @@ fn build_tree_nodes(tree: &FileTree) -> (Vec<TreeNode>, Rc<HashMap<String, TreeR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use tempfile::tempdir;
 
     #[test]
     fn narrow_fold_collapses_split_and_restores_it_when_wide() {
@@ -1181,6 +1202,63 @@ mod tests {
         assert_eq!(
             narrow_fold(PaneMode::Live, NARROW_WINDOW_WIDTH + 1.0, &mut restore),
             None
+        );
+    }
+
+    #[test]
+    fn resolve_local_image_finds_image_at_vault_root() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("photo.png"), b"PNG").expect("write image");
+        let cache = Rc::new(RefCell::new(HashMap::new()));
+        assert!(resolve_local_image(dir.path(), "", &cache, "photo.png").is_some());
+    }
+
+    #[test]
+    fn resolve_local_image_finds_image_in_note_folder() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("notes")).expect("create notes");
+        std::fs::write(dir.path().join("notes").join("img.png"), b"PNG").expect("write image");
+        let cache = Rc::new(RefCell::new(HashMap::new()));
+        assert!(
+            resolve_local_image(dir.path(), "notes", &cache, "img.png").is_some(),
+            "image next to the active note resolves"
+        );
+    }
+
+    #[test]
+    fn resolve_local_image_handles_backslash_note_folder() {
+        // Windows-style paths use backslashes; the folder lookup splits on
+        // either separator so images beside a note still resolve.
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("notes")).expect("create notes");
+        std::fs::write(dir.path().join("notes").join("img.png"), b"PNG").expect("write image");
+        let cache = Rc::new(RefCell::new(HashMap::new()));
+        assert!(
+            resolve_local_image(dir.path(), "notes\\", &cache, "img.png").is_some(),
+            "backslash note folder still resolves the image"
+        );
+    }
+
+    #[test]
+    fn resolve_local_image_rejects_remote_nonraster_and_escape() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("diagram.svg"), b"svg").expect("write svg");
+        let cache = Rc::new(RefCell::new(HashMap::new()));
+        assert!(
+            resolve_local_image(dir.path(), "", &cache, "https://example.com/x.png").is_none(),
+            "remote url is a placeholder"
+        );
+        assert!(
+            resolve_local_image(dir.path(), "", &cache, "diagram.svg").is_none(),
+            "non-raster is a placeholder"
+        );
+        assert!(
+            resolve_local_image(dir.path(), "", &cache, "../escape.png").is_none(),
+            "path escaping the vault root is a placeholder"
+        );
+        assert!(
+            resolve_local_image(dir.path(), "", &cache, "missing.png").is_none(),
+            "missing file is a placeholder"
         );
     }
 }
