@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use vault_app::markdown::plain_inlines;
 use vault_md::{Block, Doc, Inline};
 use windows_reactor::{
-    Border, Callback, ChildrenControl, ContentControl, FontWeight, HyperlinkButton, KeyedView,
-    Orientation, StackPanel, TextBlock, View,
+    Border, Callback, ChildrenControl, ContentControl, FontWeight, HyperlinkButton, Image,
+    KeyedView, LayoutControl, Orientation, StackPanel, Stretch, TextBlock, View,
 };
 
 use super::reading::WindowsMarkdownRenderer;
@@ -425,15 +425,52 @@ fn inline_view_with_style(
                 None => View::from(styled_text(format!("^{r}"), size, font_weight)),
             }
         }
-        Inline::Image { alt, .. } => {
-            let label = if config.show_images {
-                format!("[img: {alt}]")
-            } else {
-                format!("[img hidden: {alt}]")
-            };
-            View::from(styled_text(label, size, font_weight))
+        Inline::Image { url, alt } => {
+            // A local vault raster renders inline (the shell installs the
+            // resolver); remote URLs and unreadable targets keep the text
+            // placeholder, the same contract the Linux shell follows.
+            match config
+                .show_images
+                .then_some(config.image_resolver.as_ref())
+                .flatten()
+            {
+                Some(resolve) => match resolve(url) {
+                    Some(image) => View::from(
+                        Image::new()
+                            .source_data(image)
+                            .stretch(Stretch::Uniform)
+                            .max_width(600.0),
+                    ),
+                    None => View::from(styled_text(format!("[img: {alt}]"), size, font_weight)),
+                },
+                None => {
+                    let label = if config.show_images {
+                        format!("[img: {alt}]")
+                    } else {
+                        format!("[img hidden: {alt}]")
+                    };
+                    View::from(styled_text(label, size, font_weight))
+                }
+            }
         }
-        Inline::Embed(_) => View::from(styled_text(String::from("(embed)"), size, font_weight)),
+        Inline::Embed(embed) => {
+            // `![[image.png]]` transcludes a local image when it resolves;
+            // everything else (note embeds, unresolvable targets) stays the
+            // placeholder until transclusion renders real note bodies.
+            if config.show_images {
+                if let Some(resolve) = config.image_resolver.as_ref() {
+                    if let Some(image) = resolve(&embed.target.note) {
+                        return View::from(
+                            Image::new()
+                                .source_data(image)
+                                .stretch(Stretch::Uniform)
+                                .max_width(600.0),
+                        );
+                    }
+                }
+            }
+            View::from(styled_text(String::from("(embed)"), size, font_weight))
+        }
         Inline::InlineFootnote(children) => {
             View::from(styled_text(plain_inlines(children), size, font_weight))
         }

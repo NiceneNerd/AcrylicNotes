@@ -18,12 +18,13 @@ use std::rc::Rc;
 
 use windows_reactor::{
     AutomationExt, Border, Brush, Button, ChildrenControl, Component, ComponentContext,
-    ContentControl, CornerRadius, FontWeight, Grid, GridChildExt, GridLength, HorizontalAlignment,
-    HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, LayoutControl, Orientation,
-    ScrollBarVisibility, ScrollViewer, SlotView, SlotsControl, SplitView, SplitViewDisplayMode,
-    SplitViewSlot, StackPanel, TextBlock, TextBox, TextWrapping, ThemeBrush, Thickness, TitleBar,
-    TitleBarSlot, TreeNode, TreeView, TreeViewExt, TreeViewSelectionMode, VerticalAlignment, View,
-    ViewContext, WindowBackdrop, WindowSize, WindowTheme, WindowTitleBarHeight, WindowVisuals,
+    ContentControl, CornerRadius, EncodedImage, FontWeight, Grid, GridChildExt, GridLength,
+    HorizontalAlignment, HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, LayoutControl,
+    Orientation, ScrollBarVisibility, ScrollViewer, SlotView, SlotsControl, SplitView,
+    SplitViewDisplayMode, SplitViewSlot, StackPanel, TextBlock, TextBox, TextWrapping, ThemeBrush,
+    Thickness, TitleBar, TitleBarSlot, TreeNode, TreeView, TreeViewExt, TreeViewSelectionMode,
+    VerticalAlignment, View, ViewContext, WindowBackdrop, WindowSize, WindowTheme,
+    WindowTitleBarHeight, WindowVisuals,
 };
 
 use vault_app::commands::UiCommand;
@@ -35,7 +36,7 @@ use vault_platform::OpenTarget;
 
 use crate::app::WindowsApp;
 use crate::file_tree::FileTree;
-use crate::reading::WindowsMarkdownRenderer;
+use crate::reading::{ImageResolver, WindowsMarkdownRenderer};
 use crate::reading_view::{doc_view, LinkNav};
 use crate::windows_message::{NativeEvent, WindowsMessage};
 
@@ -87,6 +88,61 @@ fn narrow_fold(current: PaneMode, width: f64, restore_split: &mut bool) -> Optio
     }
 }
 
+/// Raster extensions the reading view will decode. Anything else (SVG,
+/// PDF, remote URLs) keeps the text placeholder.
+fn is_raster_image(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
+    )
+}
+
+/// Resolve an image URL as written in a note to encoded bytes, reading
+/// local vault rasters and caching them by canonical path. Remote URLs
+/// and anything that escapes the vault root return `None` (the text
+/// placeholder). The note-relative path is tried first, then the vault
+/// root, matching Obsidian's attachment lookup.
+fn resolve_local_image(
+    root: &std::path::Path,
+    note_folder: &str,
+    cache: &Rc<RefCell<HashMap<String, Option<EncodedImage>>>>,
+    url: &str,
+) -> Option<EncodedImage> {
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:") {
+        return None;
+    }
+    // Obsidian anchors (`image.png#center`) are not part of the filename.
+    let url = url.split('#').next().unwrap_or(url).trim();
+    if url.is_empty() {
+        return None;
+    }
+    let canonical_root = root.canonicalize().ok()?;
+    let from_note = if note_folder.is_empty() {
+        canonical_root.join(url)
+    } else {
+        canonical_root.join(note_folder).join(url)
+    };
+    for candidate in [from_note, canonical_root.join(url)] {
+        let Ok(canonical) = candidate.canonicalize() else {
+            continue;
+        };
+        if !canonical.starts_with(&canonical_root) || !is_raster_image(&canonical) {
+            continue;
+        }
+        let key = canonical.to_string_lossy().into_owned();
+        if let Some(cached) = cache.borrow().get(&key) {
+            return cached.clone();
+        }
+        let resolved = std::fs::read(&canonical).ok().map(EncodedImage::new);
+        cache.borrow_mut().insert(key, resolved.clone());
+        return resolved;
+    }
+    None
+}
+
 /// The native shell over the shared kernel: a banner zone above a
 /// SplitView whose pane holds the sidebar and whose content holds the
 /// note area (tab strip, editor, reading view).
@@ -122,6 +178,11 @@ pub struct Shell {
     /// and should restore it once the window is wide again. Shell-local
     /// (view) state, mirroring the Linux shell's `restore_split`.
     restore_split: bool,
+    /// Cache of locally resolved images, keyed by the canonical file path.
+    /// An entry of `None` records a failed lookup so a missing file is not
+    /// re-read on every render. Shared with the renderer's resolver closure
+    /// (hence `Rc`).
+    image_cache: Rc<RefCell<HashMap<String, Option<EncodedImage>>>>,
 }
 
 impl Component for Shell {
@@ -137,6 +198,7 @@ impl Component for Shell {
             file_tree,
             selected_tag: None,
             restore_split: false,
+            image_cache: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -731,6 +793,24 @@ impl Component for Shell {
                 None
             });
         }
+        // Local image resolver: reads vault rasters relative to the active
+        // note's folder (then the vault root) and caches them by canonical
+        // path. Remote URLs and paths escaping the root keep the text
+        // placeholder. The cache is shared across renders.
+        let vault_root = self.handle.0.borrow().runner.root().to_path_buf();
+        let note_folder = state
+            .tabs
+            .active_path()
+            .and_then(|path| path.rsplit_once('/').map(|(folder, _)| folder.to_string()))
+            .unwrap_or_default();
+        let image_resolver: ImageResolver = {
+            let cache = self.image_cache.clone();
+            Rc::new(move |url: &str| resolve_local_image(&vault_root, &note_folder, &cache, url))
+        };
+        let renderer = WindowsMarkdownRenderer {
+            image_resolver: Some(image_resolver),
+            ..Default::default()
+        };
         let reading_area = active_buffer
             .map(|buffer| {
                 let doc = parse_note(&buffer.text);
@@ -785,12 +865,7 @@ impl Component for Shell {
                         }
                     })
                 };
-                doc_view(
-                    &doc,
-                    &WindowsMarkdownRenderer::default(),
-                    state.jump_anchor,
-                    &on_link,
-                )
+                doc_view(&doc, &renderer, state.jump_anchor, &on_link)
             })
             .unwrap_or_else(|| View::from(TextBlock::new().text("(no note open)")));
 

@@ -58,6 +58,13 @@ impl WindowsEffectRunner {
         }
     }
 
+    /// The vault root the shell resolves local attachments (images)
+    /// against.
+    #[must_use]
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     /// Perform a guarded save of `text` at `path`, with `base` as the
     /// sentinel the edits were made against (shared workflow decision).
     pub fn save(&mut self, path: &str, text: &str, base: &str) -> SaveOutcome {

@@ -20,7 +20,7 @@ use std::rc::Rc;
 use windows_reactor::test::{NodeId, PropertyId, PropertyValue, Pump, RecordingRuntime, SlotId};
 use windows_reactor::{
     ChildrenControl, Component, ComponentContext, FontWeight, KeyedView, LocalSender, Orientation,
-    StackPanel, TextBlock, VerticalAlignment, View, ViewContext,
+    StackPanel, Stretch, TextBlock, VerticalAlignment, View, ViewContext,
 };
 
 /// The sidebar file-tree view (kernel state, see `file_tree.rs`).
@@ -430,7 +430,7 @@ fn headless_shell_status_bar_counts_the_active_buffer() {
     let app = shell_app_with(&[("a.md", "a body\n")]);
     shell_open_tab(&app, "a.md", "a body\n", "a body\n");
 
-    let mut pump = mounted_shell(&app);
+    let pump = mounted_shell(&app);
     let window = pump.window().expect("window node");
     let rt = pump.runtime();
     // "a body\n" is two words and seven characters (trailing newline counts).
@@ -467,6 +467,34 @@ fn headless_shell_empty_state_with_no_note_open() {
         find_node_with_property_text(rt, window, PropertyId::TextBoxText, "").is_none(),
         "no source TextBox exists with no note open"
     );
+}
+
+#[test]
+fn headless_shell_renders_a_local_vault_image() {
+    // A real vault root with an image file: the reading renderer resolves
+    // local rasters through the shell's resolver (no webview), while remote
+    // URLs stay text placeholders.
+    let root = std::env::temp_dir().join(format!("vaultnotes-image-test-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("create temp root");
+    std::fs::write(root.join("pixel.png"), b"encoded image bytes").expect("write image");
+
+    let app = shell_app_with_root(&[("a.md", "![x](pixel.png)\n")], &root);
+    shell_open_tab(&app, "a.md", "![x](pixel.png)\n", "![x](pixel.png)\n");
+
+    let pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    let image = find_node_with_property(rt, window, PropertyId::ImageSource, &|value| {
+        matches!(value, PropertyValue::EncodedImage(_))
+    })
+    .expect("local image rendered as an Image node");
+    assert_eq!(
+        rt.node(image).unwrap().property(PropertyId::ImageStretch),
+        Some(&PropertyValue::Stretch(Stretch::Uniform)),
+        "the image scales uniformly"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
 }
 
 /// Inject one `TextBoxTextChanged` on the editor node (the payload the
@@ -850,6 +878,25 @@ fn find_node_with_property_text(
     }
     for child in child_ids(rt, from) {
         if let Some(found) = find_node_with_property_text(rt, child, property, value) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// First node (depth-first) whose `property` value satisfies `predicate`.
+fn find_node_with_property(
+    rt: &RecordingRuntime,
+    from: NodeId,
+    property: PropertyId,
+    predicate: &dyn Fn(&PropertyValue) -> bool,
+) -> Option<NodeId> {
+    let node = rt.node(from)?;
+    if node.property(property).is_some_and(predicate) {
+        return Some(from);
+    }
+    for child in child_ids(rt, from) {
+        if let Some(found) = find_node_with_property(rt, child, property, predicate) {
             return Some(found);
         }
     }

@@ -8,15 +8,37 @@
 //! Linux frontend uses for previews and counts) and the renderer
 //! configuration the shell will consume.
 
+use std::rc::Rc;
+
 use vault_md::{Block, Doc, Inline};
+use windows_reactor::EncodedImage;
+
+/// Resolves an image URL as written in a note to encoded raster bytes for
+/// inline rendering. `None` keeps the text placeholder, so a doc rendered
+/// with the default config stays text-only (remote images, missing files,
+/// and the headless renderer tests all land there).
+pub type ImageResolver = Rc<dyn Fn(&str) -> Option<EncodedImage>>;
 
 /// Reading-renderer configuration for the Windows shell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct WindowsMarkdownRenderer {
     /// Whether images render inline or as placeholders.
     pub show_images: bool,
     /// Whether the theme is dark (accent/contrast decisions).
     pub dark_mode: bool,
+    /// Optional local-image resolver (the shell installs one that reads
+    /// vault rasters and caches them by path).
+    pub image_resolver: Option<ImageResolver>,
+}
+
+impl std::fmt::Debug for WindowsMarkdownRenderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowsMarkdownRenderer")
+            .field("show_images", &self.show_images)
+            .field("dark_mode", &self.dark_mode)
+            .field("has_image_resolver", &self.image_resolver.is_some())
+            .finish()
+    }
 }
 
 impl Default for WindowsMarkdownRenderer {
@@ -24,6 +46,7 @@ impl Default for WindowsMarkdownRenderer {
         Self {
             show_images: true,
             dark_mode: false,
+            image_resolver: None,
         }
     }
 }
