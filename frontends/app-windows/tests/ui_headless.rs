@@ -1094,9 +1094,14 @@ fn headless_shell_live_pane_renders_the_reading_view_only() {
     let pump = mounted_shell(&app);
     let window = pump.window().expect("window node");
     let rt = pump.runtime();
+    // Live mode renders headings as RichTextBlock (inline flow), not TextBlock.
     assert!(
-        find_node_with_property_text(rt, window, PropertyId::TextBlockText, "Title").is_some(),
-        "the parsed heading renders"
+        find_node_with_property(rt, window, PropertyId::RichTextBlockBlocks, &|v| matches!(
+            v,
+            PropertyValue::RichText(_)
+        ))
+        .is_some(),
+        "the parsed heading renders as RichTextBlock"
     );
     assert!(
         find_node_with_property_text(

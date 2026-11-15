@@ -18,7 +18,8 @@ use vault_app::markdown::plain_inlines;
 use vault_md::{Block, Doc, Inline};
 use windows_reactor::{
     Border, Callback, ChildrenControl, ContentControl, EncodedImage, FontWeight, HyperlinkButton,
-    Image, KeyedView, LayoutControl, Orientation, StackPanel, Stretch, TextBlock, View,
+    Image, KeyedView, LayoutControl, Orientation, RichText, RichTextBlock, RichTextInline,
+    RichTextParagraph, RichTextRun, StackPanel, Stretch, TextBlock, TextWrapping, View,
 };
 
 use super::reading::WindowsMarkdownRenderer;
@@ -332,6 +333,122 @@ fn styled_text(text: String, size: f64, font_weight: Option<FontWeight>) -> Text
         block = block.font_weight(weight);
     }
     block
+}
+
+/// Render a block for the Live pane. Prose (paragraphs, headings) renders
+/// via RichTextBlock so runs flow inline on one line with text wrapping.
+/// Complex blocks (callouts, lists, tables, quotes, code, ...) fall back to
+/// the existing block_view. Images embedded within a paragraph also fall
+/// back since RichTextBlock has no inline-UI slot.
+pub fn live_block_view(
+    block: &Block,
+    config: &WindowsMarkdownRenderer,
+    footnote_blocks: &HashMap<String, usize>,
+    on_link: &dyn Fn(LinkNav) -> Callback<()>,
+) -> View {
+    match block {
+        Block::Paragraph { content, .. } => {
+            if has_non_prose_inline(content) {
+                return block_view(block, config, footnote_blocks, on_link);
+            }
+            let runs: Vec<RichTextInline> = content.iter().map(inline_to_rich_run).collect();
+            View::from(
+                RichTextBlock::new()
+                    .paragraphs(Some(RichText::new([RichTextParagraph::new(runs)])))
+                    .text_wrapping(Some(TextWrapping::Wrap)),
+            )
+        }
+        Block::Heading { level, content, .. } => {
+            let size = match *level {
+                1 => 28.0,
+                2 => 24.0,
+                3 => 20.0,
+                _ => 16.0,
+            };
+            if has_non_prose_inline(content) {
+                return block_view(block, config, footnote_blocks, on_link);
+            }
+            let runs: Vec<RichTextInline> = content.iter().map(inline_to_rich_run).collect();
+            View::from(
+                RichTextBlock::new()
+                    .paragraphs(Some(RichText::new([RichTextParagraph::new(runs)])))
+                    .font_size(Some(size))
+                    .text_wrapping(Some(TextWrapping::Wrap)),
+            )
+        }
+        _ => block_view(block, config, footnote_blocks, on_link),
+    }
+}
+
+/// True if any inline in `content` cannot be represented as a RichTextRun
+/// (image, embed, link, wiki link, tag, footnote ref). Those fall back to
+/// block_view so they stay clickable via HyperlinkButton.
+fn has_non_prose_inline(content: &[Inline]) -> bool {
+    content.iter().any(|i| {
+        matches!(
+            i,
+            Inline::Image { .. }
+                | Inline::Embed(_)
+                | Inline::Link { .. }
+                | Inline::WikiLink(_)
+                | Inline::Tag(_)
+                | Inline::FootnoteRef(_)
+        )
+    })
+}
+
+/// Convert a prose inline to a RichTextInline run. Links are rendered as
+/// plain label text (not clickable) because RichTextHyperlink uses WinUI
+/// navigation that bypasses the kernel — click links in Reading mode instead.
+fn inline_to_rich_run(inline: &Inline) -> RichTextInline {
+    match inline {
+        Inline::Text(t) => RichTextInline::Run(RichTextRun::plain(t.clone())),
+        Inline::Strong(children) => {
+            let text = plain_inlines(children);
+            RichTextInline::Run(RichTextRun {
+                text,
+                is_bold: true,
+                is_italic: false,
+            })
+        }
+        Inline::Emph(children) => {
+            let text = plain_inlines(children);
+            RichTextInline::Run(RichTextRun {
+                text,
+                is_bold: false,
+                is_italic: true,
+            })
+        }
+        Inline::Code(t) => RichTextInline::Run(RichTextRun::plain(t.clone())),
+        Inline::Math(t) => RichTextInline::Run(RichTextRun::plain(t.clone())),
+        Inline::Link { content, .. } => {
+            RichTextInline::Run(RichTextRun::plain(plain_inlines(content)))
+        }
+        Inline::WikiLink(wl) => {
+            let label = match &wl.alias {
+                Some(alias) => plain_inlines(alias),
+                None => wl.target.note.clone(),
+            };
+            RichTextInline::Run(RichTextRun::plain(label))
+        }
+        Inline::Tag(t) => RichTextInline::Run(RichTextRun::plain(format!("#{t}"))),
+        Inline::FootnoteRef(r) => RichTextInline::Run(RichTextRun::plain(format!("^{r}"))),
+        Inline::InlineFootnote(children) => {
+            RichTextInline::Run(RichTextRun::plain(plain_inlines(children)))
+        }
+        Inline::Html(t) => RichTextInline::Run(RichTextRun::plain(t.clone())),
+        Inline::SoftBreak | Inline::HardBreak => RichTextInline::LineBreak,
+        Inline::Image { .. } | Inline::Embed(_) => {
+            // Filtered out by the caller; be safe anyway.
+            RichTextInline::Run(RichTextRun::plain(String::new()))
+        }
+        Inline::Strike(children) => {
+            RichTextInline::Run(RichTextRun::plain(plain_inlines(children)))
+        }
+        Inline::Highlight(children) => {
+            RichTextInline::Run(RichTextRun::plain(plain_inlines(children)))
+        }
+    }
 }
 
 /// Render a single inline with a given font size and an explicit font

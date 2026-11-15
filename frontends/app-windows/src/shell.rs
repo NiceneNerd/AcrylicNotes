@@ -19,7 +19,7 @@ use std::rc::Rc;
 use windows_reactor::{
     AutomationExt, Border, Brush, Button, ChildrenControl, Component, ComponentContext,
     ContentControl, CornerRadius, FontWeight, Grid, GridChildExt, GridLength, HorizontalAlignment,
-    HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, LayoutControl, Orientation,
+    HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, LayoutControl, Orientation, RichEditBox,
     ScrollBarVisibility, ScrollViewer, SlotView, SlotsControl, SplitView, SplitViewDisplayMode,
     SplitViewSlot, StackPanel, TextBlock, TextBox, TextWrapping, ThemeBrush, Thickness, TitleBar,
     TitleBarSlot, TreeNode, TreeView, TreeViewExt, TreeViewSelectionMode, VerticalAlignment, View,
@@ -30,13 +30,13 @@ use vault_app::commands::UiCommand;
 use vault_app::navigation::{outline, NavSection};
 use vault_app::settings::{PaneMode, ThemeChoice};
 use vault_app::tree as kernel_tree;
-use vault_md::parse_note;
+use vault_md::{parse_note, Block, Doc};
 use vault_platform::OpenTarget;
 
 use crate::app::WindowsApp;
 use crate::file_tree::FileTree;
 use crate::reading::{ImageResolver, WindowsMarkdownRenderer};
-use crate::reading_view::{doc_view, LinkNav};
+use crate::reading_view::{doc_view, live_block_view, LinkNav};
 use crate::windows_message::{NativeEvent, WindowsMessage};
 
 /// The shell component's input: a shared handle to the kernel host.
@@ -189,6 +189,15 @@ pub struct Shell {
     /// re-read on every render. Shared with the renderer's resolver closure
     /// (hence `Rc`).
     image_cache: Rc<RefCell<HashMap<String, Option<String>>>>,
+    /// Which region index is being edited in the Live pane (RichEditBox).
+    /// Shell-local view state; `None` means all blocks render as rich text.
+    live_focused: Cell<Option<usize>>,
+    /// The note's editable regions, cached per render. `BlockSlice` tiling
+    /// comes from `vault_app::live::slices`.
+    live_slices: RefCell<Vec<vault_app::live::BlockSlice>>,
+    /// Last programmatic text rendered into the Live-pane RichEditBox
+    /// (echo suppression, same pattern as `rendered_editor`).
+    live_editor_text: RefCell<String>,
 }
 
 impl Component for Shell {
@@ -206,6 +215,9 @@ impl Component for Shell {
             restore_split: false,
             image_cache: Rc::new(RefCell::new(HashMap::new())),
             last_pane: Cell::new(None),
+            live_focused: Cell::new(None),
+            live_slices: RefCell::new(Vec::new()),
+            live_editor_text: RefCell::new(String::new()),
         }
     }
 
@@ -257,6 +269,42 @@ impl Component for Shell {
                     .handle_native(WindowsMessage::Command(UiCommand::SetPaneMode { mode }));
             }
             return;
+        }
+        // Live pane: clicking a rendered block opens it for editing.
+        if let WindowsMessage::Native(NativeEvent::LiveFocus { region }) = message {
+            self.live_focused.set(Some(region));
+            return;
+        }
+        // Live pane: Escape commits the edited block's source back into
+        // the buffer via a line-range splice (round-trips byte-for-byte).
+        if let WindowsMessage::Native(NativeEvent::LiveCommit) = message {
+            if let Some(region) = self.live_focused.get() {
+                let slices = self.live_slices.borrow();
+                if let Some(slice) = slices.get(region) {
+                    let app = self.handle.0.borrow();
+                    let state = &app.shared.state;
+                    if let Some(tab) = state.tabs.active() {
+                        if let Some(buffer) = app.buffers.get(&tab) {
+                            let editor_text = self.live_editor_text.borrow().clone();
+                            let new_text = vault_app::live::replace_lines(
+                                &buffer.text,
+                                slice.start_line,
+                                slice.end_line,
+                                &editor_text,
+                            );
+                            drop(app);
+                            self.live_focused.set(None);
+                            self.handle
+                                .0
+                                .borrow_mut()
+                                .handle_native(WindowsMessage::Native(NativeEvent::EditorEdited {
+                                    text: new_text,
+                                }));
+                            return;
+                        }
+                    }
+                }
+            }
         }
         if let WindowsMessage::Native(NativeEvent::EditorEdited { text }) = &message {
             // Echo suppression: equal to the last rendered text means
@@ -830,61 +878,75 @@ impl Component for Shell {
             image_resolver: Some(image_resolver),
             ..Default::default()
         };
-        let reading_area = active_buffer
-            .map(|buffer| {
-                let doc = parse_note(&buffer.text);
-                // Link clicks become kernel commands (plan §10.3): URLs go
-                // through `OpenExternal` (the ExternalOpener service owns
-                // the hand-off), wiki links open or focus their tab.
-                let on_link = |nav: LinkNav| {
-                    let handle = self.handle.clone();
-                    context.callback(move |()| match nav.clone() {
-                        LinkNav::Url(url) => WindowsMessage::Command(UiCommand::OpenExternal {
-                            target: OpenTarget::Url(url),
-                        }),
-                        LinkNav::Note(path) => {
-                            WindowsMessage::Command(UiCommand::OpenNote { path })
-                        }
-                        // Relative Markdown link: resolve against the
-                        // active note's folder through the vault index
-                        // (plan §10.3's `resolve_relative` flow). A
-                        // resolved note opens a tab; anything else
-                        // (attachments, unresolvable targets) is handed
-                        // to the platform's default file handler.
-                        LinkNav::Relative(target) => {
-                            let from = handle
-                                .0
-                                .borrow()
-                                .shared
-                                .state
-                                .tabs
-                                .active_path()
-                                .unwrap_or("")
-                                .to_string();
-                            if let Some(path) =
-                                handle.0.borrow().runner.resolve_relative(&target, &from)
-                            {
-                                WindowsMessage::Command(UiCommand::OpenNote { path })
-                            } else {
-                                WindowsMessage::Command(UiCommand::OpenExternal {
-                                    target: OpenTarget::File(std::path::PathBuf::from(&target)),
-                                })
-                            }
-                        }
-                        // A reading-view tag routes to the tags panel
-                        // with the tag selected (shell-local filter).
-                        LinkNav::Tag(tag) => {
-                            WindowsMessage::Native(NativeEvent::TagToggled { tag })
-                        }
-                        // A footnote reference jumps to its definition:
-                        // the block index was resolved at render time,
-                        // so just anchor it (the Border marker).
-                        LinkNav::Footnote(block) => {
-                            WindowsMessage::Command(UiCommand::JumpOutline { block })
-                        }
+        // Parse the doc once; Reading/Split use doc_view, Live uses
+        // live_block_view per region.
+        let doc: Option<Doc> = active_buffer
+            .as_ref()
+            .map(|buffer| parse_note(&buffer.text));
+
+        // Link-click callback: shared logic, created at each call site
+        // (context.callback takes &self, so multiple can coexist).
+        let link_callback = |handle: &ShellHandle, nav: &LinkNav| -> WindowsMessage {
+            match nav {
+                LinkNav::Url(url) => WindowsMessage::Command(UiCommand::OpenExternal {
+                    target: OpenTarget::Url(url.clone()),
+                }),
+                LinkNav::Note(path) => {
+                    WindowsMessage::Command(UiCommand::OpenNote { path: path.clone() })
+                }
+                // Relative Markdown link: resolve against the active note's
+                // folder through the vault index (plan §10.3's
+                // `resolve_relative` flow).
+                LinkNav::Relative(target) => {
+                    let from = handle
+                        .0
+                        .borrow()
+                        .shared
+                        .state
+                        .tabs
+                        .active_path()
+                        .unwrap_or("")
+                        .to_string();
+                    if let Some(path) = handle.0.borrow().runner.resolve_relative(target, &from) {
+                        WindowsMessage::Command(UiCommand::OpenNote { path })
+                    } else {
+                        WindowsMessage::Command(UiCommand::OpenExternal {
+                            target: OpenTarget::File(std::path::PathBuf::from(target.as_str())),
+                        })
+                    }
+                }
+                LinkNav::Tag(tag) => {
+                    WindowsMessage::Native(NativeEvent::TagToggled { tag: tag.clone() })
+                }
+                LinkNav::Footnote(block) => {
+                    WindowsMessage::Command(UiCommand::JumpOutline { block: *block })
+                }
+            }
+        };
+
+        let footnote_blocks: std::collections::HashMap<String, usize> = doc
+            .as_ref()
+            .map(|doc| {
+                doc.blocks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, block)| match block {
+                        Block::FootnoteDef { label, .. } => Some((label.clone(), i)),
+                        _ => None,
                     })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let reading_area = doc
+            .as_ref()
+            .map(|doc| {
+                let handle = self.handle.clone();
+                let on_link = |nav: LinkNav| {
+                    let handle = handle.clone();
+                    context.callback(move |()| link_callback(&handle, &nav))
                 };
-                doc_view(&doc, &renderer, state.jump_anchor, &on_link)
+                doc_view(doc, &renderer, state.jump_anchor, &on_link)
             })
             .unwrap_or_else(|| View::from(TextBlock::new().text("(no note open)")));
 
@@ -893,6 +955,105 @@ impl Component for Shell {
         let reading_area = Border::new()
             .padding(Thickness::new(READING_MARGIN, 0.0, READING_MARGIN, 0.0))
             .content(reading_area);
+
+        // Live pane: each region renders as rich text, except the focused
+        // region which is a raw-source RichEditBox. Click a block to edit
+        // it; Escape commits the block's source back via line-range splice.
+        let live_pane_body = if state.pane == PaneMode::Live {
+            if let Some(buffer) = active_buffer {
+                let doc = doc.as_ref().unwrap();
+                let slices = vault_app::live::slices(&buffer.text, doc);
+                self.live_slices.replace(slices.clone());
+                let children: Vec<KeyedView> = slices
+                    .iter()
+                    .enumerate()
+                    .map(|(region_idx, slice)| {
+                        let is_focused = self.live_focused.get() == Some(region_idx);
+                        let key = format!("live-region-{region_idx}");
+
+                        if is_focused {
+                            // Raw-source editor for the focused block.
+                            let source = slice.source(&buffer.text);
+                            let display_text = if *self.live_editor_text.borrow() == source {
+                                self.live_editor_text.borrow().clone()
+                            } else {
+                                source.clone()
+                            };
+                            *self.live_editor_text.borrow_mut() = display_text.clone();
+
+                            KeyedView::new(
+                                key,
+                                View::from(
+                                    RichEditBox::new()
+                                        .text(display_text)
+                                        .on_text_changed(context.callback(|text: String| {
+                                            WindowsMessage::Native(NativeEvent::EditorEdited {
+                                                text,
+                                            })
+                                        }))
+                                        .vertical_alignment(VerticalAlignment::Stretch)
+                                        .min_height(60.0),
+                                ),
+                            )
+                        } else {
+                            match slice.block {
+                                Some(block_idx) => {
+                                    let handle = self.handle.clone();
+                                    let on_link = |nav: LinkNav| {
+                                        let handle = handle.clone();
+                                        context.callback(move |()| link_callback(&handle, &nav))
+                                    };
+                                    KeyedView::new(
+                                        key,
+                                        live_block_view(
+                                            &doc.blocks[block_idx],
+                                            &renderer,
+                                            &footnote_blocks,
+                                            &on_link,
+                                        ),
+                                    )
+                                }
+                                None => {
+                                    // Frontmatter or empty body region:
+                                    // raw text, muted.
+                                    let text = slice.source(&buffer.text);
+                                    KeyedView::new(
+                                        key,
+                                        View::from(
+                                            TextBlock::new()
+                                                .text(text)
+                                                .font_size(12.0)
+                                                .opacity(0.6)
+                                                .text_wrapping(TextWrapping::Wrap),
+                                        ),
+                                    )
+                                }
+                            }
+                        }
+                    })
+                    .collect();
+
+                ScrollViewer::new()
+                    .grid_row(1)
+                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                    .content(
+                        StackPanel::new()
+                            .orientation(Orientation::Vertical)
+                            .spacing(10.0)
+                            .keyed_children(children),
+                    )
+            } else {
+                TextBlock::new()
+                    .text("Open a note from the sidebar, or click a link in reading view.")
+                    .opacity(0.6)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .grid_row(1)
+                    .into()
+            }
+        } else {
+            View::from(TextBlock::new().text(""))
+        };
 
         // Note area: the tab strip on top, the pane body filling the rest.
         // The body sits in a Star grid row so the ScrollViewers get a
@@ -931,6 +1092,10 @@ impl Component for Shell {
                 .vertical_alignment(VerticalAlignment::Center)
                 .grid_row(1)
                 .into()
+        } else if state.pane == PaneMode::Live {
+            // Live pane: rich-text blocks with a per-block raw-source
+            // editor; click a block to edit it, Escape commits.
+            live_pane_body
         } else if show_source && show_reading {
             let editor = View::from(source_editor.grid_column(0));
             let reading = ScrollViewer::new()

@@ -57,6 +57,12 @@ pub enum NativeEvent {
     /// than one) and restores it when the window widens again, matching
     /// the Linux shell. The width is in device-independent pixels.
     WindowResized { width: f64 },
+    /// The user clicked a rendered (non-focused) block in the Live pane;
+    /// that region becomes a raw-source editor. Shell-local view state.
+    LiveFocus { region: usize },
+    /// Escape pressed in a Live-pane RichEditBox; the block's source is
+    /// spliced back into the buffer and the block re-renders as rich text.
+    LiveCommit,
 }
 
 #[cfg(test)]
