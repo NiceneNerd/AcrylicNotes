@@ -52,6 +52,11 @@ pub enum NativeEvent {
     /// report labels this shell rendered; an unknown label (never
     /// expected) lands here instead of mis-routing to a wrong note.
     Noop,
+    /// The window was resized. The shell folds the split layout to the
+    /// source pane below `NARROW_WINDOW_WIDTH` (two panes need more room
+    /// than one) and restores it when the window widens again, matching
+    /// the Linux shell. The width is in device-independent pixels.
+    WindowResized { width: f64 },
 }
 
 #[cfg(test)]

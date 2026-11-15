@@ -18,12 +18,12 @@ use std::rc::Rc;
 
 use windows_reactor::{
     AutomationExt, Border, Brush, Button, ChildrenControl, Component, ComponentContext,
-    ContentControl, FontWeight, Grid, GridChildExt, GridLength, HorizontalAlignment,
+    ContentControl, CornerRadius, FontWeight, Grid, GridChildExt, GridLength, HorizontalAlignment,
     HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, LayoutControl, Orientation,
     ScrollBarVisibility, ScrollViewer, SlotView, SlotsControl, SplitView, SplitViewDisplayMode,
     SplitViewSlot, StackPanel, TextBlock, TextBox, TextWrapping, ThemeBrush, Thickness, TitleBar,
     TitleBarSlot, TreeNode, TreeView, TreeViewExt, TreeViewSelectionMode, VerticalAlignment, View,
-    ViewContext, WindowBackdrop, WindowTheme, WindowTitleBarHeight, WindowVisuals,
+    ViewContext, WindowBackdrop, WindowSize, WindowTheme, WindowTitleBarHeight, WindowVisuals,
 };
 
 use vault_app::commands::UiCommand;
@@ -60,6 +60,33 @@ impl ShellHandle {
     }
 }
 
+/// Window width (DIPs) below which the split layout folds to the source
+/// pane: two panes side by side need more room than one.
+const NARROW_WINDOW_WIDTH: f64 = 480.0;
+
+/// Horizontal padding (DIPs) the reading view leaves around its text.
+/// Mirrors the kernel's default `ReadingMargin::Comfortable` (32 px); the
+/// settings drawer will drive it live once that lands on Windows.
+const READING_MARGIN: f64 = 32.0;
+
+/// The pane a window resize should switch to, if any. Mirrors the Linux
+/// shell: below [`NARROW_WINDOW_WIDTH`] Split folds to Source and the fold
+/// is remembered, and widening restores Split unless the user picked a
+/// different pane while narrow (the caller's `restore_split` is only
+/// cleared when the fold is actually undone).
+fn narrow_fold(current: PaneMode, width: f64, restore_split: &mut bool) -> Option<PaneMode> {
+    let narrow = width < NARROW_WINDOW_WIDTH;
+    if narrow && current == PaneMode::Split {
+        *restore_split = true;
+        Some(PaneMode::Source)
+    } else if !narrow && *restore_split && current == PaneMode::Source {
+        *restore_split = false;
+        Some(PaneMode::Split)
+    } else {
+        None
+    }
+}
+
 /// The native shell over the shared kernel: a banner zone above a
 /// SplitView whose pane holds the sidebar and whose content holds the
 /// note area (tab strip, editor, reading view).
@@ -91,6 +118,10 @@ pub struct Shell {
     /// tag list, `Some(tag)` shows that tag's notes. Clicking the
     /// selected tag again clears it.
     selected_tag: Option<String>,
+    /// Whether the narrow-window fold hid a user-requested Split layout
+    /// and should restore it once the window is wide again. Shell-local
+    /// (view) state, mirroring the Linux shell's `restore_split`.
+    restore_split: bool,
 }
 
 impl Component for Shell {
@@ -105,6 +136,7 @@ impl Component for Shell {
             source_text_seeded: Cell::new(false),
             file_tree,
             selected_tag: None,
+            restore_split: false,
         }
     }
 
@@ -140,6 +172,21 @@ impl Component for Shell {
                 .handle_native(WindowsMessage::Command(UiCommand::SetNavSection {
                     section: NavSection::Tags,
                 }));
+            return;
+        }
+        // Narrow-window fold: below `NARROW_WINDOW_WIDTH` the split layout
+        // folds to the source pane (two panes do not fit), and widening
+        // restores it unless the user picked a pane in the meantime. The
+        // fold is shell presentation, so it drives the kernel's pane mode
+        // through the normal `SetPaneMode` command.
+        if let WindowsMessage::Native(NativeEvent::WindowResized { width }) = &message {
+            let current = self.handle.0.borrow().shared.state.pane;
+            if let Some(mode) = narrow_fold(current, *width, &mut self.restore_split) {
+                self.handle
+                    .0
+                    .borrow_mut()
+                    .handle_native(WindowsMessage::Command(UiCommand::SetPaneMode { mode }));
+            }
             return;
         }
         if let WindowsMessage::Native(NativeEvent::EditorEdited { text }) = &message {
@@ -189,6 +236,12 @@ impl Component for Shell {
                 .client_size(1180.0, 760.0),
         );
         context.window_title("VaultNotes");
+        // Window-size observation: the shell folds the split layout below
+        // `NARROW_WINDOW_WIDTH`. Declared every publication like the other
+        // window observations; the runtime only calls it on a real resize.
+        context.on_window_size(context.callback(|size: WindowSize| {
+            WindowsMessage::Native(NativeEvent::WindowResized { width: size.width })
+        }));
 
         // File-tree sidebar: one TreeView node per vault folder/note,
         // keyed by vault path. The native control reports the invoked
@@ -436,13 +489,24 @@ impl Component for Shell {
             NavSection::Links => ScrollViewer::new().grid_row(1).content(links_panel),
             NavSection::Outline => ScrollViewer::new().grid_row(1).content(outline_panel),
         };
-        let sidebar = Grid::new()
-            .rows([GridLength::Auto, GridLength::STAR])
-            .columns([GridLength::STAR])
-            .keyed_children([
-                KeyedView::new("nav-row", nav_row),
-                KeyedView::new("sidebar-panel", sidebar_panel),
-            ]);
+        // Sidebar as a rounded card: the card surface picks up the theme
+        // (and Mica translucency when glass is on) and the stroke keeps the
+        // edge legible against the note area.
+        let sidebar = Border::new()
+            .corner_radius(CornerRadius::uniform(8.0))
+            .border_thickness(Thickness::uniform(1.0))
+            .background(Brush::Theme(ThemeBrush::CardBackground))
+            .border_brush(Brush::Theme(ThemeBrush::CardStroke))
+            .padding(Thickness::uniform(8.0))
+            .content(
+                Grid::new()
+                    .rows([GridLength::Auto, GridLength::STAR])
+                    .columns([GridLength::STAR])
+                    .keyed_children([
+                        KeyedView::new("nav-row", nav_row),
+                        KeyedView::new("sidebar-panel", sidebar_panel),
+                    ]),
+            );
 
         // Tab strip: a horizontal, scrollable row of tabs mirroring the
         // Linux app's tab bar. Each tab shows the note's title and, dimmed
@@ -730,6 +794,12 @@ impl Component for Shell {
             })
             .unwrap_or_else(|| View::from(TextBlock::new().text("(no note open)")));
 
+        // Reading margins: the text column keeps the configurable gutter
+        // around it (horizontal only, matching the Linux reading view).
+        let reading_area = Border::new()
+            .padding(Thickness::new(READING_MARGIN, 0.0, READING_MARGIN, 0.0))
+            .content(reading_area);
+
         // Note area: the tab strip on top, the pane body filling the rest.
         // The body sits in a Star grid row so the ScrollViewers get a
         // bounded viewport — a StackPanel would hand them infinite height
@@ -996,4 +1066,46 @@ fn build_tree_nodes(tree: &FileTree) -> (Vec<TreeNode>, Rc<HashMap<String, TreeR
         .map(|node| convert(node, tree, &labels))
         .collect();
     (nodes, Rc::new(targets))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn narrow_fold_collapses_split_and_restores_it_when_wide() {
+        let mut restore = false;
+        // Split folds to Source below the threshold, remembering the fold.
+        assert_eq!(
+            narrow_fold(PaneMode::Split, NARROW_WINDOW_WIDTH - 1.0, &mut restore),
+            Some(PaneMode::Source)
+        );
+        assert!(restore);
+        // Widening over the same pane restores Split and clears the flag.
+        assert_eq!(
+            narrow_fold(PaneMode::Source, NARROW_WINDOW_WIDTH + 1.0, &mut restore),
+            Some(PaneMode::Split)
+        );
+        assert!(!restore);
+    }
+
+    #[test]
+    fn narrow_fold_leaves_a_pane_the_user_picked() {
+        // The user picked Reading while narrow: widening must not override
+        // that choice back to Split.
+        let mut restore = true;
+        assert_eq!(
+            narrow_fold(PaneMode::Reading, NARROW_WINDOW_WIDTH - 1.0, &mut restore),
+            None
+        );
+        assert_eq!(
+            narrow_fold(PaneMode::Reading, NARROW_WINDOW_WIDTH + 1.0, &mut restore),
+            None
+        );
+        // A pane that was never folded is untouched either way.
+        assert_eq!(
+            narrow_fold(PaneMode::Live, NARROW_WINDOW_WIDTH + 1.0, &mut restore),
+            None
+        );
+    }
 }

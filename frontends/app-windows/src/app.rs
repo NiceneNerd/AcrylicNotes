@@ -298,6 +298,10 @@ impl WindowsApp {
             NativeEvent::TagToggled { .. } => {}
             NativeEvent::FolderToggled { .. } => {}
             NativeEvent::Noop => {}
+            // The narrow-window fold is shell presentation: it is handled
+            // in the shell's own update by issuing `SetPaneMode`. If it does
+            // reach the host, it is a no-op here.
+            NativeEvent::WindowResized { .. } => {}
         }
     }
 
