@@ -19,8 +19,9 @@ use windows_reactor::{
     Button, ChildrenControl, Component, ComponentContext, ContentControl, Grid, GridChildExt,
     GridLength, HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, Orientation,
     ScrollBarVisibility, ScrollViewer, SlotView, SlotsControl, SplitView, SplitViewDisplayMode,
-    SplitViewSlot, StackPanel, TextBlock, TextBox, TreeNode, TreeView, TreeViewExt,
-    TreeViewSelectionMode, View, ViewContext, WindowBackdrop, WindowTheme, WindowVisuals,
+    SplitViewSlot, StackPanel, TextBlock, TextBox, TitleBar, TitleBarSlot, TreeNode, TreeView,
+    TreeViewExt, TreeViewSelectionMode, View, ViewContext, WindowBackdrop, WindowTheme,
+    WindowTitleBarHeight, WindowVisuals,
 };
 
 use vault_app::commands::UiCommand;
@@ -163,7 +164,12 @@ impl Component for Shell {
         } else {
             WindowBackdrop::None
         };
-        context.window_visuals(WindowVisuals::new().theme(window_theme).backdrop(backdrop));
+        context.window_visuals(
+            WindowVisuals::new()
+                .theme(window_theme)
+                .backdrop(backdrop)
+                .client_size(1180.0, 760.0),
+        );
         context.window_title("VaultNotes");
 
         // File-tree sidebar: one TreeView node per vault folder/note,
@@ -609,9 +615,9 @@ impl Component for Shell {
             .unwrap_or_else(|| View::from(TextBlock::new().text("(no note open)")));
 
         // Note area: everything that renders inside the SplitView's content
-        // pane — the tab strip, the save button, the pane-mode and
-        // appearance rows, and the editor/reading view. Keys are preserved
-        // so reconciliation keeps tab identity across open/close.
+        // pane — the tab strip, the editor/reading view, and (in a later
+        // slice) the status bar. The save button, the pane-mode switcher,
+        // and the appearance row have moved into the title bar's toolbar.
         let mut note_area: Vec<KeyedView> = Vec::new();
         note_area.push(KeyedView::new(
             "tab-bar",
@@ -619,15 +625,6 @@ impl Component for Shell {
                 .orientation(Orientation::Vertical)
                 .keyed_children(tabs),
         ));
-        // Save button (the toolbar stand-in for Ctrl+S).
-        note_area.push(KeyedView::new(
-            "save",
-            Button::new()
-                .on_click(context.callback(|()| WindowsMessage::Command(UiCommand::SaveActiveTab)))
-                .content(TextBlock::new().text("save")),
-        ));
-        note_area.extend(pane_buttons);
-        note_area.push(KeyedView::new("appearance-row", appearance_row));
         if show_source {
             note_area.push(KeyedView::new(
                 "editor",
@@ -648,20 +645,37 @@ impl Component for Shell {
             .orientation(Orientation::Vertical)
             .keyed_children(note_area);
 
-        // Banner zone (row 0): the error InfoBar spans the full width above
+        // Toolbar row hosted in the title bar's Content slot: save, the
+        // pane-mode switcher, and the appearance controls. Icon-only in the
+        // real WinUI build; text labels here keep headless labels stable.
+        let mut toolbar_buttons: Vec<KeyedView> = Vec::new();
+        toolbar_buttons.push(KeyedView::new(
+            "save",
+            Button::new()
+                .on_click(context.callback(|()| WindowsMessage::Command(UiCommand::SaveActiveTab)))
+                .content(TextBlock::new().text("save")),
+        ));
+        toolbar_buttons.extend(pane_buttons);
+        toolbar_buttons.push(KeyedView::new("appearance-row", appearance_row));
+        let toolbar = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .keyed_children(toolbar_buttons);
+
+        // Banner zone (row 1): the error InfoBar spans the full width above
         // the sidebar, matching the Linux app's banner/error stack.
         let banner_zone = StackPanel::new()
-            .grid_row(0)
+            .grid_row(1)
             .grid_column(0)
             .orientation(Orientation::Vertical)
             .keyed_children([KeyedView::new("error-line", error_banner)]);
 
-        // SplitView (row 1): sidebar in the pane, note area in the content.
-        // `is_pane_open` is controlled by kernel `sidebar_open`; closing the
-        // pane writes back through `SetSidebarVisible` (wired to the title
-        // bar's pane toggle in a later slice).
+        // SplitView (row 2): sidebar in the pane, note area in the content.
+        // `is_pane_open` is controlled by kernel `sidebar_open`; the title
+        // bar's pane toggle and the pane's own close both write back
+        // through `SetSidebarVisible`.
+        let pane_handle = self.handle.clone();
         let split_view = SplitView::new()
-            .grid_row(1)
+            .grid_row(2)
             .grid_column(0)
             .display_mode(SplitViewDisplayMode::Inline)
             .open_pane_length(250.0)
@@ -674,10 +688,31 @@ impl Component for Shell {
                 SlotView::new(SplitViewSlot::Content, note_area),
             ]);
 
+        // Title bar (row 0): content extends into the title bar; the
+        // built-in pane toggle button writes back to kernel `sidebar_open`
+        // through `SetSidebarVisible`. The callback returns `()` so the
+        // message is sent imperatively through the context sender.
+        let pane_sender = context.sender();
+        let title_bar = TitleBar::new()
+            .grid_row(0)
+            .grid_column(0)
+            .grid_column_span(1)
+            .title("Vault Notes")
+            .preferred_height(WindowTitleBarHeight::Tall)
+            .is_pane_toggle_button_visible(true)
+            .on_pane_toggle_requested(move || {
+                let open = !pane_handle.0.borrow().shared.state.sidebar_open;
+                pane_sender.send(WindowsMessage::Command(UiCommand::SetSidebarVisible {
+                    open,
+                }));
+            })
+            .slots([SlotView::new(TitleBarSlot::Content, toolbar)]);
+
         Grid::new()
-            .rows([GridLength::Auto, GridLength::STAR])
+            .rows([GridLength::Auto, GridLength::Auto, GridLength::STAR])
             .columns([GridLength::STAR])
             .keyed_children([
+                KeyedView::new("title-bar", title_bar),
                 KeyedView::new("banner-zone", banner_zone),
                 KeyedView::new("split-view", split_view),
             ])

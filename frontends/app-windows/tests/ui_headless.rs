@@ -222,7 +222,7 @@ use vault_app::repository::{testing::MemoryRepository, NoteRepository};
 use vault_app::settings::{AppSettings, MemorySettingsStore, ThemeChoice};
 use vault_platform::testing::{OpenCall, RecordingOpener};
 use windows_reactor::test::{EventId, EventPayload, QueuedEvent};
-use windows_reactor::{WindowBackdrop, WindowTheme, WindowVisuals};
+use windows_reactor::{WindowBackdrop, WindowTheme, WindowTitleBarHeight, WindowVisuals};
 
 /// A kernel host over a memory vault with a succeeding opener.
 fn shell_app_with(notes: &[(&str, &str)]) -> Rc<RefCell<WindowsApp>> {
@@ -304,16 +304,22 @@ fn mounted_shell(app: &Rc<RefCell<WindowsApp>>) -> Pump<RecordingRuntime> {
     pump
 }
 
-/// Direct children of `node`, including SplitView slot contents. The
-/// recording runtime places SplitView's pane and content in named slots
-/// rather than the default children list, so a plain `children()` walk
-/// would miss everything inside the SplitView.
+/// Direct children of `node`, including SplitView and TitleBar slot
+/// contents. The recording runtime places SplitView's pane/content and
+/// TitleBar's Content/RightHeader in named slots rather than the default
+/// children list, so a plain `children()` walk would miss everything
+/// inside them.
 fn child_ids(rt: &RecordingRuntime, node: NodeId) -> Vec<NodeId> {
     let Some(n) = rt.node(node) else {
         return Vec::new();
     };
     let mut out: Vec<NodeId> = n.children().to_vec();
-    for slot in [SlotId::SplitViewPane, SlotId::SplitViewContent] {
+    for slot in [
+        SlotId::SplitViewPane,
+        SlotId::SplitViewContent,
+        SlotId::TitleBarContent,
+        SlotId::TitleBarRightHeader,
+    ] {
         if let Some(child) = n.slot(slot) {
             out.push(child);
         }
@@ -630,6 +636,74 @@ fn headless_shell_split_view_keeps_sidebar_and_content_in_separate_panes() {
     // The window title and visuals are still declared each publication.
     assert_eq!(rt.window_title(window), Some("VaultNotes"));
     assert!(rt.window_visuals(window).is_some());
+}
+
+#[test]
+fn headless_shell_title_bar_hosts_toolbar_and_pane_toggle() {
+    let app = shell_app_with(&[("a.md", "body\n")]);
+    shell_open_tab(&app, "a.md", "body\n", "body\n");
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    // Title bar declared with Tall height; taskbar title in sync.
+    let (_, height) = rt.window_title_bar(window).expect("title bar");
+    assert_eq!(
+        height,
+        WindowTitleBarHeight::Tall,
+        "title bar declared with Tall height"
+    );
+    assert_eq!(rt.window_title(window), Some("VaultNotes"));
+    // Initial client size matches Linux's 1180x760.
+    assert_eq!(
+        rt.window_visuals(window).expect("visuals"),
+        WindowVisuals::new()
+            .theme(WindowTheme::System)
+            .backdrop(WindowBackdrop::Mica)
+            .client_size(1180.0, 760.0),
+    );
+    // Toolbar buttons live in the title bar's Content slot.
+    assert!(
+        find_owner_of_label(rt, window, "save").is_some(),
+        "save button in title bar toolbar"
+    );
+    assert!(
+        find_owner_of_label(rt, window, "[live]").is_some(),
+        "pane-mode switcher in title bar toolbar"
+    );
+    // The sidebar starts open; clicking the pane toggle closes it.
+    assert!(app.borrow().shared.state.sidebar_open);
+    let title_bar = rt.window_title_bar(window).expect("title bar").0;
+    let revision = pump
+        .event_revision(title_bar, EventId::TitleBarPaneToggleRequested)
+        .expect("pane-toggle event active");
+    pump.queue_event(QueuedEvent::new(
+        title_bar,
+        EventId::TitleBarPaneToggleRequested,
+        revision,
+        EventPayload::Unit,
+    ));
+    pump.dispatch_events().expect("dispatch events");
+    pump.dispatch_components(10).expect("dispatch components");
+    assert!(
+        !app.borrow().shared.state.sidebar_open,
+        "pane toggle closed the sidebar"
+    );
+    // Clicking again reopens it.
+    let revision = pump
+        .event_revision(title_bar, EventId::TitleBarPaneToggleRequested)
+        .expect("pane-toggle event active");
+    pump.queue_event(QueuedEvent::new(
+        title_bar,
+        EventId::TitleBarPaneToggleRequested,
+        revision,
+        EventPayload::Unit,
+    ));
+    pump.dispatch_events().expect("dispatch events");
+    pump.dispatch_components(10).expect("dispatch components");
+    assert!(
+        app.borrow().shared.state.sidebar_open,
+        "pane toggle reopened the sidebar"
+    );
 }
 
 #[test]
@@ -1173,7 +1247,8 @@ fn headless_shell_applies_the_persisted_theme_and_glass_to_the_window() {
         visuals,
         WindowVisuals::new()
             .theme(WindowTheme::Dark)
-            .backdrop(WindowBackdrop::None),
+            .backdrop(WindowBackdrop::None)
+            .client_size(1180.0, 760.0),
         "persisted dark theme, glass off"
     );
     assert_eq!(rt.window_title(window), Some("VaultNotes"));
@@ -1204,7 +1279,8 @@ fn headless_shell_theme_clicks_retheme_the_window_and_persist() {
         visuals,
         WindowVisuals::new()
             .theme(WindowTheme::Light)
-            .backdrop(WindowBackdrop::Mica),
+            .backdrop(WindowBackdrop::Mica)
+            .client_size(1180.0, 760.0),
     );
     assert_eq!(settings.borrow().last().theme, ThemeChoice::Light);
     assert!(find_owner_of_label(rt, window, "[light]").is_some());
@@ -1222,7 +1298,8 @@ fn headless_shell_theme_clicks_retheme_the_window_and_persist() {
         rt.window_visuals(window).expect("visuals"),
         WindowVisuals::new()
             .theme(WindowTheme::Dark)
-            .backdrop(WindowBackdrop::Mica),
+            .backdrop(WindowBackdrop::Mica)
+            .client_size(1180.0, 760.0),
     );
     assert_eq!(settings.borrow().last().theme, ThemeChoice::Dark);
 }
@@ -1240,7 +1317,8 @@ fn headless_shell_glass_toggle_flips_the_backdrop_and_persists() {
         rt.window_visuals(window).expect("visuals"),
         WindowVisuals::new()
             .theme(WindowTheme::System)
-            .backdrop(WindowBackdrop::Mica),
+            .backdrop(WindowBackdrop::Mica)
+            .client_size(1180.0, 760.0),
         "glass on requests the frosted backdrop"
     );
     assert!(find_owner_of_label(rt, window, "[glass]").is_some());
@@ -1258,7 +1336,8 @@ fn headless_shell_glass_toggle_flips_the_backdrop_and_persists() {
         rt.window_visuals(window).expect("visuals"),
         WindowVisuals::new()
             .theme(WindowTheme::System)
-            .backdrop(WindowBackdrop::None),
+            .backdrop(WindowBackdrop::None)
+            .client_size(1180.0, 760.0),
     );
     assert!(!settings.borrow().last().glass_enabled);
     assert!(find_owner_of_label(rt, window, "glass").is_some());
@@ -1275,7 +1354,8 @@ fn headless_shell_glass_toggle_flips_the_backdrop_and_persists() {
         rt.window_visuals(window).expect("visuals"),
         WindowVisuals::new()
             .theme(WindowTheme::System)
-            .backdrop(WindowBackdrop::Mica),
+            .backdrop(WindowBackdrop::Mica)
+            .client_size(1180.0, 760.0),
     );
     assert!(settings.borrow().last().glass_enabled);
 }
