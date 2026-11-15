@@ -12,7 +12,7 @@
 //! Wine via `cargo xtask test-windows-ui`), where clicks are injected as
 //! recorded events and the reconciled tree is asserted.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -75,6 +75,13 @@ pub struct Shell {
     /// Split): while only the reading view is shown no TextBox exists,
     /// so no echoes can be generated.
     rendered_editor: RefCell<String>,
+    /// Whether the source TextBox has had its full text rendered at least
+    /// once. windows-reactor applies `TextBoxText` before `TextBoxAcceptsReturn`
+    /// (fixed enum order, not builder-call order), so on the very first
+    /// render multiline text is truncated to one line while `AcceptsReturn`
+    /// is still `false`. We render empty text on the first pass, let
+    /// `AcceptsReturn`/`Wrap` apply, then re-render with the full text.
+    source_text_seeded: Cell<bool>,
     /// The vault's file tree: kernel `TreeNode`s plus `TreeState`
     /// (expansion/selection). Built once from the vault's note paths;
     /// expansion state persists across renders here.
@@ -95,6 +102,7 @@ impl Component for Shell {
         Shell {
             handle: input.clone(),
             rendered_editor: RefCell::new(String::new()),
+            source_text_seeded: Cell::new(false),
             file_tree,
             selected_tag: None,
         }
@@ -618,15 +626,29 @@ impl Component for Shell {
         // With no active buffer the source editor renders empty.
         let show_source = !matches!(state.pane, PaneMode::Live | PaneMode::Reading);
         let show_reading = !matches!(state.pane, PaneMode::Source);
-        if show_source {
-            let editor_text = active_buffer.map(|b| b.text.clone()).unwrap_or_default();
-            *self.rendered_editor.borrow_mut() = editor_text.clone();
+        // No source TextBox in the note area means the next source-mode
+        // render recreates the native control, so it needs a fresh seed pass.
+        if !show_source {
+            self.source_text_seeded.set(false);
         }
-        // Stretch to fill the bounded STAR grid cell so multi-line content
-        // is fully visible on first render. min_height guarantees at least
-        // several lines are visible even if the SplitView hasn't measured
-        // its content slot yet on the very first pass (a tab switch then
-        // re-measures and the cell fills).
+        // windows-reactor applies `TextBoxText` before `TextBoxAcceptsReturn`
+        // (fixed enum order, not builder-call order), so on the very first
+        // render multiline text is truncated to one line while
+        // `AcceptsReturn` is still `false`. Render empty text on the first
+        // source-mode pass, let `AcceptsReturn`/`Wrap` apply, then re-render
+        // with the full text — now `AcceptsReturn` is already true so
+        // multiline content survives `SetText`.
+        let is_first_source_render = show_source && !self.source_text_seeded.get();
+        let editor_text = active_buffer.map(|b| b.text.clone()).unwrap_or_default();
+        let source_display_text = if is_first_source_render {
+            String::new()
+        } else {
+            editor_text.clone()
+        };
+        if show_source {
+            *self.rendered_editor.borrow_mut() = source_display_text.clone();
+        }
+
         let source_editor = TextBox::new()
             .accepts_return(true)
             .text_wrapping(TextWrapping::Wrap)
@@ -635,7 +657,16 @@ impl Component for Shell {
             .on_text_changed(context.callback(|text: String| {
                 WindowsMessage::Native(NativeEvent::EditorEdited { text })
             }))
-            .text(active_buffer.map(|b| b.text.clone()).unwrap_or_default());
+            .text(source_display_text);
+
+        if is_first_source_render {
+            self.source_text_seeded.set(true);
+            let sender = context.sender();
+            context.use_effect("source-text-seed", (), move || {
+                sender.send(WindowsMessage::Native(NativeEvent::Noop));
+                None
+            });
+        }
         let reading_area = active_buffer
             .map(|buffer| {
                 let doc = parse_note(&buffer.text);

@@ -371,6 +371,13 @@ fn click(pump: &mut Pump<RecordingRuntime>, node: NodeId, event: EventId) {
 
 /// Switch the kernel pane mode by clicking its layout button (the pane
 /// defaults to Live, which renders no source TextBox).
+///
+/// Entering a source-bearing pane seeds the TextBox across two
+/// publications: the first renders empty text (windows-reactor applies
+/// `TextBoxText` before `TextBoxAcceptsReturn`, which would truncate
+/// multiline content), then a `use_effect` message drives the full-text
+/// render. That effect setup runs after `dispatch_components` drains its
+/// queue, so pump once more for the seeded render to land.
 fn switch_pane(pump: &mut Pump<RecordingRuntime>, label: &str) {
     let window = pump.window().expect("window node");
     let target = {
@@ -379,6 +386,8 @@ fn switch_pane(pump: &mut Pump<RecordingRuntime>, label: &str) {
             .unwrap_or_else(|| panic!("{label} pane button recorded"))
     };
     click(pump, target, EventId::ButtonClick);
+    pump.dispatch_components(10)
+        .expect("dispatch source-text seed");
 }
 
 #[test]
@@ -1020,12 +1029,7 @@ fn headless_shell_pane_split_shows_source_and_reading() {
     );
 
     let mut pump = mounted_shell(&app);
-    let window = pump.window().expect("window node");
-    let target = {
-        let rt = pump.runtime();
-        find_owner_of_label(rt, window, "split").expect("split button recorded")
-    };
-    click(&mut pump, target, EventId::ButtonClick);
+    switch_pane(&mut pump, "split");
 
     // Both panes: the source TextBox and the parsed reading view.
     assert_eq!(
@@ -1062,12 +1066,7 @@ fn headless_shell_pane_source_shows_the_editor_only() {
     );
 
     let mut pump = mounted_shell(&app);
-    let window = pump.window().expect("window node");
-    let target = {
-        let rt = pump.runtime();
-        find_owner_of_label(rt, window, "source").expect("source button recorded")
-    };
-    click(&mut pump, target, EventId::ButtonClick);
+    switch_pane(&mut pump, "source");
 
     let window = pump.window().expect("window node");
     let rt = pump.runtime();
@@ -1102,12 +1101,7 @@ fn headless_shell_source_editor_fills_its_grid_cell() {
     );
 
     let mut pump = mounted_shell(&app);
-    let window = pump.window().expect("window node");
-    let target = {
-        let rt = pump.runtime();
-        find_owner_of_label(rt, window, "source").expect("source button recorded")
-    };
-    click(&mut pump, target, EventId::ButtonClick);
+    switch_pane(&mut pump, "source");
 
     let window = pump.window().expect("window node");
     let rt = pump.runtime();
@@ -1209,12 +1203,7 @@ fn headless_shell_pane_typing_in_split_updates_the_reading_view() {
 
     let mut pump = mounted_shell(&app);
     // Switch to Split so both panes are mounted.
-    let window = pump.window().expect("window node");
-    let target = {
-        let rt = pump.runtime();
-        find_owner_of_label(rt, window, "split").expect("split button recorded")
-    };
-    click(&mut pump, target, EventId::ButtonClick);
+    switch_pane(&mut pump, "split");
 
     // Type into the source TextBox.
     let window = pump.window().expect("window node");
