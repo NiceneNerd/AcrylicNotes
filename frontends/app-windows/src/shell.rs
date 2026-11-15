@@ -22,8 +22,8 @@ use windows_reactor::{
     InfoBarSeverity, KeyedView, LayoutControl, Orientation, ScrollBarVisibility, ScrollViewer,
     SlotView, SlotsControl, SplitView, SplitViewDisplayMode, SplitViewSlot, StackPanel, TextBlock,
     TextBox, TextWrapping, ThemeBrush, TitleBar, TitleBarSlot, TreeNode, TreeView, TreeViewExt,
-    TreeViewSelectionMode, View, ViewContext, WindowBackdrop, WindowTheme, WindowTitleBarHeight,
-    WindowVisuals,
+    TreeViewSelectionMode, VerticalAlignment, View, ViewContext, WindowBackdrop, WindowTheme,
+    WindowTitleBarHeight, WindowVisuals,
 };
 
 use vault_app::commands::UiCommand;
@@ -622,9 +622,14 @@ impl Component for Shell {
             let editor_text = active_buffer.map(|b| b.text.clone()).unwrap_or_default();
             *self.rendered_editor.borrow_mut() = editor_text.clone();
         }
+        // Stretch to fill the ScrollViewer's viewport so multi-line content
+        // is fully visible on first render (without it, the TextBox sizes to
+        // its measured content and shows only one line until a tab switch
+        // forces remeasure).
         let source_editor = TextBox::new()
             .accepts_return(true)
             .text_wrapping(TextWrapping::Wrap)
+            .vertical_alignment(VerticalAlignment::Stretch)
             .on_text_changed(context.callback(|text: String| {
                 WindowsMessage::Native(NativeEvent::EditorEdited { text })
             }))

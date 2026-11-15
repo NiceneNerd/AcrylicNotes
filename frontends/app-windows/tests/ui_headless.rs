@@ -20,7 +20,7 @@ use std::rc::Rc;
 use windows_reactor::test::{NodeId, PropertyId, PropertyValue, Pump, RecordingRuntime, SlotId};
 use windows_reactor::{
     ChildrenControl, Component, ComponentContext, FontWeight, KeyedView, LocalSender, Orientation,
-    StackPanel, TextBlock, View, ViewContext,
+    StackPanel, TextBlock, VerticalAlignment, View, ViewContext,
 };
 
 /// The sidebar file-tree view (kernel state, see `file_tree.rs`).
@@ -1071,6 +1071,47 @@ fn headless_shell_pane_source_shows_the_editor_only() {
     assert!(
         find_node_with_property_text(rt, window, PropertyId::TextBlockText, "Title").is_none(),
         "the reading view is gone in Source mode"
+    );
+}
+
+#[test]
+fn headless_shell_source_editor_stretches_to_fill_viewport() {
+    // The source TextBox must stretch vertically to fill the ScrollViewer's
+    // viewport on first render, otherwise multi-line content shows only one
+    // line until a tab switch forces remeasure.
+    let app = shell_app_with(&[("a.md", "line one\nline two\nline three\n")]);
+    shell_open_tab(
+        &app,
+        "a.md",
+        "line one\nline two\nline three\n",
+        "line one\nline two\nline three\n",
+    );
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "source").expect("source button recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    let editor = find_node_with_property_text(
+        rt,
+        window,
+        PropertyId::TextBoxText,
+        "line one\nline two\nline three\n",
+    )
+    .expect("source TextBox recorded");
+    assert_eq!(
+        rt.node(editor)
+            .unwrap()
+            .property(PropertyId::VerticalAlignment),
+        Some(&PropertyValue::VerticalAlignment(
+            VerticalAlignment::Stretch
+        )),
+        "the source TextBox stretches to fill the ScrollViewer viewport"
     );
 }
 
