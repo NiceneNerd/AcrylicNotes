@@ -17,12 +17,13 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use windows_reactor::{
-    Brush, Button, ChildrenControl, Component, ComponentContext, ContentControl, Grid,
-    GridChildExt, GridLength, HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, Orientation,
-    ScrollBarVisibility, ScrollViewer, SlotView, SlotsControl, SplitView, SplitViewDisplayMode,
-    SplitViewSlot, StackPanel, TextBlock, TextBox, TextWrapping, ThemeBrush, TitleBar,
-    TitleBarSlot, TreeNode, TreeView, TreeViewExt, TreeViewSelectionMode, View, ViewContext,
-    WindowBackdrop, WindowTheme, WindowTitleBarHeight, WindowVisuals,
+    AutomationExt, Border, Brush, Button, ChildrenControl, Component, ComponentContext,
+    ContentControl, FontWeight, Grid, GridChildExt, GridLength, HyperlinkButton, InfoBar,
+    InfoBarSeverity, KeyedView, LayoutControl, Orientation, ScrollBarVisibility, ScrollViewer,
+    SlotView, SlotsControl, SplitView, SplitViewDisplayMode, SplitViewSlot, StackPanel, TextBlock,
+    TextBox, TextWrapping, ThemeBrush, TitleBar, TitleBarSlot, TreeNode, TreeView, TreeViewExt,
+    TreeViewSelectionMode, View, ViewContext, WindowBackdrop, WindowTheme, WindowTitleBarHeight,
+    WindowVisuals,
 };
 
 use vault_app::commands::UiCommand;
@@ -435,9 +436,16 @@ impl Component for Shell {
                 KeyedView::new("sidebar-panel", sidebar_panel),
             ]);
 
-        // Tab bar: one activate button and one close button per tab,
-        // keyed by tab id so reconciliation preserves identity as tabs
-        // open and close. The active tab's label is bracketed.
+        // Tab strip: a horizontal, scrollable row of tabs mirroring the
+        // Linux app's tab bar. Each tab shows the note's title and, dimmed
+        // beside it, the folder the note lives in (so two notes with the
+        // same name are told apart at a glance); a leading dot marks
+        // unsaved edits and a per-tab close button sits at the right. The
+        // active tab is tinted and its title is bold. Keyed by path so
+        // reconciliation keeps identity as tabs open and close (the kernel
+        // never holds two tabs for one path). Automation names give each
+        // control a stable, accessible handle for screen readers and the
+        // headless tests.
         let tabs: Vec<KeyedView> = state
             .tabs
             .order()
@@ -445,30 +453,71 @@ impl Component for Shell {
             .map(|&tab| {
                 let path = state.tabs.path(tab).unwrap_or("?").to_string();
                 let is_active = state.tabs.active() == Some(tab);
-                let label = if is_active {
-                    format!("[{path}]")
-                } else {
-                    path.clone()
-                };
+                let dirty = app
+                    .buffers
+                    .get(&tab)
+                    .is_some_and(crate::app::NoteBuffer::is_dirty);
+                let mut title = vault_app::fuzzy::title_of(&path);
+                if dirty {
+                    title = format!("• {title}");
+                }
+                let folder = path
+                    .rsplit_once('/')
+                    .map(|(folder, _)| folder.to_string())
+                    .unwrap_or_default();
                 let position = state.tabs.position(tab).unwrap_or(0);
+
+                // The clickable label: the title, plus the folder dimmed
+                // beside it when the note is not at the vault root.
+                let mut label_cells: Vec<KeyedView> = vec![KeyedView::new(
+                    "title",
+                    TextBlock::new().text(title).font_weight(if is_active {
+                        FontWeight::SEMI_BOLD
+                    } else {
+                        FontWeight::NORMAL
+                    }),
+                )];
+                if !folder.is_empty() {
+                    label_cells.push(KeyedView::new(
+                        "folder",
+                        TextBlock::new().text(folder).font_size(12.0).opacity(0.6),
+                    ));
+                }
+                let label = StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(6.0)
+                    .keyed_children(label_cells);
                 let activate = Button::new()
+                    .automation_name(format!("open {path}"))
                     .on_click(context.callback(move |()| {
                         WindowsMessage::Command(UiCommand::ActivateTab { position })
                     }))
-                    .content(TextBlock::new().text(label));
+                    .content(label);
                 let close = Button::new()
+                    .automation_name(format!("close {path}"))
                     .on_click(context.callback(move |()| {
                         WindowsMessage::Command(UiCommand::CloseTab { position })
                     }))
-                    .content(TextBlock::new().text(format!("close {path}")));
-                // The tab path doubles as the key: the kernel never
-                // holds two tabs for one path (open_or_focus dedupes).
-                KeyedView::new(
-                    path.clone(),
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .children([activate, close]),
-                )
+                    .content(TextBlock::new().text("✕"));
+                let row = StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(4.0)
+                    .keyed_children([
+                        KeyedView::new("open", activate),
+                        KeyedView::new("close", close),
+                    ]);
+                let mut tab_body = Border::new().padding(4.0).corner_radius(4.0);
+                if is_active {
+                    // A card fill plus a thin accent border reads as the
+                    // selected tab against the note-area surface in both
+                    // light and dark themes (the surface itself is themed
+                    // below, so a plain fill could blend into it).
+                    tab_body = tab_body
+                        .background(Brush::Theme(ThemeBrush::CardBackground))
+                        .border_brush(Brush::Theme(ThemeBrush::Accent))
+                        .border_thickness(1.0);
+                }
+                KeyedView::new(path, tab_body.content(row))
             })
             .collect();
 
@@ -648,10 +697,18 @@ impl Component for Shell {
         // bounded viewport — a StackPanel would hand them infinite height
         // and nothing would ever scroll. Split shows both panes side by
         // side (Linux's fixed 50/50, no divider).
-        let tab_bar = StackPanel::new()
+        // The strip scrolls sideways when more tabs than fit are open, the
+        // same behavior as the Linux app's horizontal tab bar.
+        let tab_bar = ScrollViewer::new()
             .grid_row(0)
-            .orientation(Orientation::Vertical)
-            .keyed_children(tabs);
+            .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
+            .vertical_scroll_bar_visibility(ScrollBarVisibility::Disabled)
+            .content(
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(2.0)
+                    .keyed_children(tabs),
+            );
         let pane_body: View = if show_source && show_reading {
             let editor = ScrollViewer::new()
                 .grid_column(0)

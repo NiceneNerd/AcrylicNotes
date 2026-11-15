@@ -19,8 +19,8 @@ use std::rc::Rc;
 
 use windows_reactor::test::{NodeId, PropertyId, PropertyValue, Pump, RecordingRuntime, SlotId};
 use windows_reactor::{
-    ChildrenControl, Component, ComponentContext, KeyedView, LocalSender, Orientation, StackPanel,
-    TextBlock, View, ViewContext,
+    ChildrenControl, Component, ComponentContext, FontWeight, KeyedView, LocalSender, Orientation,
+    StackPanel, TextBlock, View, ViewContext,
 };
 
 /// The sidebar file-tree view (kernel state, see `file_tree.rs`).
@@ -381,10 +381,19 @@ fn headless_shell_renders_tabs_editor_and_error_line() {
     switch_pane(&mut pump, "source");
     let window = pump.window().expect("window node");
     let rt = pump.runtime();
-    // Active tab renders bracketed; the editor shows the buffer text.
-    assert!(
-        find_owner_of_label(rt, window, "[a.md]").is_some(),
-        "active tab button recorded"
+    // The tab strip renders the active tab (bold title); the editor shows
+    // the buffer text.
+    let tab_button =
+        find_node_with_property_text(rt, window, PropertyId::AutomationName, "open a.md")
+            .expect("active tab button recorded");
+    let title = find_node_with_property_text(rt, tab_button, PropertyId::TextBlockText, "a")
+        .expect("tab title recorded");
+    assert_eq!(
+        rt.node(title)
+            .unwrap()
+            .property(PropertyId::TextBlockFontWeight),
+        Some(&PropertyValue::FontWeight(FontWeight::SEMI_BOLD)),
+        "the active tab's title is bold"
     );
     let editor = find_node_with_property_text(rt, window, PropertyId::TextBoxText, "a body\n")
         .expect("editor recorded");
@@ -451,7 +460,8 @@ fn headless_shell_tab_switch_syncs_the_editor_programmatically() {
     let window = pump.window().expect("window node");
     let target = {
         let rt = pump.runtime();
-        find_owner_of_label(rt, window, "a.md").expect("a.md tab button recorded")
+        find_node_with_property_text(rt, window, PropertyId::AutomationName, "open a.md")
+            .expect("a.md tab button recorded")
     };
     click(&mut pump, target, EventId::ButtonClick);
 
@@ -526,7 +536,8 @@ fn headless_shell_click_activates_the_clicked_tab() {
     let window = pump.window().expect("window node");
     let target = {
         let rt = pump.runtime();
-        find_owner_of_label(rt, window, "a.md").expect("a.md tab button recorded")
+        find_node_with_property_text(rt, window, PropertyId::AutomationName, "open a.md")
+            .expect("a.md tab button recorded")
     };
     click(&mut pump, target, EventId::ButtonClick);
 
@@ -539,8 +550,32 @@ fn headless_shell_click_activates_the_clicked_tab() {
     );
     let window = pump.window().expect("window node");
     let rt = pump.runtime();
-    assert!(find_owner_of_label(rt, window, "[a.md]").is_some());
-    assert!(find_owner_of_label(rt, window, "b.md").is_some());
+    // a.md is active: its title is bold.
+    let tab_button =
+        find_node_with_property_text(rt, window, PropertyId::AutomationName, "open a.md")
+            .expect("a.md tab button recorded");
+    let title = find_node_with_property_text(rt, tab_button, PropertyId::TextBlockText, "a")
+        .expect("a.md tab title recorded");
+    assert_eq!(
+        rt.node(title)
+            .unwrap()
+            .property(PropertyId::TextBlockFontWeight),
+        Some(&PropertyValue::FontWeight(FontWeight::SEMI_BOLD)),
+        "the active tab's title is bold"
+    );
+    // b.md is not active: its title is normal weight.
+    let b_button =
+        find_node_with_property_text(rt, window, PropertyId::AutomationName, "open b.md")
+            .expect("b.md tab button recorded");
+    let b_title = find_node_with_property_text(rt, b_button, PropertyId::TextBlockText, "b")
+        .expect("b.md tab title recorded");
+    assert_eq!(
+        rt.node(b_title)
+            .unwrap()
+            .property(PropertyId::TextBlockFontWeight),
+        Some(&PropertyValue::FontWeight(FontWeight::NORMAL)),
+        "the inactive tab's title is not bold"
+    );
 }
 
 #[test]
@@ -554,7 +589,8 @@ fn headless_shell_click_closes_a_tab() {
     let window = pump.window().expect("window node");
     let target = {
         let rt = pump.runtime();
-        find_owner_of_label(rt, window, "close a.md").expect("close button recorded")
+        find_node_with_property_text(rt, window, PropertyId::AutomationName, "close a.md")
+            .expect("close button recorded")
     };
     click(&mut pump, target, EventId::ButtonClick);
 
