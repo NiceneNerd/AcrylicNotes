@@ -146,6 +146,12 @@ pub mod testing {
         notes: HashMap<String, String>,
         fail_saves_with: Option<String>,
         saved: Vec<SaveRecord>,
+        /// Tags per note path (the [`NoteIndex`](crate::navigation::NoteIndex)
+        /// fake's data, built with [`MemoryRepository::add_tag`]).
+        tags: HashMap<String, Vec<String>>,
+        /// Outgoing links, `from -> to` (built with
+        /// [`MemoryRepository::link`]).
+        links: Vec<(String, String)>,
     }
 
     impl MemoryRepository {
@@ -176,6 +182,48 @@ pub mod testing {
         #[must_use]
         pub fn save_records(&self) -> Vec<SaveRecord> {
             self.saved.clone()
+        }
+
+        /// Record that `path` is tagged `tag` (the index fake's data).
+        pub fn add_tag(&mut self, path: &str, tag: &str) {
+            self.tags
+                .entry(path.to_string())
+                .or_default()
+                .push(tag.to_string());
+        }
+
+        /// Record that the note `from` links to `to` (the index fake's
+        /// backlink data).
+        pub fn link(&mut self, from: &str, to: &str) {
+            self.links.push((from.to_string(), to.to_string()));
+        }
+
+        /// Resolve a link target against the stored notes: exact path,
+        /// then with `.md`, then a unique basename match — enough
+        /// determinism for the UI tests (the real shortest-unique-name
+        /// policy is vault-core's and is tested there).
+        fn resolve(&self, target: &str) -> Option<String> {
+            if self.notes.contains_key(target) {
+                return Some(target.to_string());
+            }
+            let with_md = format!("{target}.md");
+            if self.notes.contains_key(&with_md) {
+                return Some(with_md);
+            }
+            let base = target.rsplit('/').next().unwrap_or(target);
+            let base_md = format!("{base}.md");
+            let matches: Vec<&String> = self
+                .notes
+                .keys()
+                .filter(|path| {
+                    let name = path.rsplit('/').next().unwrap_or(path);
+                    name == base || name == base_md
+                })
+                .collect();
+            if matches.len() == 1 {
+                return Some(matches[0].clone());
+            }
+            None
         }
 
         fn write(
@@ -256,9 +304,74 @@ pub mod testing {
         }
     }
 
+    impl crate::navigation::NoteIndex for MemoryRepository {
+        fn tag_counts(&self) -> Vec<(String, usize)> {
+            // BTreeMap keeps the tag-name order the panel shows.
+            let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+            for list in self.tags.values() {
+                for tag in list {
+                    *counts.entry(tag.clone()).or_default() += 1;
+                }
+            }
+            counts.into_iter().collect()
+        }
+
+        fn tag_notes(&self, tag: &str) -> Vec<String> {
+            let mut paths: Vec<String> = self
+                .tags
+                .iter()
+                .filter(|(_, tags)| tags.iter().any(|candidate| candidate == tag))
+                .map(|(path, _)| path.clone())
+                .collect();
+            paths.sort();
+            paths
+        }
+
+        fn backlinks(&self, path: &str) -> Vec<String> {
+            let mut sources: Vec<String> = self
+                .links
+                .iter()
+                .filter(|(_, to)| to == path)
+                .map(|(from, _)| from.clone())
+                .collect();
+            sources.sort();
+            sources.dedup();
+            sources
+        }
+
+        fn resolve_note(&self, target: &str, _from: &str) -> Option<String> {
+            self.resolve(target)
+        }
+
+        fn resolve_relative(&self, target: &str, from: &str) -> Option<String> {
+            // Folder-relative: join against `from`'s folder, collapse
+            // `.`/`..`, then exact or +".md" match (standard Markdown
+            // links carry their extension; wiki-style omits it).
+            let dir = from.rsplit_once('/').map_or("", |(d, _)| d);
+            let joined_source = format!("{dir}/{target}");
+            let mut parts: Vec<&str> = Vec::new();
+            for part in joined_source.split('/') {
+                match part {
+                    "" | "." => {}
+                    ".." => {
+                        parts.pop();
+                    }
+                    other => parts.push(other),
+                }
+            }
+            let joined = parts.join("/");
+            if self.notes.contains_key(&joined) {
+                return Some(joined);
+            }
+            let with_md = format!("{joined}.md");
+            self.notes.contains_key(&with_md).then_some(with_md)
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::navigation::NoteIndex;
 
         #[test]
         fn the_fake_refuses_a_stale_sentinel_like_the_real_vault() {
@@ -296,6 +409,61 @@ pub mod testing {
                 repo.save_body("gone.md", "", "x"),
                 Err(RepositoryError::NotFound { .. })
             ));
+        }
+
+        #[test]
+        fn the_index_fake_serves_tag_counts_backlinks_and_resolution() {
+            let mut repo = MemoryRepository::new();
+            repo.insert("notes/alpha.md", "a\n");
+            repo.insert("notes/beta.md", "b\n");
+            repo.insert("root.md", "r\n");
+            repo.add_tag("notes/alpha.md", "work");
+            repo.add_tag("notes/beta.md", "work");
+            repo.add_tag("root.md", "home");
+            repo.link("root.md", "notes/alpha.md");
+            repo.link("notes/beta.md", "notes/alpha.md");
+
+            assert_eq!(
+                repo.tag_counts(),
+                vec![("home".to_string(), 1usize), ("work".to_string(), 2usize),]
+            );
+            assert_eq!(
+                repo.tag_notes("work"),
+                vec!["notes/alpha.md".to_string(), "notes/beta.md".to_string()]
+            );
+            assert_eq!(
+                repo.backlinks("notes/alpha.md"),
+                vec!["notes/beta.md".to_string(), "root.md".to_string()]
+            );
+            // Exact path, extension completion, unique basename.
+            assert_eq!(
+                repo.resolve_note("notes/alpha.md", "root.md"),
+                Some("notes/alpha.md".to_string())
+            );
+            assert_eq!(
+                repo.resolve_note("notes/alpha", "root.md"),
+                Some("notes/alpha.md".to_string())
+            );
+            assert_eq!(
+                repo.resolve_note("alpha", "root.md"),
+                Some("notes/alpha.md".to_string())
+            );
+            assert_eq!(repo.resolve_note("missing", "root.md"), None);
+
+            // Folder-relative targets join against the source's folder.
+            assert_eq!(
+                repo.resolve_relative("beta.md", "notes/alpha.md"),
+                Some("notes/beta.md".to_string())
+            );
+            assert_eq!(
+                repo.resolve_relative("beta", "notes/alpha.md"),
+                Some("notes/beta.md".to_string())
+            );
+            assert_eq!(
+                repo.resolve_relative("../root.md", "notes/alpha.md"),
+                Some("root.md".to_string())
+            );
+            assert_eq!(repo.resolve_relative("gone.png", "notes/alpha.md"), None);
         }
     }
 }

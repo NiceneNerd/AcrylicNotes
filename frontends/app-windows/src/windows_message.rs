@@ -37,6 +37,11 @@ pub enum NativeEvent {
     /// (disk) text is untouched — dirtiness stays exactly "buffer text
     /// differs from disk text".
     EditorEdited { text: String },
+    /// A tag row was clicked (tag panel drill-down, and later the
+    /// reading view's tags). Shell-local view state: selecting or
+    /// clearing a tag never touches the vault, so it stays out of the
+    /// kernel (the same split the file tree's expansion state uses).
+    TagToggled { tag: String },
 }
 
 #[cfg(test)]
@@ -51,6 +56,9 @@ mod tests {
                 effect: vault_app::ids::EffectId::new(7),
             }),
             WindowsMessage::Native(NativeEvent::WindowClosing),
+            WindowsMessage::Native(NativeEvent::TagToggled {
+                tag: "work".to_string(),
+            }),
         ];
         // A smoke pass over the variants; behavior lives in app.rs tests.
         assert!(matches!(messages[0], WindowsMessage::Command(_)));

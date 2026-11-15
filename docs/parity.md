@@ -35,7 +35,7 @@ scenarios.
 | PANE-* | Split mode | — | — | Existing (reference) | Not started |
 | EDIT-*, PANE-* | Live mode | — | — | Existing (reference; word/offset math shared via `vault_app::editor` since Phase 6) | Not started |
 | NAV-* | Search | — | — | Existing (reference) | Not started |
-| NAV-* | Tags/backlinks | — | — | Existing (reference) | Not started |
+| NAV-* | Tags/backlinks | — | — | Existing (reference) | Functional: the shared `NoteIndex` adapter (kernel `vault_app::navigation`, real impl over vault-core's index, `MemoryRepository` fake for tests) feeds the shell's Tags panel (counts, shell-local drill-down) and Links panel (backlinks of the active note), rows open notes through `OpenNote` with index resolution of bare titles; headless-verified (Wine) |
 | NAV-* | Outline | — | — | Existing (reference) | Not started |
 | NAV-* | Quick switcher | — | — | Existing (reference; switcher/fuzzy/tags/backlinks/outline/tree view models shared via `vault_app::{navigation,tree,fuzzy}` since Phase 5) | Not started |
 | EDIT-* | Find/replace | — | — | Existing (reference; matching shared via `vault_app::editor` since Phase 6) | Not started |
@@ -81,6 +81,7 @@ machine and is never claimed via Wine.
 | APPWIN-008 | Native window loop, WinUI controls, live adapters | In progress (p11): `Shell` renders TreeView sidebar, tab bar, pane-mode buttons, source editor, reading view, and error line from kernel state, all headless-verified (RecordingRuntime under Wine); `main.rs` window loop awaits the p11 platform adapters; keyboard routing is blocked by windows-reactor 0.100.0's limited AcceleratorKey set; real-rendering/IME/DPI/pickers/packaging checks remain user-side |
 | APPWIN-009 | Cross-target verification (xtask + CI) | Done, runs on Linux: cross-target checks + headless Wine UI tests; real-Windows smoke remains user-side |
 | APPWIN-010 | Appearance (window theme, glass backdrop, title, boot pane) | Done, headless-verified (Wine): the shell declares `window_visuals` from the kernel's persisted theme/glass every publication, themes are switched through kernel `SetTheme`/`SetGlassEnabled` (persisted load-modify-store), the session boots into the persisted `default_pane`/sidebar, and the window is titled VaultNotes |
+| APPWIN-011 | Vault-index adapter + Tags/Links panels | Done, headless-verified (Wine): the `NoteIndex` trait in `vault_app::navigation` (tag counts/notes, backlinks, wiki-link + folder-relative resolution) is implemented by the live `Vault` (same `Rc` as the repository in `main.rs`) and by the `MemoryRepository` fake; the shell renders the Tags panel (counts, drill-down as shell-local state via `NativeEvent::TagToggled`) and the Links panel (backlinks, empty state), and `OpenNote` resolves bare titles through the index before opening |
 
 ## Baseline (Phase 0)
 

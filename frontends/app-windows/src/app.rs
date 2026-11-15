@@ -19,6 +19,7 @@ use std::rc::Rc;
 use vault_app::commands::UiCommand;
 use vault_app::effects::{AppEvent, Effect, EffectKind};
 use vault_app::ids::{EffectId, TabId};
+use vault_app::navigation::NoteIndex;
 use vault_app::repository::NoteRepository;
 use vault_app::settings::SettingsStore;
 use vault_app::workflow::SaveOutcome;
@@ -81,6 +82,7 @@ impl WindowsApp {
     #[must_use]
     pub fn new(
         repo: Rc<RefCell<dyn NoteRepository>>,
+        index: Rc<RefCell<dyn NoteIndex>>,
         opener: Rc<dyn ExternalOpener>,
         settings: Rc<RefCell<dyn SettingsStore>>,
         root: impl Into<std::path::PathBuf>,
@@ -97,7 +99,7 @@ impl WindowsApp {
         shared.state.glass_enabled = document.glass_enabled;
         Self {
             shared,
-            runner: WindowsEffectRunner::new(repo, opener, settings, root),
+            runner: WindowsEffectRunner::new(repo, index, opener, settings, root),
             buffers: HashMap::new(),
         }
     }
@@ -115,15 +117,34 @@ impl WindowsApp {
     pub fn handle_native(&mut self, message: WindowsMessage) {
         match message {
             WindowsMessage::Command(UiCommand::OpenNote { path }) => {
-                // Open the tab in the kernel, then populate the frontend
-                // buffer from disk so the reading view has something to render.
-                let effects = self
+                // Resolve through the vault index first: wiki links and
+                // switcher entries carry bare titles ("Meeting Notes"),
+                // while the file tree carries exact paths (which resolve
+                // to themselves). Unresolved targets open as-is — the
+                // failed read surfaces on the error line. Resolution is
+                // relative to the active note (nearest-first is the
+                // index's policy), empty when no tab is open.
+                let from = self
                     .shared
-                    .dispatch(UiCommand::OpenNote { path: path.clone() });
+                    .state
+                    .tabs
+                    .active_path()
+                    .unwrap_or("")
+                    .to_string();
+                let resolved = self
+                    .runner
+                    .resolve_note(&path, &from)
+                    .unwrap_or_else(|| path.clone());
+                // Open the tab in the kernel, then populate the frontend
+                // buffer from disk so the reading view has something to
+                // render.
+                let effects = self.shared.dispatch(UiCommand::OpenNote {
+                    path: resolved.clone(),
+                });
                 self.run_effects(effects);
-                if let Some(tab) = self.shared.state.tabs.id_of(&path) {
+                if let Some(tab) = self.shared.state.tabs.id_of(&resolved) {
                     if !self.buffers.contains_key(&tab) {
-                        if let Ok(text) = self.runner.read_note(&path) {
+                        if let Ok(text) = self.runner.read_note(&resolved) {
                             self.buffers.insert(tab, NoteBuffer::clean(text));
                         }
                     }
@@ -271,6 +292,9 @@ impl WindowsApp {
                 self.run_effects(effects);
             }
             NativeEvent::EditorEdited { text } => self.set_active_buffer_text(text),
+            // Tag toggles never reach the kernel host: the shell handles
+            // them in its own update (shell-local view state).
+            NativeEvent::TagToggled { .. } => {}
         }
     }
 
@@ -332,6 +356,7 @@ mod tests {
         let settings = Rc::new(RefCell::new(MemorySettingsStore::default()));
         let app = WindowsApp::new(
             repo.clone(),
+            repo.clone(),
             opener.clone(),
             settings.clone(),
             std::env::temp_dir(),
@@ -365,6 +390,46 @@ mod tests {
             base: "same".into(),
         };
         assert!(dirty.is_dirty());
+    }
+
+    #[test]
+    fn an_open_note_resolves_bare_titles_through_the_index() {
+        // Wiki links and switcher entries carry bare titles: OpenNote
+        // resolves them through the vault index before opening.
+        let (mut app, _repo, _opener) = app_with(&[("notes/meeting.md", "minutes\n")]);
+        app.handle_native(WindowsMessage::Command(UiCommand::OpenNote {
+            path: "meeting".into(),
+        }));
+
+        assert_eq!(
+            app.shared.state.tabs.active_path(),
+            Some("notes/meeting.md"),
+            "the bare title resolved to the real note path"
+        );
+        let tab = app
+            .shared
+            .state
+            .tabs
+            .id_of("notes/meeting.md")
+            .expect("resolved tab");
+        assert_eq!(
+            app.buffers.get(&tab).map(|b| b.text.as_str()),
+            Some("minutes\n"),
+            "the buffer read the resolved note"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_open_note_opens_its_raw_target() {
+        // Nothing matches: the target opens as-is (the kernel opens the
+        // tab; the missing note simply has no buffer to populate).
+        let (mut app, _repo, _opener) = app_with(&[("a.md", "a\n")]);
+        app.handle_native(WindowsMessage::Command(UiCommand::OpenNote {
+            path: "gone".into(),
+        }));
+
+        assert_eq!(app.shared.state.tabs.active_path(), Some("gone"));
+        assert!(app.buffers.is_empty());
     }
 
     #[test]
@@ -525,7 +590,8 @@ mod tests {
             },
         )));
         let mut app = WindowsApp::new(
-            repo,
+            repo.clone(),
+            repo.clone(),
             Rc::new(RecordingOpener::succeeding()),
             settings.clone(),
             std::env::temp_dir(),
@@ -558,7 +624,8 @@ mod tests {
             },
         )));
         let app = WindowsApp::new(
-            repo,
+            repo.clone(),
+            repo.clone(),
             Rc::new(RecordingOpener::succeeding()),
             settings.clone(),
             std::env::temp_dir(),
@@ -587,7 +654,8 @@ mod tests {
             },
         )));
         let mut app = WindowsApp::new(
-            repo,
+            repo.clone(),
+            repo.clone(),
             Rc::new(RecordingOpener::succeeding()),
             settings.clone(),
             std::env::temp_dir(),
@@ -617,8 +685,10 @@ mod tests {
         std::fs::write(dir.path().join("b.md"), "nothing to see\n").unwrap();
         std::fs::write(dir.path().join("c.txt"), "needle but not a note\n").unwrap();
 
+        let repo = Rc::new(RefCell::new(MemoryRepository::new()));
         let mut app = WindowsApp::new(
-            Rc::new(RefCell::new(MemoryRepository::new())),
+            repo.clone(),
+            repo.clone(),
             Rc::new(RecordingOpener::succeeding()),
             Rc::new(RefCell::new(MemorySettingsStore::default())),
             dir.path(),
@@ -739,7 +809,13 @@ mod tests {
             program: "xdg-open".into(),
         }));
         let settings = Rc::new(RefCell::new(MemorySettingsStore::default()));
-        let mut app = WindowsApp::new(repo, opener.clone(), settings, std::env::temp_dir());
+        let mut app = WindowsApp::new(
+            repo.clone(),
+            repo.clone(),
+            opener.clone(),
+            settings,
+            std::env::temp_dir(),
+        );
 
         app.handle_native(WindowsMessage::Command(UiCommand::OpenExternal {
             target: vault_platform::OpenTarget::File("/tmp/attachment.png".into()),

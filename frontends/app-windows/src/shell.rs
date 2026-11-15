@@ -72,6 +72,11 @@ pub struct Shell {
     /// (expansion/selection). Built once from the vault's note paths;
     /// expansion state persists across renders here.
     file_tree: FileTree,
+    /// The tag panel's drill-down selection (shell-local view state, the
+    /// same split as the file tree's expansion state): `None` shows the
+    /// tag list, `Some(tag)` shows that tag's notes. Clicking the
+    /// selected tag again clears it.
+    selected_tag: Option<String>,
 }
 
 impl Component for Shell {
@@ -84,6 +89,7 @@ impl Component for Shell {
             handle: input.clone(),
             rendered_editor: RefCell::new(String::new()),
             file_tree,
+            selected_tag: None,
         }
     }
 
@@ -92,6 +98,18 @@ impl Component for Shell {
     }
 
     fn update(&mut self, message: Self::Message, _context: &ComponentContext<Self>) {
+        // Tag drill-down is shell-local view state (never touches the
+        // vault): selecting a tag shows its notes, clicking the selected
+        // tag again clears the filter. No kernel dispatch, and the
+        // re-render follows the handled message.
+        if let WindowsMessage::Native(NativeEvent::TagToggled { tag }) = message {
+            self.selected_tag = if self.selected_tag.as_deref() == Some(tag.as_str()) {
+                None
+            } else {
+                Some(tag)
+            };
+            return;
+        }
         if let WindowsMessage::Native(NativeEvent::EditorEdited { text }) = &message {
             // Echo suppression: equal to the last rendered text means
             // the echo of our own programmatic sync (initial text set,
@@ -147,33 +165,29 @@ impl Component for Shell {
             )
             .nodes(build_tree_nodes(&self.file_tree));
 
-        // Sidebar navigation (kernel-owned via `state.panel`): one button
-        // per section the shell can render today. Tags and backlinks need
-        // the vault index adapter (a later p11 slice) and stay off the
-        // row; their panels render an honest placeholder if the kernel is
-        // ever switched to them by another command.
-        let nav_buttons: Vec<KeyedView> = [
-            ("files", NavSection::Files),
-            ("search", NavSection::Search),
-            ("outline", NavSection::Outline),
-        ]
-        .iter()
-        .map(|&(label, section)| {
-            let text = if state.panel == section {
-                format!("[{label}]")
-            } else {
-                label.to_string()
-            };
-            KeyedView::new(
-                format!("nav-{label}"),
-                Button::new()
-                    .on_click(context.callback(move |()| {
-                        WindowsMessage::Command(UiCommand::SetNavSection { section })
-                    }))
-                    .content(TextBlock::new().text(text)),
-            )
-        })
-        .collect();
+        // Sidebar navigation (kernel-owned via `state.panel`): one
+        // button per section, the active one bracketed. Tags and links
+        // read the vault through the shared `NoteIndex` adapter (the
+        // runner's `tag_counts`/`tag_notes`/`backlinks`).
+        let nav_buttons: Vec<KeyedView> = NavSection::ALL
+            .iter()
+            .map(|&section| {
+                let label = section.label().to_lowercase();
+                let text = if state.panel == section {
+                    format!("[{label}]")
+                } else {
+                    label.clone()
+                };
+                KeyedView::new(
+                    format!("nav-{label}"),
+                    Button::new()
+                        .on_click(context.callback(move |()| {
+                            WindowsMessage::Command(UiCommand::SetNavSection { section })
+                        }))
+                        .content(TextBlock::new().text(text)),
+                )
+            })
+            .collect();
         let nav_row = StackPanel::new()
             .orientation(Orientation::Horizontal)
             .keyed_children(nav_buttons);
@@ -230,6 +244,105 @@ impl Component for Shell {
                 ])
         };
 
+        // Tags panel (shell-local drill-down via `selected_tag`): the
+        // tag list with counts (`#tag (n)` rows), or the selected tag's
+        // notes with a back row. Clicking a tag toggles the filter
+        // (shell-local; never touches the vault); clicking a note opens
+        // it through the kernel.
+        let tags_panel = {
+            let mut rows: Vec<KeyedView> = Vec::new();
+            match &self.selected_tag {
+                None => {
+                    let counts = app.runner.tag_counts();
+                    if counts.is_empty() {
+                        rows.push(KeyedView::new(
+                            "no-tags",
+                            View::from(TextBlock::new().text("(no tags in this vault)")),
+                        ));
+                    }
+                    rows.extend(counts.into_iter().map(|(tag, count)| {
+                        let key = tag.clone();
+                        let click_tag = tag.clone();
+                        KeyedView::new(
+                            key,
+                            Button::new()
+                                .on_click(context.callback(move |()| {
+                                    WindowsMessage::Native(NativeEvent::TagToggled {
+                                        tag: click_tag.clone(),
+                                    })
+                                }))
+                                .content(TextBlock::new().text(format!("#{tag} ({count})"))),
+                        )
+                    }));
+                }
+                Some(tag) => {
+                    let selected = tag.clone();
+                    rows.push(KeyedView::new(
+                        "all-tags",
+                        Button::new()
+                            .on_click(context.callback(move |()| {
+                                WindowsMessage::Native(NativeEvent::TagToggled {
+                                    tag: selected.clone(),
+                                })
+                            }))
+                            .content(TextBlock::new().text(format!("← #{tag}"))),
+                    ));
+                    rows.extend(app.runner.tag_notes(tag).into_iter().map(|path| {
+                        let click_path = path.clone();
+                        KeyedView::new(
+                            path.clone(),
+                            Button::new()
+                                .on_click(context.callback(move |()| {
+                                    WindowsMessage::Command(UiCommand::OpenNote {
+                                        path: click_path.clone(),
+                                    })
+                                }))
+                                .content(TextBlock::new().text(path)),
+                        )
+                    }));
+                }
+            }
+            StackPanel::new()
+                .orientation(Orientation::Vertical)
+                .keyed_children(rows)
+        };
+
+        // Links panel: the active note's backlinks (the shared
+        // `NoteIndex` adapter's data, sorted by source path). Each row
+        // opens its source note.
+        let links_panel = match state.tabs.active_path() {
+            None => View::from(TextBlock::new().text("(open a note to see its backlinks)")),
+            Some(path) => {
+                let sources = app.runner.backlinks(path);
+                let rows: Vec<KeyedView> = if sources.is_empty() {
+                    vec![KeyedView::new(
+                        "no-backlinks",
+                        View::from(TextBlock::new().text("(no backlinks)")),
+                    )]
+                } else {
+                    sources
+                        .into_iter()
+                        .map(|source| {
+                            let click_source = source.clone();
+                            KeyedView::new(
+                                source.clone(),
+                                Button::new()
+                                    .on_click(context.callback(move |()| {
+                                        WindowsMessage::Command(UiCommand::OpenNote {
+                                            path: click_source.clone(),
+                                        })
+                                    }))
+                                    .content(TextBlock::new().text(source)),
+                            )
+                        })
+                        .collect()
+                };
+                StackPanel::new()
+                    .orientation(Orientation::Vertical)
+                    .keyed_children(rows)
+            }
+        };
+
         // Outline panel: the active buffer's headings (the shared
         // `vault_app::navigation::outline` view model), indented by
         // level. Parsed per render like the reading view; clicking an
@@ -254,16 +367,13 @@ impl Component for Shell {
             })
             .unwrap_or_else(|| View::from(TextBlock::new().text("(no note open)")));
 
-        // The active panel. Files is the default; the placeholder arms
-        // keep the match total for sections whose data source has not
-        // landed (tags/backlinks need the vault index adapter).
+        // The active panel. Files is the default.
         let sidebar_panel = match state.panel {
             NavSection::Files => tree_view,
             NavSection::Search => search_panel,
+            NavSection::Tags => tags_panel,
+            NavSection::Links => links_panel,
             NavSection::Outline => outline_panel,
-            NavSection::Tags | NavSection::Links => {
-                View::from(TextBlock::new().text("(panel needs the vault index adapter)"))
-            }
         };
         let sidebar = StackPanel::new()
             .orientation(Orientation::Vertical)

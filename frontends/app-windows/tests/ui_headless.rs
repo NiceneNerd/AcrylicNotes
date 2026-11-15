@@ -217,6 +217,7 @@ use app_windows::shell::{Shell, ShellHandle};
 use app_windows::windows_message::WindowsMessage;
 use app_windows::WindowsApp;
 use vault_app::commands::UiCommand;
+use vault_app::navigation::NoteIndex;
 use vault_app::repository::{testing::MemoryRepository, NoteRepository};
 use vault_app::settings::{AppSettings, MemorySettingsStore, ThemeChoice};
 use vault_platform::testing::{OpenCall, RecordingOpener};
@@ -241,7 +242,8 @@ fn shell_app_with_settings(
     }
     let settings = Rc::new(RefCell::new(MemorySettingsStore::default()));
     let app = WindowsApp::new(
-        repo as Rc<RefCell<dyn NoteRepository>>,
+        repo.clone() as Rc<RefCell<dyn NoteRepository>>,
+        repo.clone() as Rc<RefCell<dyn NoteIndex>>,
         Rc::new(RecordingOpener::succeeding()),
         settings.clone(),
         std::env::temp_dir(),
@@ -261,7 +263,8 @@ fn shell_app_with_document(
     }
     let settings = Rc::new(RefCell::new(MemorySettingsStore::starting_with(document)));
     let app = WindowsApp::new(
-        repo as Rc<RefCell<dyn NoteRepository>>,
+        repo.clone() as Rc<RefCell<dyn NoteRepository>>,
+        repo.clone() as Rc<RefCell<dyn NoteIndex>>,
         Rc::new(RecordingOpener::succeeding()),
         settings.clone(),
         std::env::temp_dir(),
@@ -550,7 +553,8 @@ fn headless_shell_save_click_surfaces_the_kernel_error_line() {
     repo.borrow_mut().insert("a.md", "old\n");
     repo.borrow_mut().fail_saves_with("io broke");
     let app = Rc::new(RefCell::new(WindowsApp::new(
-        repo as Rc<RefCell<dyn NoteRepository>>,
+        repo.clone() as Rc<RefCell<dyn NoteRepository>>,
+        repo.clone() as Rc<RefCell<dyn NoteIndex>>,
         Rc::new(RecordingOpener::succeeding()),
         Rc::new(RefCell::new(MemorySettingsStore::default())),
         std::env::temp_dir(),
@@ -827,7 +831,8 @@ fn headless_shell_reading_link_click_opens_the_url_through_the_kernel() {
         .insert("a.md", "see [the docs](https://example.com)\n");
     let opener = Rc::new(RecordingOpener::succeeding());
     let app = Rc::new(RefCell::new(WindowsApp::new(
-        repo as Rc<RefCell<dyn NoteRepository>>,
+        repo.clone() as Rc<RefCell<dyn NoteRepository>>,
+        repo.clone() as Rc<RefCell<dyn NoteIndex>>,
         opener.clone(),
         Rc::new(RefCell::new(MemorySettingsStore::default())),
         std::env::temp_dir(),
@@ -926,7 +931,8 @@ fn shell_app_with_root(notes: &[(&str, &str)], root: &std::path::Path) -> Rc<Ref
         repo.borrow_mut().insert(path, text);
     }
     let app = WindowsApp::new(
-        repo as Rc<RefCell<dyn NoteRepository>>,
+        repo.clone() as Rc<RefCell<dyn NoteRepository>>,
+        repo.clone() as Rc<RefCell<dyn NoteIndex>>,
         Rc::new(RecordingOpener::succeeding()),
         Rc::new(RefCell::new(MemorySettingsStore::default())),
         root,
@@ -1252,4 +1258,189 @@ fn headless_shell_boots_into_the_persisted_default_pane() {
         "the session boots into the persisted split pane"
     );
     assert!(find_owner_of_label(rt, window, "[split]").is_some());
+}
+
+// --- tags and links panels (the vault index adapter) --------------------------
+
+/// A shell whose repository fake is seeded with notes, tags, and links,
+/// handing back the repo so tests can seed index data before mounting.
+fn shell_app_with_index(
+    notes: &[(&str, &str)],
+    tags: &[(&str, &str)],
+    links: &[(&str, &str)],
+) -> (Rc<RefCell<WindowsApp>>, Rc<RefCell<MemoryRepository>>) {
+    let repo = Rc::new(RefCell::new(MemoryRepository::new()));
+    for (path, text) in notes {
+        repo.borrow_mut().insert(path, text);
+    }
+    for (path, tag) in tags {
+        repo.borrow_mut().add_tag(path, tag);
+    }
+    for (from, to) in links {
+        repo.borrow_mut().link(from, to);
+    }
+    let app = WindowsApp::new(
+        repo.clone() as Rc<RefCell<dyn NoteRepository>>,
+        repo.clone() as Rc<RefCell<dyn NoteIndex>>,
+        Rc::new(RecordingOpener::succeeding()),
+        Rc::new(RefCell::new(MemorySettingsStore::default())),
+        std::env::temp_dir(),
+    );
+    (Rc::new(RefCell::new(app)), repo)
+}
+
+#[test]
+fn headless_shell_tags_panel_lists_counts_and_drills_down() {
+    let (app, _repo) = shell_app_with_index(
+        &[("a.md", "a\n"), ("b.md", "b\n"), ("c.md", "c\n")],
+        &[("a.md", "work"), ("b.md", "work"), ("c.md", "home")],
+        &[],
+    );
+    shell_open_tab(&app, "c.md", "c\n", "c\n");
+
+    let mut pump = mounted_shell(&app);
+    // Switch the sidebar to Tags.
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "tags").expect("tags nav button")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    // The tag list shows each tag with its count.
+    let window = pump.window().expect("window node");
+    {
+        let rt = pump.runtime();
+        assert!(find_owner_of_label(rt, window, "#work (2)").is_some());
+        assert!(find_owner_of_label(rt, window, "#home (1)").is_some());
+        assert_eq!(
+            app.borrow().shared.state.panel,
+            vault_app::navigation::NavSection::Tags,
+            "the kernel owns the section"
+        );
+    }
+
+    // Clicking a tag drills down to its notes (shell-local filter).
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "#work (2)").expect("work tag row")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(
+        find_owner_of_label(rt, window, "← #work").is_some(),
+        "the drill-down shows a back row"
+    );
+    assert!(find_owner_of_label(rt, window, "a.md").is_some());
+    assert!(find_owner_of_label(rt, window, "b.md").is_some());
+    assert!(
+        find_owner_of_label(rt, window, "#work (2)").is_none(),
+        "the tag list is replaced by the drill-down"
+    );
+
+    // Clicking the back row clears the filter.
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "← #work").expect("back row")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(find_owner_of_label(rt, window, "#work (2)").is_some());
+    assert!(find_owner_of_label(rt, window, "a.md").is_none());
+}
+
+#[test]
+fn headless_shell_tags_drill_down_click_opens_the_note() {
+    let (app, _repo) = shell_app_with_index(
+        &[("a.md", "a\n"), ("b.md", "b\n")],
+        &[("a.md", "work"), ("b.md", "work")],
+        &[],
+    );
+    // Only b.md is open: clicking the a.md row must open it.
+    shell_open_tab(&app, "b.md", "b\n", "b\n");
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "tags").expect("tags nav button")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "#work (2)").expect("work tag row")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "a.md").expect("a.md note row")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    // The kernel opened the note and its buffer is populated.
+    assert_eq!(app.borrow().shared.state.tabs.active_path(), Some("a.md"));
+}
+
+#[test]
+fn headless_shell_links_panel_lists_backlinks_and_opens_one() {
+    // b.md links to a.md: with a.md active, the links panel lists b.md.
+    let (app, _repo) = shell_app_with_index(
+        &[("a.md", "a\n"), ("b.md", "b\n")],
+        &[],
+        &[("b.md", "a.md")],
+    );
+    shell_open_tab(&app, "a.md", "a\n", "a\n");
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "links").expect("links nav button")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    let window = pump.window().expect("window node");
+    {
+        let rt = pump.runtime();
+        assert!(
+            find_owner_of_label(rt, window, "b.md").is_some(),
+            "the backlink source is listed"
+        );
+    }
+
+    // Clicking the backlink opens its source note.
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "b.md").expect("b.md backlink row")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    assert_eq!(app.borrow().shared.state.tabs.active_path(), Some("b.md"));
+}
+
+#[test]
+fn headless_shell_links_panel_shows_the_empty_state_without_a_note() {
+    let (app, _repo) = shell_app_with_index(&[("a.md", "a\n")], &[], &[]);
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "links").expect("links nav button")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(
+        find_owner_of_label(rt, window, "(open a note to see its backlinks)").is_some(),
+        "the no-active-note hint is shown"
+    );
 }

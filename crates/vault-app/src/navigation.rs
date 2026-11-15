@@ -6,6 +6,64 @@ use vault_md::{Block, Doc};
 
 use crate::markdown::plain_inlines;
 
+/// The vault index adapter: tag lookups, backlinks, and link-path
+/// resolution.
+///
+/// The [`NoteRepository`](crate::repository::NoteRepository) trait
+/// deliberately hides its backing store, so tag/backlink data and link
+/// resolution need their own contract. vault-core's `Vault` provides the
+/// real one (nearest-first resolution is its index's job); tests inject
+/// the deterministic fake in `repository::testing`. Plan §12's
+/// navigation row: "counts and navigation come from shared models".
+pub trait NoteIndex {
+    /// Every tag with its note count, sorted by tag name (the order the
+    /// tag panel shows them).
+    fn tag_counts(&self) -> Vec<(String, usize)>;
+
+    /// The notes tagged `tag`, sorted by path (the order the panel's
+    /// drill-down lists them).
+    fn tag_notes(&self, tag: &str) -> Vec<String>;
+
+    /// The backlinks of `path`, sorted by source path.
+    fn backlinks(&self, path: &str) -> Vec<String>;
+
+    /// Resolve a link target (`[[Meeting Notes]]`, `Meeting Notes.md`,
+    /// `notes/b.md`) to a vault-relative note path, from `from`
+    /// (vault-core's index: exact, then extension, then
+    /// shortest-unique-name).
+    fn resolve_note(&self, target: &str, from: &str) -> Option<String>;
+
+    /// Resolve a folder-relative target (`Note.md`,
+    /// `../media/x.png`) against the source note's folder — standard
+    /// Markdown links, never shortest-unique-name. Attachment files
+    /// resolve too.
+    fn resolve_relative(&self, target: &str, from: &str) -> Option<String>;
+}
+
+impl NoteIndex for vault_core::Vault {
+    fn tag_counts(&self) -> Vec<(String, usize)> {
+        tag_counts(self)
+    }
+
+    fn tag_notes(&self, tag: &str) -> Vec<String> {
+        tag_notes(self, tag)
+    }
+
+    fn backlinks(&self, path: &str) -> Vec<String> {
+        sorted_backlinks(self, path)
+    }
+
+    fn resolve_note(&self, target: &str, from: &str) -> Option<String> {
+        self.index().resolve(target, from).map(str::to_string)
+    }
+
+    fn resolve_relative(&self, target: &str, from: &str) -> Option<String> {
+        self.index()
+            .resolve_relative(target, from)
+            .map(str::to_string)
+    }
+}
+
 /// One heading for the outline panel: its top-level block index, the
 /// heading level and its plain text (moved from the cosmic frontend's
 /// reading module; the data is pure `Doc` → rows).
@@ -359,6 +417,45 @@ mod tests {
         assert_eq!(
             tag_notes(&scratch, "alpha"),
             vec!["a.md".to_string(), "b.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_vault_index_adapter_serves_views_and_resolution() {
+        // The same fixture data arrives through the adapter the Windows
+        // shell holds (the free view models delegate to it).
+        let root = tests_dir().join("basic");
+        let vault = vault_core::Vault::open(&root).expect("fixture vault opens");
+        let adapter: &dyn NoteIndex = &vault;
+
+        assert_eq!(
+            adapter.backlinks("notes/sub/Deep Note.md"),
+            vec!["notes/Welcome.md".to_string()]
+        );
+
+        // Wikilink targets resolve to the fixture's note paths
+        // (nearest-first is vault-core's index policy).
+        assert_eq!(
+            adapter.resolve_note("Deep Note", "notes/Welcome.md"),
+            Some("notes/sub/Deep Note.md".to_string())
+        );
+        assert_eq!(
+            adapter.resolve_note("notes/Getting Started.md", "notes/Welcome.md"),
+            Some("notes/Getting Started.md".to_string())
+        );
+        assert_eq!(
+            adapter.resolve_note("no such note", "notes/Welcome.md"),
+            None
+        );
+
+        // Tag counts arrive through the same adapter.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.md"), "---\ntags: [alpha]\n---\n\nbody\n").unwrap();
+        let scratch = vault_core::Vault::open(tmp.path()).unwrap();
+        let scratch_index: &dyn NoteIndex = &scratch;
+        assert_eq!(
+            scratch_index.tag_counts(),
+            vec![("alpha".to_string(), 1usize)]
         );
     }
 }

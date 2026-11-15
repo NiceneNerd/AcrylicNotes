@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use vault_app::navigation::NoteIndex;
 use vault_app::repository::{NoteRepository, RepositoryError};
 use vault_app::search::{SearchHitView, SEARCH_MAX_HITS};
 use vault_app::settings::SettingsStore;
@@ -26,6 +27,10 @@ use vault_platform::{ExternalOpener, OpenError, OpenTarget};
 /// Holds the services the reducer's effects need.
 pub struct WindowsEffectRunner {
     repo: Rc<RefCell<dyn NoteRepository>>,
+    /// The vault index (tags, backlinks, link resolution). Production
+    /// passes the same live `Vault` as the repository; tests inject the
+    /// `MemoryRepository` fake (which implements both traits).
+    index: Rc<RefCell<dyn NoteIndex>>,
     opener: Rc<dyn ExternalOpener>,
     settings: Rc<RefCell<dyn SettingsStore>>,
     /// The vault root the shared search engine scans (the Linux shell
@@ -39,12 +44,14 @@ impl WindowsEffectRunner {
     #[must_use]
     pub fn new(
         repo: Rc<RefCell<dyn NoteRepository>>,
+        index: Rc<RefCell<dyn NoteIndex>>,
         opener: Rc<dyn ExternalOpener>,
         settings: Rc<RefCell<dyn SettingsStore>>,
         root: impl Into<PathBuf>,
     ) -> Self {
         Self {
             repo,
+            index,
             opener,
             settings,
             root: root.into(),
@@ -80,6 +87,31 @@ impl WindowsEffectRunner {
     /// file-tree sidebar's node list.
     pub fn note_paths(&self) -> Vec<String> {
         self.repo.borrow().note_paths()
+    }
+
+    /// Every tag with its note count, sorted by tag name (the tag
+    /// panel's list view; the shared `NoteIndex` adapter's data).
+    pub fn tag_counts(&self) -> Vec<(String, usize)> {
+        self.index.borrow().tag_counts()
+    }
+
+    /// The notes tagged `tag`, sorted by path (the tag panel's
+    /// drill-down view).
+    pub fn tag_notes(&self, tag: &str) -> Vec<String> {
+        self.index.borrow().tag_notes(tag)
+    }
+
+    /// The backlinks of `path`, sorted by source path (the links
+    /// panel's view).
+    pub fn backlinks(&self, path: &str) -> Vec<String> {
+        self.index.borrow().backlinks(path)
+    }
+
+    /// Resolve a link target to a vault-relative note path from `from`
+    /// (the shared adapter; exact, then extension, then
+    /// shortest-unique-name). `None` means the target matches nothing.
+    pub fn resolve_note(&self, target: &str, from: &str) -> Option<String> {
+        self.index.borrow().resolve_note(target, from)
     }
 
     /// Hand an open target to the platform's default handler. Success is

@@ -65,13 +65,18 @@ fn main() {
     let vault = Vault::open(vault_root).expect("could not open the vault");
     let vault_root_buf = vault.root().to_path_buf();
 
-    // 4. Platform services injected into the kernel host.
-    let repo: Rc<RefCell<dyn NoteRepository>> = Rc::new(RefCell::new(vault));
+    // 4. Platform services injected into the kernel host. The same live
+    //    Vault backs the repository and the note index (tags, backlinks,
+    //    link resolution).
+    let vault = Rc::new(RefCell::new(vault));
+    let repo: Rc<RefCell<dyn NoteRepository>> = vault.clone();
+    let index: Rc<RefCell<dyn vault_app::navigation::NoteIndex>> = vault.clone();
     let opener: Rc<dyn vault_platform::ExternalOpener> = Rc::new(WinOpener::new());
 
     // 5. Build the kernel host over the live services.
     let app = Rc::new(RefCell::new(WindowsApp::new(
         repo,
+        index,
         opener,
         settings,
         vault_root_buf,
