@@ -11,13 +11,16 @@
 use std::rc::Rc;
 
 use vault_md::{Block, Doc, Inline};
-use windows_reactor::EncodedImage;
 
-/// Resolves an image URL as written in a note to encoded raster bytes for
-/// inline rendering. `None` keeps the text placeholder, so a doc rendered
-/// with the default config stays text-only (remote images, missing files,
-/// and the headless renderer tests all land there).
-pub type ImageResolver = Rc<dyn Fn(&str) -> Option<EncodedImage>>;
+/// Resolves an image URL as written in a note to a `file:///` URI for inline
+/// rendering. `None` keeps the text placeholder, so a doc rendered with the
+/// default config stays text-only (remote images, missing files, and the
+/// headless renderer tests all land there).
+///
+/// The returned URI must be absolute (`file:///...`) so WinUI's `Image`
+/// control can load it natively (the backend handles `ImageValue::Uri`,
+/// not `EncodedImage`).
+pub type ImageResolver = Rc<dyn Fn(&str) -> Option<String>>;
 
 /// Reading-renderer configuration for the Windows shell.
 #[derive(Clone)]
@@ -26,8 +29,8 @@ pub struct WindowsMarkdownRenderer {
     pub show_images: bool,
     /// Whether the theme is dark (accent/contrast decisions).
     pub dark_mode: bool,
-    /// Optional local-image resolver (the shell installs one that reads
-    /// vault rasters and caches them by path).
+    /// Optional local-image resolver (the shell installs one that returns a
+    /// `file:///` URI for vault rasters, cached by path).
     pub image_resolver: Option<ImageResolver>,
 }
 

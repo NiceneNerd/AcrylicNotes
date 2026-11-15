@@ -485,7 +485,10 @@ fn headless_shell_renders_a_local_vault_image() {
     let window = pump.window().expect("window node");
     let rt = pump.runtime();
     let image = find_node_with_property(rt, window, PropertyId::ImageSource, &|value| {
-        matches!(value, PropertyValue::EncodedImage(_))
+        matches!(
+            value,
+            PropertyValue::Str(uri) if uri.starts_with("file:///")
+        ) || matches!(value, PropertyValue::EncodedImage(_))
     })
     .expect("local image rendered as an Image node");
     assert_eq!(

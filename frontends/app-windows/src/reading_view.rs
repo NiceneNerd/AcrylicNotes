@@ -13,11 +13,12 @@
 //! headlessly under Wine via the `RecordingRuntime`.
 
 use std::collections::HashMap;
+use std::fs;
 use vault_app::markdown::plain_inlines;
 use vault_md::{Block, Doc, Inline};
 use windows_reactor::{
-    Border, Callback, ChildrenControl, ContentControl, FontWeight, HyperlinkButton, Image,
-    KeyedView, LayoutControl, Orientation, StackPanel, Stretch, TextBlock, View,
+    Border, Callback, ChildrenControl, ContentControl, EncodedImage, FontWeight, HyperlinkButton,
+    Image, KeyedView, LayoutControl, Orientation, StackPanel, Stretch, TextBlock, View,
 };
 
 use super::reading::WindowsMarkdownRenderer;
@@ -142,7 +143,8 @@ fn block_view(
 ) -> View {
     match block {
         Block::Paragraph { content, .. } => StackPanel::new()
-            .orientation(Orientation::Vertical)
+            .orientation(Orientation::Horizontal)
+            .spacing(4.0)
             .keyed_children(content.iter().enumerate().map(|(i, inline)| {
                 KeyedView::new(
                     i.to_string(),
@@ -157,7 +159,8 @@ fn block_view(
                 _ => 16.0,
             };
             StackPanel::new()
-                .orientation(Orientation::Vertical)
+                .orientation(Orientation::Horizontal)
+                .spacing(4.0)
                 .keyed_children(content.iter().enumerate().map(|(i, inline)| {
                     KeyedView::new(
                         i.to_string(),
@@ -426,21 +429,43 @@ fn inline_view_with_style(
             }
         }
         Inline::Image { url, alt } => {
-            // A local vault raster renders inline (the shell installs the
-            // resolver); remote URLs and unreadable targets keep the text
-            // placeholder, the same contract the Linux shell follows.
+            // A local vault raster renders inline via a `file:///` URI — the
+            // WinUI backend handles `ImageValue::Uri` (not `EncodedImage`),
+            // so `source_data` is a no-op on real Windows. The resolver
+            // returns a canonical path; we build the URI and try `source`
+            // first, falling back to `source_data` (which works in test
+            // environments where `Uri::CreateUri` is unavailable).
             match config
                 .show_images
                 .then_some(config.image_resolver.as_ref())
                 .flatten()
             {
                 Some(resolve) => match resolve(url) {
-                    Some(image) => View::from(
-                        Image::new()
-                            .source_data(image)
-                            .stretch(Stretch::Uniform)
-                            .max_width(600.0),
-                    ),
+                    Some(path) => {
+                        let uri = format!("file:///{}", path.replace('\\', "/"));
+                        match Image::new().source(uri) {
+                            Ok(image) => View::from(
+                                image
+                                    .stretch(Stretch::Uniform)
+                                    .max_width(600.0)
+                                    .min_height(150.0),
+                            ),
+                            Err(_) => match fs::read(&path) {
+                                Ok(bytes) => View::from(
+                                    Image::new()
+                                        .source_data(EncodedImage::new(bytes))
+                                        .stretch(Stretch::Uniform)
+                                        .max_width(600.0)
+                                        .min_height(150.0),
+                                ),
+                                Err(_) => View::from(styled_text(
+                                    format!("[img: {alt}]"),
+                                    size,
+                                    font_weight,
+                                )),
+                            },
+                        }
+                    }
                     None => View::from(styled_text(format!("[img: {alt}]"), size, font_weight)),
                 },
                 None => {
@@ -459,13 +484,30 @@ fn inline_view_with_style(
             // placeholder until transclusion renders real note bodies.
             if config.show_images {
                 if let Some(resolve) = config.image_resolver.as_ref() {
-                    if let Some(image) = resolve(&embed.target.note) {
-                        return View::from(
-                            Image::new()
-                                .source_data(image)
-                                .stretch(Stretch::Uniform)
-                                .max_width(600.0),
-                        );
+                    if let Some(path) = resolve(&embed.target.note) {
+                        let uri = format!("file:///{}", path.replace('\\', "/"));
+                        return match Image::new().source(uri) {
+                            Ok(image) => View::from(
+                                image
+                                    .stretch(Stretch::Uniform)
+                                    .max_width(600.0)
+                                    .min_height(150.0),
+                            ),
+                            Err(_) => match fs::read(&path) {
+                                Ok(bytes) => View::from(
+                                    Image::new()
+                                        .source_data(EncodedImage::new(bytes))
+                                        .stretch(Stretch::Uniform)
+                                        .max_width(600.0)
+                                        .min_height(150.0),
+                                ),
+                                Err(_) => View::from(styled_text(
+                                    String::from("(embed)"),
+                                    size,
+                                    font_weight,
+                                )),
+                            },
+                        };
                     }
                 }
             }

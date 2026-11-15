@@ -18,13 +18,12 @@ use std::rc::Rc;
 
 use windows_reactor::{
     AutomationExt, Border, Brush, Button, ChildrenControl, Component, ComponentContext,
-    ContentControl, CornerRadius, EncodedImage, FontWeight, Grid, GridChildExt, GridLength,
-    HorizontalAlignment, HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, LayoutControl,
-    Orientation, ScrollBarVisibility, ScrollViewer, SlotView, SlotsControl, SplitView,
-    SplitViewDisplayMode, SplitViewSlot, StackPanel, TextBlock, TextBox, TextWrapping, ThemeBrush,
-    Thickness, TitleBar, TitleBarSlot, TreeNode, TreeView, TreeViewExt, TreeViewSelectionMode,
-    VerticalAlignment, View, ViewContext, WindowBackdrop, WindowSize, WindowTheme,
-    WindowTitleBarHeight, WindowVisuals,
+    ContentControl, CornerRadius, FontWeight, Grid, GridChildExt, GridLength, HorizontalAlignment,
+    HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, LayoutControl, Orientation,
+    ScrollBarVisibility, ScrollViewer, SlotView, SlotsControl, SplitView, SplitViewDisplayMode,
+    SplitViewSlot, StackPanel, TextBlock, TextBox, TextWrapping, ThemeBrush, Thickness, TitleBar,
+    TitleBarSlot, TreeNode, TreeView, TreeViewExt, TreeViewSelectionMode, VerticalAlignment, View,
+    ViewContext, WindowBackdrop, WindowSize, WindowTheme, WindowTitleBarHeight, WindowVisuals,
 };
 
 use vault_app::commands::UiCommand;
@@ -100,17 +99,18 @@ fn is_raster_image(path: &std::path::Path) -> bool {
     )
 }
 
-/// Resolve an image URL as written in a note to encoded bytes, reading
-/// local vault rasters and caching them by canonical path. Remote URLs
+/// Resolve an image URL as written in a note to a canonical file path for
+/// inline rendering. The shell builds a `file:///` URI from this path; the
+/// WinUI backend handles `ImageValue::Uri` (not `EncodedImage`). Remote URLs
 /// and anything that escapes the vault root return `None` (the text
-/// placeholder). The note-relative path is tried first, then the vault
-/// root, matching Obsidian's attachment lookup.
+/// placeholder). The note-relative path is tried first, then the vault root,
+/// matching Obsidian's attachment lookup.
 fn resolve_local_image(
     root: &std::path::Path,
     note_folder: &str,
-    cache: &Rc<RefCell<HashMap<String, Option<EncodedImage>>>>,
+    cache: &Rc<RefCell<HashMap<String, Option<String>>>>,
     url: &str,
-) -> Option<EncodedImage> {
+) -> Option<String> {
     if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:") {
         return None;
     }
@@ -136,7 +136,7 @@ fn resolve_local_image(
         if let Some(cached) = cache.borrow().get(&key) {
             return cached.clone();
         }
-        let resolved = std::fs::read(&canonical).ok().map(EncodedImage::new);
+        let resolved = Some(canonical.to_string_lossy().into_owned());
         cache.borrow_mut().insert(key, resolved.clone());
         return resolved;
     }
@@ -188,7 +188,7 @@ pub struct Shell {
     /// An entry of `None` records a failed lookup so a missing file is not
     /// re-read on every render. Shared with the renderer's resolver closure
     /// (hence `Rc`).
-    image_cache: Rc<RefCell<HashMap<String, Option<EncodedImage>>>>,
+    image_cache: Rc<RefCell<HashMap<String, Option<String>>>>,
 }
 
 impl Component for Shell {
