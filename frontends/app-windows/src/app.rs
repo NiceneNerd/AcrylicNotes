@@ -104,6 +104,19 @@ impl WindowsApp {
     /// reducer via `App::handle`.
     pub fn handle_native(&mut self, message: WindowsMessage) {
         match message {
+            WindowsMessage::Command(UiCommand::OpenNote { path }) => {
+                // Open the tab in the kernel, then populate the frontend
+                // buffer from disk so the reading view has something to render.
+                let effects = self.shared.dispatch(UiCommand::OpenNote { path: path.clone() });
+                self.run_effects(effects);
+                if let Some(tab) = self.shared.state.tabs.id_of(&path) {
+                    if self.buffers.get(&tab).is_none() {
+                        if let Ok(text) = self.runner.read_note(&path) {
+                            self.buffers.insert(tab, NoteBuffer::clean(text));
+                        }
+                    }
+                }
+            }
             WindowsMessage::Command(command) => {
                 let effects = self.shared.dispatch(command);
                 self.run_effects(effects);
