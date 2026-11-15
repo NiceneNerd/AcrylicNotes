@@ -17,7 +17,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use windows_reactor::test::{NodeId, PropertyId, PropertyValue, Pump, RecordingRuntime};
+use windows_reactor::test::{NodeId, PropertyId, PropertyValue, Pump, RecordingRuntime, SlotId};
 use windows_reactor::{
     ChildrenControl, Component, ComponentContext, KeyedView, LocalSender, Orientation, StackPanel,
     TextBlock, View, ViewContext,
@@ -304,11 +304,29 @@ fn mounted_shell(app: &Rc<RefCell<WindowsApp>>) -> Pump<RecordingRuntime> {
     pump
 }
 
+/// Direct children of `node`, including SplitView slot contents. The
+/// recording runtime places SplitView's pane and content in named slots
+/// rather than the default children list, so a plain `children()` walk
+/// would miss everything inside the SplitView.
+fn child_ids(rt: &RecordingRuntime, node: NodeId) -> Vec<NodeId> {
+    let Some(n) = rt.node(node) else {
+        return Vec::new();
+    };
+    let mut out: Vec<NodeId> = n.children().to_vec();
+    for slot in [SlotId::SplitViewPane, SlotId::SplitViewContent] {
+        if let Some(child) = n.slot(slot) {
+            out.push(child);
+        }
+        out.extend(n.slot_children(slot).iter().copied());
+    }
+    out
+}
+
 /// Find the node owning the TextBlock child whose text is exactly
 /// `label` (a button's content label makes its owner the button node).
 fn find_owner_of_label(rt: &RecordingRuntime, from: NodeId, label: &str) -> Option<NodeId> {
-    let node = rt.node(from)?;
-    for &child in node.children() {
+    rt.node(from)?;
+    for child in child_ids(rt, from) {
         if let Some(child_node) = rt.node(child) {
             if child_node.property(PropertyId::TextBlockText)
                 == Some(&PropertyValue::Str(label.to_string()))
@@ -578,15 +596,40 @@ fn headless_shell_save_click_surfaces_the_kernel_error_line() {
     );
     let window = pump.window().expect("window node");
     let rt = pump.runtime();
-    let error_line = find_node_with_property_text(
+    let error_banner = find_node_with_property_text(
         rt,
         window,
-        PropertyId::TextBlockText,
+        PropertyId::InfoBarMessage,
         "save failed: io broke",
     )
-    .expect("error line re-rendered");
-    // The error line is its own TextBlock node (not the button content).
-    assert_ne!(error_line, target, "error line is a distinct node");
+    .expect("error banner re-rendered");
+    // The error banner is its own InfoBar node (not the save button).
+    assert_ne!(error_banner, target, "error banner is a distinct node");
+}
+
+#[test]
+fn headless_shell_split_view_keeps_sidebar_and_content_in_separate_panes() {
+    // The skeleton re-parents the sidebar into the SplitView pane and the
+    // editor into the content slot; both must still resolve after the move.
+    let app = shell_app_with(&[("a.md", "a body\n")]);
+    shell_open_tab(&app, "a.md", "a body\n", "a body\n");
+    let mut pump = mounted_shell(&app);
+    switch_pane(&mut pump, "source");
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    // Pane slot: the file tree (sidebar) is still mounted.
+    assert!(
+        find_tree_view(rt, window).is_some(),
+        "sidebar tree in the SplitView pane"
+    );
+    // Content slot: the source editor is still mounted.
+    assert!(
+        find_node_with_property_text(rt, window, PropertyId::TextBoxText, "a body\n").is_some(),
+        "editor in the SplitView content slot"
+    );
+    // The window title and visuals are still declared each publication.
+    assert_eq!(rt.window_title(window), Some("VaultNotes"));
+    assert!(rt.window_visuals(window).is_some());
 }
 
 #[test]
@@ -629,7 +672,7 @@ fn find_node_with_property_text(
     if node.property(property) == Some(&PropertyValue::Str(value.to_string())) {
         return Some(from);
     }
-    for &child in node.children() {
+    for child in child_ids(rt, from) {
         if let Some(found) = find_node_with_property_text(rt, child, property, value) {
             return Some(found);
         }
@@ -642,7 +685,7 @@ fn find_text(rt: &RecordingRuntime, from: NodeId) -> Option<NodeId> {
     if node.property(PropertyId::TextBlockText).is_some() {
         return Some(from);
     }
-    for &child in node.children() {
+    for child in child_ids(rt, from) {
         if let Some(found) = find_text(rt, child) {
             return Some(found);
         }
@@ -657,7 +700,7 @@ fn find_tree_view(rt: &RecordingRuntime, from: NodeId) -> Option<NodeId> {
     if rt.tree_nodes(from).is_some() {
         return Some(from);
     }
-    for &child in rt.node(from)?.children() {
+    for child in child_ids(rt, from) {
         if let Some(found) = find_tree_view(rt, child) {
             return Some(found);
         }
@@ -1102,7 +1145,7 @@ fn collect_texts(rt: &RecordingRuntime, from: NodeId, out: &mut Vec<String>) {
         if let Some(PropertyValue::Str(text)) = node.property(PropertyId::TextBlockText) {
             out.push(text.clone());
         }
-        for &child in node.children() {
+        for child in child_ids(rt, from) {
             collect_texts(rt, child, out);
         }
     }

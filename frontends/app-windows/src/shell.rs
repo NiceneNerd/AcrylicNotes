@@ -16,8 +16,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use windows_reactor::{
-    Button, ChildrenControl, Component, ComponentContext, ContentControl, HyperlinkButton,
-    KeyedView, Orientation, StackPanel, TextBlock, TextBox, TreeNode, TreeView, TreeViewExt,
+    Button, ChildrenControl, Component, ComponentContext, ContentControl, Grid, GridChildExt,
+    GridLength, HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, Orientation,
+    ScrollBarVisibility, ScrollViewer, SlotView, SlotsControl, SplitView, SplitViewDisplayMode,
+    SplitViewSlot, StackPanel, TextBlock, TextBox, TreeNode, TreeView, TreeViewExt,
     TreeViewSelectionMode, View, ViewContext, WindowBackdrop, WindowTheme, WindowVisuals,
 };
 
@@ -55,7 +57,9 @@ impl ShellHandle {
     }
 }
 
-/// The native shell: tabs, editor, and error line over the shared kernel.
+/// The native shell over the shared kernel: a banner zone above a
+/// SplitView whose pane holds the sidebar and whose content holds the
+/// note area (tab strip, editor, reading view).
 pub struct Shell {
     handle: ShellHandle,
     /// The editor text as last rendered programmatically. A real WinUI
@@ -435,14 +439,14 @@ impl Component for Shell {
             })
             .collect();
 
-        // Error line: the kernel's last actionable error (empty when
-        // everything is fine).
-        let error_line = TextBlock::new().text(
-            state
-                .last_error
-                .clone()
-                .unwrap_or_else(|| String::from("(no errors)")),
-        );
+        // Error banner: the kernel's last actionable error, full-width and
+        // above the sidebar (Linux parity). It opens when the kernel records
+        // an error and closes again once a later action clears `last_error`.
+        let error_banner = InfoBar::new()
+            .severity(InfoBarSeverity::Error)
+            .is_open(state.last_error.is_some())
+            .message(state.last_error.clone().unwrap_or_default())
+            .is_closable(false);
 
         // Pane layout (kernel-owned via `state.pane`): one button per
         // mode, the active one bracketed. A click is a kernel command.
@@ -604,40 +608,79 @@ impl Component for Shell {
             })
             .unwrap_or_else(|| View::from(TextBlock::new().text("(no note open)")));
 
-        let mut main_area: Vec<KeyedView> = Vec::new();
+        // Note area: everything that renders inside the SplitView's content
+        // pane — the tab strip, the save button, the pane-mode and
+        // appearance rows, and the editor/reading view. Keys are preserved
+        // so reconciliation keeps tab identity across open/close.
+        let mut note_area: Vec<KeyedView> = Vec::new();
+        note_area.push(KeyedView::new(
+            "tab-bar",
+            StackPanel::new()
+                .orientation(Orientation::Vertical)
+                .keyed_children(tabs),
+        ));
+        // Save button (the toolbar stand-in for Ctrl+S).
+        note_area.push(KeyedView::new(
+            "save",
+            Button::new()
+                .on_click(context.callback(|()| WindowsMessage::Command(UiCommand::SaveActiveTab)))
+                .content(TextBlock::new().text("save")),
+        ));
+        note_area.extend(pane_buttons);
+        note_area.push(KeyedView::new("appearance-row", appearance_row));
         if show_source {
-            main_area.push(KeyedView::new("editor", View::from(source_editor)));
+            note_area.push(KeyedView::new(
+                "editor",
+                ScrollViewer::new()
+                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                    .content(source_editor),
+            ));
         }
         if show_reading {
-            main_area.push(KeyedView::new("reading-view", reading_area));
+            note_area.push(KeyedView::new(
+                "reading-view",
+                ScrollViewer::new()
+                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                    .content(reading_area),
+            ));
         }
-
-        let mut children = vec![
-            KeyedView::new("sidebar", sidebar),
-            KeyedView::new("error-line", error_line),
-            KeyedView::new(
-                "tab-bar",
-                StackPanel::new()
-                    .orientation(Orientation::Vertical)
-                    .keyed_children(tabs),
-            ),
-            // Save button (the toolbar stand-in for Ctrl+S).
-            KeyedView::new(
-                "save",
-                Button::new()
-                    .on_click(
-                        context.callback(|()| WindowsMessage::Command(UiCommand::SaveActiveTab)),
-                    )
-                    .content(TextBlock::new().text("save")),
-            ),
-        ];
-        children.extend(pane_buttons);
-        children.push(KeyedView::new("appearance-row", appearance_row));
-        children.extend(main_area);
-
-        StackPanel::new()
+        let note_area = StackPanel::new()
             .orientation(Orientation::Vertical)
-            .keyed_children(children)
+            .keyed_children(note_area);
+
+        // Banner zone (row 0): the error InfoBar spans the full width above
+        // the sidebar, matching the Linux app's banner/error stack.
+        let banner_zone = StackPanel::new()
+            .grid_row(0)
+            .grid_column(0)
+            .orientation(Orientation::Vertical)
+            .keyed_children([KeyedView::new("error-line", error_banner)]);
+
+        // SplitView (row 1): sidebar in the pane, note area in the content.
+        // `is_pane_open` is controlled by kernel `sidebar_open`; closing the
+        // pane writes back through `SetSidebarVisible` (wired to the title
+        // bar's pane toggle in a later slice).
+        let split_view = SplitView::new()
+            .grid_row(1)
+            .grid_column(0)
+            .display_mode(SplitViewDisplayMode::Inline)
+            .open_pane_length(250.0)
+            .is_pane_open(Some(state.sidebar_open))
+            .on_pane_closed(context.callback(move |open: bool| {
+                WindowsMessage::Command(UiCommand::SetSidebarVisible { open })
+            }))
+            .slots([
+                SlotView::new(SplitViewSlot::Pane, sidebar),
+                SlotView::new(SplitViewSlot::Content, note_area),
+            ]);
+
+        Grid::new()
+            .rows([GridLength::Auto, GridLength::STAR])
+            .columns([GridLength::STAR])
+            .keyed_children([
+                KeyedView::new("banner-zone", banner_zone),
+                KeyedView::new("split-view", split_view),
+            ])
     }
 }
 
