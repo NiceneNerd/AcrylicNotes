@@ -85,8 +85,18 @@ impl WindowsApp {
         settings: Rc<RefCell<dyn SettingsStore>>,
         root: impl Into<std::path::PathBuf>,
     ) -> Self {
+        // The session boots into the persisted settings snapshot: the
+        // boot pane, the sidebar, and the appearance (theme, glass) —
+        // the same startup contract the Linux shell follows.
+        let document = settings.borrow().load();
+        let mut shared = App::new();
+        shared.state.pane = document.default_pane;
+        shared.state.default_pane = document.default_pane;
+        shared.state.sidebar_open = document.sidebar_open;
+        shared.state.theme = document.theme;
+        shared.state.glass_enabled = document.glass_enabled;
         Self {
-            shared: App::new(),
+            shared,
             runner: WindowsEffectRunner::new(repo, opener, settings, root),
             buffers: HashMap::new(),
         }
@@ -107,10 +117,12 @@ impl WindowsApp {
             WindowsMessage::Command(UiCommand::OpenNote { path }) => {
                 // Open the tab in the kernel, then populate the frontend
                 // buffer from disk so the reading view has something to render.
-                let effects = self.shared.dispatch(UiCommand::OpenNote { path: path.clone() });
+                let effects = self
+                    .shared
+                    .dispatch(UiCommand::OpenNote { path: path.clone() });
                 self.run_effects(effects);
                 if let Some(tab) = self.shared.state.tabs.id_of(&path) {
-                    if self.buffers.get(&tab).is_none() {
+                    if !self.buffers.contains_key(&tab) {
                         if let Ok(text) = self.runner.read_note(&path) {
                             self.buffers.insert(tab, NoteBuffer::clean(text));
                         }
@@ -156,8 +168,7 @@ impl WindowsApp {
                     // The kernel owns the snapshot; the runner owns the
                     // storage (load-modify-store through the platform
                     // settings service).
-                    let pane = self.shared.state.default_pane;
-                    self.runner.persist_settings(pane);
+                    self.runner.persist_settings(&self.shared.state);
                 }
                 EffectKind::SearchVault { request, query } => {
                     // The shared engine scans the vault root; the session
@@ -530,6 +541,71 @@ mod tests {
             ThemeChoice::Dark,
             "the other persisted fields survive"
         );
+    }
+
+    #[test]
+    fn the_session_boots_into_the_persisted_settings_snapshot() {
+        // A previous session stored a split pane, a dark theme, and a
+        // hidden sidebar; the session must boot into exactly that.
+        let repo = Rc::new(RefCell::new(MemoryRepository::new()));
+        let settings = Rc::new(RefCell::new(MemorySettingsStore::starting_with(
+            vault_app::settings::AppSettings {
+                default_pane: PaneMode::Split,
+                sidebar_open: false,
+                theme: ThemeChoice::Dark,
+                glass_enabled: false,
+                ..vault_app::settings::AppSettings::default()
+            },
+        )));
+        let app = WindowsApp::new(
+            repo,
+            Rc::new(RecordingOpener::succeeding()),
+            settings.clone(),
+            std::env::temp_dir(),
+        );
+
+        assert_eq!(
+            app.shared.state.pane,
+            PaneMode::Split,
+            "the session boots into the persisted pane"
+        );
+        assert_eq!(app.shared.state.default_pane, PaneMode::Split);
+        assert!(!app.shared.state.sidebar_open);
+        assert_eq!(app.shared.state.theme, ThemeChoice::Dark);
+        assert!(!app.shared.state.glass_enabled);
+    }
+
+    #[test]
+    fn persisting_appearance_writes_the_snapshot_and_keeps_unowned_fields() {
+        // The kernel only owns the pane snapshot, theme, and glass: a
+        // previous session's vault path must survive a theme write.
+        let repo = Rc::new(RefCell::new(MemoryRepository::new()));
+        let settings = Rc::new(RefCell::new(MemorySettingsStore::starting_with(
+            vault_app::settings::AppSettings {
+                last_vault: Some(std::path::PathBuf::from("Z:/")),
+                ..vault_app::settings::AppSettings::default()
+            },
+        )));
+        let mut app = WindowsApp::new(
+            repo,
+            Rc::new(RecordingOpener::succeeding()),
+            settings.clone(),
+            std::env::temp_dir(),
+        );
+
+        app.handle_native(WindowsMessage::Command(UiCommand::SetTheme {
+            theme: ThemeChoice::Dark,
+        }));
+
+        assert_eq!(app.shared.state.theme, ThemeChoice::Dark);
+        assert_eq!(settings.borrow().writes(), 1);
+        assert_eq!(settings.borrow().last().theme, ThemeChoice::Dark);
+        assert_eq!(
+            settings.borrow().last().last_vault,
+            Some(std::path::PathBuf::from("Z:/")),
+            "the unowned fields survive the write"
+        );
+        assert_eq!(app.shared.state.last_error, None);
     }
 
     #[test]

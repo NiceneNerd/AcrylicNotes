@@ -8,7 +8,7 @@
 use crate::ids::TabId;
 use crate::navigation::NavSection;
 use crate::search::SearchSession;
-use crate::settings::PaneMode;
+use crate::settings::{PaneMode, ThemeChoice};
 use crate::tabs::Tabs;
 
 /// The kernel's application state.
@@ -26,6 +26,11 @@ pub struct AppState {
     pub sidebar_open: bool,
     /// Which sidebar panel is active.
     pub panel: NavSection,
+    /// The UI theme choice the frontends render (appearance is shared
+    /// state, plan §5.1's appearance row).
+    pub theme: ThemeChoice,
+    /// Whether to request the platform's frosted (blur) backdrop.
+    pub glass_enabled: bool,
     /// The vault-wide search session (query, hits, current request).
     pub search: SearchSession,
     /// Tabs whose note changed on disk while they had unsaved edits
@@ -43,6 +48,8 @@ impl Default for AppState {
             default_pane: PaneMode::default(),
             sidebar_open: true,
             panel: NavSection::default(),
+            theme: ThemeChoice::default(),
+            glass_enabled: true,
             search: SearchSession::default(),
             conflicts: Vec::new(),
             last_error: None,

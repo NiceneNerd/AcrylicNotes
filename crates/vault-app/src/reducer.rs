@@ -63,6 +63,16 @@ impl App {
                 let id = self.effect_ids.allocate();
                 vec![Effect::new(id, EffectKind::PersistSettings)]
             }
+            UiCommand::SetTheme { theme } => {
+                self.state.theme = theme;
+                let id = self.effect_ids.allocate();
+                vec![Effect::new(id, EffectKind::PersistSettings)]
+            }
+            UiCommand::SetGlassEnabled { enabled } => {
+                self.state.glass_enabled = enabled;
+                let id = self.effect_ids.allocate();
+                vec![Effect::new(id, EffectKind::PersistSettings)]
+            }
             UiCommand::OpenNote { path } => {
                 self.state.tabs.open_or_focus(&path);
                 Vec::new()
@@ -259,6 +269,32 @@ mod tests {
             vec![]
         );
         assert_eq!(app.state.panel, crate::navigation::NavSection::Tags);
+    }
+
+    #[test]
+    fn appearance_commands_update_the_state_and_emit_persist_settings() {
+        let mut app = App::new();
+        // Defaults mirror AppSettings: system theme, glass on.
+        assert_eq!(app.state.theme, crate::settings::ThemeChoice::System);
+        assert!(app.state.glass_enabled);
+
+        let effects = app.dispatch(UiCommand::SetTheme {
+            theme: crate::settings::ThemeChoice::Dark,
+        });
+        assert_eq!(app.state.theme, crate::settings::ThemeChoice::Dark);
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0].kind,
+            crate::effects::EffectKind::PersistSettings
+        ));
+
+        let effects = app.dispatch(UiCommand::SetGlassEnabled { enabled: false });
+        assert!(!app.state.glass_enabled);
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0].kind,
+            crate::effects::EffectKind::PersistSettings
+        ));
     }
 
     #[test]

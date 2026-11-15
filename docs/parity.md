@@ -41,9 +41,9 @@ scenarios.
 | EDIT-* | Find/replace | — | — | Existing (reference; matching shared via `vault_app::editor` since Phase 6) | Not started |
 | DLG-* | Dialogs | — | — | Existing (reference) | Not started |
 | PLAT-* | Attachments | — | — | Existing (reference) | Not started |
-| SET-* | Theme | — | — | Existing (reference) | Not started |
-| MISC-* | Glass/backdrop | — | — | Existing (reference) | Not started |
-| SET-* | Settings | — | — | Existing (reference) | Not started |
+| SET-* | Theme | — | — | Existing (reference) | Functional: kernel `SetTheme` persists the snapshot; the shell maps it to the window's requested theme (`window_visuals`) with system/light/dark buttons, headless-verified (Wine); visual confirmation on real Windows is user-side |
+| MISC-* | Glass/backdrop | — | — | Existing (reference) | Functional: kernel `SetGlassEnabled` persists; the shell requests the Mica backdrop when on, headless-verified (Wine) |
+| SET-* | Settings | — | — | Existing (reference) | Functional: `FileSettingsStore` (atomic JSON) persists the kernel-owned fields (boot pane, theme, glass) load-modify-store, and the session boots into the persisted snapshot; remaining fields (fonts, margins, tree sort) land with their features |
 | PLAT-* | Clipboard | — | — | Existing (reference) | Not started |
 | PLAT-* | External links | — | — | Existing (reference; behind `vault_platform::ExternalOpener` since Phase 3) | Not started |
 | SAVE-* | Watcher/conflicts | — | — | Existing (reference; save plan, guarded save, autosave policy, and conflict decisions shared via `vault_app::workflow` + `NoteRepository` since Phase 4) | Not started |
@@ -80,6 +80,7 @@ machine and is never claimed via Wine.
 | APPWIN-007 | Split layout state in `vault_app::layout` | Done, Linux-tested (kernel); rendered by the Windows shell (Source/Split/Live/Reading pane buttons -> SetPaneMode, headless-tested) |
 | APPWIN-008 | Native window loop, WinUI controls, live adapters | In progress (p11): `Shell` renders TreeView sidebar, tab bar, pane-mode buttons, source editor, reading view, and error line from kernel state, all headless-verified (RecordingRuntime under Wine); `main.rs` window loop awaits the p11 platform adapters; keyboard routing is blocked by windows-reactor 0.100.0's limited AcceleratorKey set; real-rendering/IME/DPI/pickers/packaging checks remain user-side |
 | APPWIN-009 | Cross-target verification (xtask + CI) | Done, runs on Linux: cross-target checks + headless Wine UI tests; real-Windows smoke remains user-side |
+| APPWIN-010 | Appearance (window theme, glass backdrop, title, boot pane) | Done, headless-verified (Wine): the shell declares `window_visuals` from the kernel's persisted theme/glass every publication, themes are switched through kernel `SetTheme`/`SetGlassEnabled` (persisted load-modify-store), the session boots into the persisted `default_pane`/sidebar, and the window is titled VaultNotes |
 
 ## Baseline (Phase 0)
 

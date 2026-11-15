@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 use vault_app::repository::{NoteRepository, RepositoryError};
 use vault_app::search::{SearchHitView, SEARCH_MAX_HITS};
-use vault_app::settings::{PaneMode, SettingsStore};
+use vault_app::settings::SettingsStore;
 use vault_app::workflow::SaveOutcome;
 use vault_platform::{ExternalOpener, OpenError, OpenTarget};
 
@@ -101,12 +101,15 @@ impl WindowsEffectRunner {
             .map_err(|error| error.to_string())
     }
 
-    /// Persist the kernel's settings snapshot: load-modify-store, so
-    /// every field the kernel does not own survives the write. This is
-    /// the `EffectKind::PersistSettings` arm's work.
-    pub fn persist_settings(&mut self, default_pane: PaneMode) {
+    /// Persist the kernel-owned settings fields: load-modify-store, so
+    /// every field the kernel does not own survives the write. The
+    /// kernel owns the boot pane, the theme, and the glass toggle; this
+    /// is the `EffectKind::PersistSettings` arm's work.
+    pub fn persist_settings(&mut self, state: &vault_app::app_state::AppState) {
         let mut document = self.settings.borrow().load();
-        document.default_pane = default_pane;
+        document.default_pane = state.default_pane;
+        document.theme = state.theme;
+        document.glass_enabled = state.glass_enabled;
         self.settings.borrow_mut().store(&document);
     }
 

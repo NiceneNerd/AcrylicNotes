@@ -218,9 +218,10 @@ use app_windows::windows_message::WindowsMessage;
 use app_windows::WindowsApp;
 use vault_app::commands::UiCommand;
 use vault_app::repository::{testing::MemoryRepository, NoteRepository};
-use vault_app::settings::MemorySettingsStore;
+use vault_app::settings::{AppSettings, MemorySettingsStore, ThemeChoice};
 use vault_platform::testing::{OpenCall, RecordingOpener};
 use windows_reactor::test::{EventId, EventPayload, QueuedEvent};
+use windows_reactor::{WindowBackdrop, WindowTheme, WindowVisuals};
 
 /// A kernel host over a memory vault with a succeeding opener.
 fn shell_app_with(notes: &[(&str, &str)]) -> Rc<RefCell<WindowsApp>> {
@@ -239,6 +240,26 @@ fn shell_app_with_settings(
         repo.borrow_mut().insert(path, text);
     }
     let settings = Rc::new(RefCell::new(MemorySettingsStore::default()));
+    let app = WindowsApp::new(
+        repo as Rc<RefCell<dyn NoteRepository>>,
+        Rc::new(RecordingOpener::succeeding()),
+        settings.clone(),
+        std::env::temp_dir(),
+    );
+    (Rc::new(RefCell::new(app)), settings)
+}
+
+/// Like [`shell_app_with`], over an explicit settings document (the
+/// persisted snapshot a previous session left behind).
+fn shell_app_with_document(
+    notes: &[(&str, &str)],
+    document: AppSettings,
+) -> (Rc<RefCell<WindowsApp>>, Rc<RefCell<MemorySettingsStore>>) {
+    let repo = Rc::new(RefCell::new(MemoryRepository::new()));
+    for (path, text) in notes {
+        repo.borrow_mut().insert(path, text);
+    }
+    let settings = Rc::new(RefCell::new(MemorySettingsStore::starting_with(document)));
     let app = WindowsApp::new(
         repo as Rc<RefCell<dyn NoteRepository>>,
         Rc::new(RecordingOpener::succeeding()),
@@ -1079,4 +1100,156 @@ fn collect_texts(rt: &RecordingRuntime, from: NodeId, out: &mut Vec<String>) {
             collect_texts(rt, child, out);
         }
     }
+}
+
+// --- appearance (theme, glass, title, boot pane) -----------------------------
+
+#[test]
+fn headless_shell_applies_the_persisted_theme_and_glass_to_the_window() {
+    let (app, _settings) = shell_app_with_document(
+        &[("a.md", "body\n")],
+        AppSettings {
+            theme: ThemeChoice::Dark,
+            glass_enabled: false,
+            ..AppSettings::default()
+        },
+    );
+    shell_open_tab(&app, "a.md", "body\n", "body\n");
+
+    let pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    let visuals = rt.window_visuals(window).expect("window visuals declared");
+    assert_eq!(
+        visuals,
+        WindowVisuals::new()
+            .theme(WindowTheme::Dark)
+            .backdrop(WindowBackdrop::None),
+        "persisted dark theme, glass off"
+    );
+    assert_eq!(rt.window_title(window), Some("VaultNotes"));
+    // The appearance row brackets the active choices.
+    assert!(find_owner_of_label(rt, window, "[dark]").is_some());
+    assert!(find_owner_of_label(rt, window, "glass").is_some());
+}
+
+#[test]
+fn headless_shell_theme_clicks_retheme_the_window_and_persist() {
+    let (app, settings) = shell_app_with_document(&[("a.md", "body\n")], AppSettings::default());
+    shell_open_tab(&app, "a.md", "body\n", "body\n");
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "light").expect("light theme button recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    // The live window re-themed and the choice persisted.
+    assert_eq!(app.borrow().shared.state.theme, ThemeChoice::Light);
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    let visuals = rt.window_visuals(window).expect("window visuals declared");
+    assert_eq!(
+        visuals,
+        WindowVisuals::new()
+            .theme(WindowTheme::Light)
+            .backdrop(WindowBackdrop::Mica),
+    );
+    assert_eq!(settings.borrow().last().theme, ThemeChoice::Light);
+    assert!(find_owner_of_label(rt, window, "[light]").is_some());
+
+    // Dark: same route through the kernel.
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "dark").expect("dark theme button recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+    assert_eq!(app.borrow().shared.state.theme, ThemeChoice::Dark);
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert_eq!(
+        rt.window_visuals(window).expect("visuals"),
+        WindowVisuals::new()
+            .theme(WindowTheme::Dark)
+            .backdrop(WindowBackdrop::Mica),
+    );
+    assert_eq!(settings.borrow().last().theme, ThemeChoice::Dark);
+}
+
+#[test]
+fn headless_shell_glass_toggle_flips_the_backdrop_and_persists() {
+    // Defaults: glass on (the settings default) -> Mica.
+    let (app, settings) = shell_app_with_document(&[("a.md", "body\n")], AppSettings::default());
+    shell_open_tab(&app, "a.md", "body\n", "body\n");
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert_eq!(
+        rt.window_visuals(window).expect("visuals"),
+        WindowVisuals::new()
+            .theme(WindowTheme::System)
+            .backdrop(WindowBackdrop::Mica),
+        "glass on requests the frosted backdrop"
+    );
+    assert!(find_owner_of_label(rt, window, "[glass]").is_some());
+
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "[glass]").expect("glass button recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(!app.borrow().shared.state.glass_enabled);
+    assert_eq!(
+        rt.window_visuals(window).expect("visuals"),
+        WindowVisuals::new()
+            .theme(WindowTheme::System)
+            .backdrop(WindowBackdrop::None),
+    );
+    assert!(!settings.borrow().last().glass_enabled);
+    assert!(find_owner_of_label(rt, window, "glass").is_some());
+
+    // Toggling again restores the frosted backdrop.
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "glass").expect("glass button recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert_eq!(
+        rt.window_visuals(window).expect("visuals"),
+        WindowVisuals::new()
+            .theme(WindowTheme::System)
+            .backdrop(WindowBackdrop::Mica),
+    );
+    assert!(settings.borrow().last().glass_enabled);
+}
+
+#[test]
+fn headless_shell_boots_into_the_persisted_default_pane() {
+    // The persisted snapshot said Split: the source editor must be
+    // mounted at boot without any pane click.
+    let (app, _settings) = shell_app_with_document(
+        &[("a.md", "a body\n")],
+        AppSettings {
+            default_pane: vault_app::settings::PaneMode::Split,
+            ..AppSettings::default()
+        },
+    );
+    shell_open_tab(&app, "a.md", "a body\n", "a body\n");
+
+    let pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(
+        find_node_with_property_text(rt, window, PropertyId::TextBoxText, "a body\n").is_some(),
+        "the session boots into the persisted split pane"
+    );
+    assert!(find_owner_of_label(rt, window, "[split]").is_some());
 }

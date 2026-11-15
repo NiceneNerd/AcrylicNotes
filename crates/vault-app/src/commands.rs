@@ -69,6 +69,15 @@ pub enum UiCommand {
     /// rendered pane — the Linux shell's `SettingsDefaultPane` split.
     #[serde(rename = "set-default-pane")]
     SetDefaultPane { mode: crate::settings::PaneMode },
+    /// Change the UI theme choice (the settings snapshot), emitting
+    /// `EffectKind::PersistSettings`. The frontends render it (plan §5.1's
+    /// appearance row is shared state).
+    #[serde(rename = "set-theme")]
+    SetTheme { theme: crate::settings::ThemeChoice },
+    /// Toggle the frosted (blur) backdrop request (the settings
+    /// snapshot), emitting `EffectKind::PersistSettings`.
+    #[serde(rename = "set-glass-enabled")]
+    SetGlassEnabled { enabled: bool },
     /// Hand a URL or file to the platform's default handler
     /// (`EffectKind::OpenExternal`, reported via `AppEvent::Open…`).
     #[serde(rename = "open-external")]
@@ -111,6 +120,10 @@ mod tests {
             UiCommand::OpenExternal {
                 target: vault_platform::OpenTarget::Url("https://example.com".into()),
             },
+            UiCommand::SetTheme {
+                theme: crate::settings::ThemeChoice::Dark,
+            },
+            UiCommand::SetGlassEnabled { enabled: false },
         ];
         for command in commands {
             let json = serde_json::to_string(&command).unwrap();

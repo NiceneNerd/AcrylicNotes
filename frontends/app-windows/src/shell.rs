@@ -18,12 +18,12 @@ use std::rc::Rc;
 use windows_reactor::{
     Button, ChildrenControl, Component, ComponentContext, ContentControl, KeyedView, Orientation,
     StackPanel, TextBlock, TextBox, TreeNode, TreeView, TreeViewExt, TreeViewSelectionMode, View,
-    ViewContext,
+    ViewContext, WindowBackdrop, WindowTheme, WindowVisuals,
 };
 
 use vault_app::commands::UiCommand;
 use vault_app::navigation::{outline, NavSection};
-use vault_app::settings::PaneMode;
+use vault_app::settings::{PaneMode, ThemeChoice};
 use vault_app::tree as kernel_tree;
 use vault_md::parse_note;
 use vault_platform::OpenTarget;
@@ -116,6 +116,24 @@ impl Component for Shell {
         let app = self.handle.0.borrow();
         let state = &app.shared.state;
         let active_buffer = state.tabs.active().and_then(|tab| app.buffers.get(&tab));
+
+        // The window environment comes from the kernel's appearance
+        // state: the persisted theme choice maps to the requested
+        // theme (`System` follows the desktop), and the glass toggle
+        // requests the frosted Mica backdrop. Declared every
+        // publication, so a theme click re-themes the live window.
+        let window_theme = match state.theme {
+            ThemeChoice::System => WindowTheme::System,
+            ThemeChoice::Light => WindowTheme::Light,
+            ThemeChoice::Dark => WindowTheme::Dark,
+        };
+        let backdrop = if state.glass_enabled {
+            WindowBackdrop::Mica
+        } else {
+            WindowBackdrop::None
+        };
+        context.window_visuals(WindowVisuals::new().theme(window_theme).backdrop(backdrop));
+        context.window_title("VaultNotes");
 
         // File-tree sidebar: one TreeView node per vault folder/note,
         // keyed by vault path. Invoking a note row asks the kernel to
@@ -326,6 +344,56 @@ impl Component for Shell {
         })
         .collect();
 
+        // Appearance controls: one theme-choice button each (the active
+        // choice bracketed, the same convention as the pane row) plus a
+        // glass toggle. Each click is a kernel command that persists the
+        // snapshot and re-themes the window through `window_visuals`.
+        let theme_buttons: Vec<KeyedView> =
+            [
+                ("system", ThemeChoice::System),
+                ("light", ThemeChoice::Light),
+                ("dark", ThemeChoice::Dark),
+            ]
+            .iter()
+            .map(|&(label, theme)| {
+                let text = if state.theme == theme {
+                    format!("[{label}]")
+                } else {
+                    label.to_string()
+                };
+                KeyedView::new(
+                    format!("theme-{label}"),
+                    Button::new()
+                        .on_click(context.callback(move |()| {
+                            WindowsMessage::Command(UiCommand::SetTheme { theme })
+                        }))
+                        .content(TextBlock::new().text(text)),
+                )
+            })
+            .collect();
+        let glass_label = if state.glass_enabled {
+            "[glass]"
+        } else {
+            "glass"
+        };
+        // The toggle reads the kernel's live state at click time (the
+        // handle is 'static; the render-time borrow is not).
+        let glass_handle = self.handle.clone();
+        let glass_button = KeyedView::new(
+            "glass-toggle",
+            Button::new()
+                .on_click(context.callback(move |()| {
+                    let enabled = !glass_handle.0.borrow().shared.state.glass_enabled;
+                    WindowsMessage::Command(UiCommand::SetGlassEnabled { enabled })
+                }))
+                .content(TextBlock::new().text(glass_label)),
+        );
+        let mut appearance_buttons = theme_buttons;
+        appearance_buttons.push(glass_button);
+        let appearance_row = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .keyed_children(appearance_buttons);
+
         // The note area per the kernel's pane mode. Source and Split
         // render the source TextBox (user edits arrive as
         // `TextBoxTextChanged` callbacks and become `EditorEdited`
@@ -395,6 +463,7 @@ impl Component for Shell {
             ),
         ];
         children.extend(pane_buttons);
+        children.push(KeyedView::new("appearance-row", appearance_row));
         children.extend(main_area);
 
         StackPanel::new()
