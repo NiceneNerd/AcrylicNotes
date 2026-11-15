@@ -18,12 +18,12 @@ use std::rc::Rc;
 
 use windows_reactor::{
     AutomationExt, Border, Brush, Button, ChildrenControl, Component, ComponentContext,
-    ContentControl, FontWeight, Grid, GridChildExt, GridLength, HyperlinkButton, InfoBar,
-    InfoBarSeverity, KeyedView, LayoutControl, Orientation, ScrollBarVisibility, ScrollViewer,
-    SlotView, SlotsControl, SplitView, SplitViewDisplayMode, SplitViewSlot, StackPanel, TextBlock,
-    TextBox, TextWrapping, ThemeBrush, TitleBar, TitleBarSlot, TreeNode, TreeView, TreeViewExt,
-    TreeViewSelectionMode, VerticalAlignment, View, ViewContext, WindowBackdrop, WindowTheme,
-    WindowTitleBarHeight, WindowVisuals,
+    ContentControl, FontWeight, Grid, GridChildExt, GridLength, HorizontalAlignment,
+    HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, LayoutControl, Orientation,
+    ScrollBarVisibility, ScrollViewer, SlotView, SlotsControl, SplitView, SplitViewDisplayMode,
+    SplitViewSlot, StackPanel, TextBlock, TextBox, TextWrapping, ThemeBrush, Thickness, TitleBar,
+    TitleBarSlot, TreeNode, TreeView, TreeViewExt, TreeViewSelectionMode, VerticalAlignment, View,
+    ViewContext, WindowBackdrop, WindowTheme, WindowTitleBarHeight, WindowVisuals,
 };
 
 use vault_app::commands::UiCommand;
@@ -756,7 +756,18 @@ impl Component for Shell {
         // forced a remeasure. As a direct grid child the row gives it a
         // bounded height and Stretch fills it immediately. The reading view
         // keeps its ScrollViewer — its element tree has no internal scroller.
-        let pane_body: View = if show_source && show_reading {
+        let pane_body: View = if state.tabs.active().is_none() {
+            // Empty state: no note open, so the note column shows a hint
+            // instead of an empty editor. Mirrors the Linux shell's
+            // centered muted message.
+            TextBlock::new()
+                .text("Open a note from the sidebar, or click a link in reading view.")
+                .opacity(0.6)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .grid_row(1)
+                .into()
+        } else if show_source && show_reading {
             let editor = View::from(source_editor.grid_column(0));
             let reading = ScrollViewer::new()
                 .grid_column(1)
@@ -787,13 +798,31 @@ impl Component for Shell {
         } else {
             Brush::Theme(ThemeBrush::SolidBackground)
         };
+        // Status bar under the note column only (not the sidebar): word and
+        // character counts for the active buffer, mirroring the Linux
+        // shell's label. `count_words` is shared kernel logic; the counts
+        // come from the live buffer so unsaved edits update immediately.
+        let status_text = active_buffer
+            .map(|buffer| {
+                let words = vault_app::editor::count_words(&buffer.text);
+                let chars = buffer.text.chars().count();
+                format!("{words} words • {chars} characters")
+            })
+            .unwrap_or_default();
+        let status_bar = TextBlock::new()
+            .text(status_text)
+            .font_size(12.0)
+            .opacity(0.6)
+            .margin(Thickness::xy(12.0, 4.0))
+            .grid_row(2);
         let note_area = Grid::new()
             .background(note_area_bg)
-            .rows([GridLength::Auto, GridLength::STAR])
+            .rows([GridLength::Auto, GridLength::STAR, GridLength::Auto])
             .columns([GridLength::STAR])
             .keyed_children([
                 KeyedView::new("tab-bar", tab_bar),
                 KeyedView::new("pane-body", pane_body),
+                KeyedView::new("status-bar", status_bar),
             ]);
 
         // Toolbar row hosted in the title bar's Content slot: save, the

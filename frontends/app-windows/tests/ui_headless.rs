@@ -425,6 +425,50 @@ fn headless_shell_renders_tabs_editor_and_error_line() {
     );
 }
 
+#[test]
+fn headless_shell_status_bar_counts_the_active_buffer() {
+    let app = shell_app_with(&[("a.md", "a body\n")]);
+    shell_open_tab(&app, "a.md", "a body\n", "a body\n");
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    // "a body\n" is two words and seven characters (trailing newline counts).
+    assert!(
+        find_node_with_property_text(
+            rt,
+            window,
+            PropertyId::TextBlockText,
+            "2 words • 7 characters"
+        )
+        .is_some(),
+        "the status bar reports word and character counts"
+    );
+}
+
+#[test]
+fn headless_shell_empty_state_with_no_note_open() {
+    let app = shell_app_with(&[]);
+
+    let pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(
+        find_node_with_property_text(
+            rt,
+            window,
+            PropertyId::TextBlockText,
+            "Open a note from the sidebar, or click a link in reading view."
+        )
+        .is_some(),
+        "the empty state replaces the note body until a note opens"
+    );
+    assert!(
+        find_node_with_property_text(rt, window, PropertyId::TextBoxText, "").is_none(),
+        "no source TextBox exists with no note open"
+    );
+}
+
 /// Inject one `TextBoxTextChanged` on the editor node (the payload the
 /// real runtime sends: the control's full text).
 fn type_text(pump: &mut Pump<RecordingRuntime>, editor: NodeId, text: &str) {
