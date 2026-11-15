@@ -999,18 +999,25 @@ impl Component for Shell {
                             match slice.block {
                                 Some(block_idx) => {
                                     let handle = self.handle.clone();
+                                    let region = region_idx;
                                     let on_link = |nav: LinkNav| {
                                         let handle = handle.clone();
                                         context.callback(move |()| link_callback(&handle, &nav))
                                     };
                                     KeyedView::new(
                                         key,
-                                        live_block_view(
-                                            &doc.blocks[block_idx],
-                                            &renderer,
-                                            &footnote_blocks,
-                                            &on_link,
-                                        ),
+                                        Button::new()
+                                            .on_click(context.callback(move |()| {
+                                                WindowsMessage::Native(NativeEvent::LiveFocus {
+                                                    region,
+                                                })
+                                            }))
+                                            .content(live_block_view(
+                                                &doc.blocks[block_idx],
+                                                &renderer,
+                                                &footnote_blocks,
+                                                &on_link,
+                                            )),
                                     )
                                 }
                                 None => {

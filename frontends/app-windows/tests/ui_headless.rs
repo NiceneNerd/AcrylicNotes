@@ -1291,7 +1291,7 @@ fn headless_shell_reading_link_click_opens_the_url_through_the_kernel() {
         let rt = pump.runtime();
         find_owner_of_label(rt, window, "the docs").expect("link button recorded")
     };
-    click(&mut pump, target, EventId::HyperlinkButtonClick);
+    click(&mut pump, target, EventId::ButtonClick);
 
     assert_eq!(
         opener.calls(),
@@ -1316,7 +1316,7 @@ fn headless_shell_reading_wiki_link_click_opens_the_note() {
         let rt = pump.runtime();
         find_owner_of_label(rt, window, "b.md").expect("wiki link button recorded")
     };
-    click(&mut pump, target, EventId::HyperlinkButtonClick);
+    click(&mut pump, target, EventId::ButtonClick);
 
     assert_eq!(
         app.borrow().shared.state.tabs.active_path(),
@@ -1900,7 +1900,7 @@ fn headless_shell_reading_relative_link_click_opens_the_note() {
         let rt = pump.runtime();
         find_owner_of_label(rt, window, "b").expect("relative link button recorded")
     };
-    click(&mut pump, target, EventId::HyperlinkButtonClick);
+    click(&mut pump, target, EventId::ButtonClick);
 
     assert_eq!(
         app.borrow().shared.state.tabs.active_path(),
@@ -1936,7 +1936,7 @@ fn headless_shell_reading_relative_link_to_attachment_opens_the_file() {
         let rt = pump.runtime();
         find_owner_of_label(rt, window, "img").expect("attachment link button recorded")
     };
-    click(&mut pump, target, EventId::HyperlinkButtonClick);
+    click(&mut pump, target, EventId::ButtonClick);
 
     assert_eq!(
         opener.calls(),
@@ -1963,7 +1963,7 @@ fn headless_shell_reading_tag_click_switches_to_the_tags_panel() {
         let rt = pump.runtime();
         find_owner_of_label(rt, window, "#work").expect("tag link button recorded")
     };
-    click(&mut pump, target, EventId::HyperlinkButtonClick);
+    click(&mut pump, target, EventId::ButtonClick);
 
     let window = pump.window().expect("window node");
     let rt = pump.runtime();
@@ -2001,7 +2001,7 @@ fn headless_shell_reading_footnote_ref_click_anchors_the_definition() {
         let rt = pump.runtime();
         find_owner_of_label(rt, window, "^1").expect("footnote ref button recorded")
     };
-    click(&mut pump, target, EventId::HyperlinkButtonClick);
+    click(&mut pump, target, EventId::ButtonClick);
 
     assert_eq!(
         app.borrow().shared.state.jump_anchor,

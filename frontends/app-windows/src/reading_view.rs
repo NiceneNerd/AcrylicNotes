@@ -17,9 +17,10 @@ use std::fs;
 use vault_app::markdown::plain_inlines;
 use vault_md::{Block, Doc, Inline};
 use windows_reactor::{
-    Border, Callback, ChildrenControl, ContentControl, EncodedImage, FontWeight, HyperlinkButton,
-    Image, KeyedView, LayoutControl, Orientation, RichText, RichTextBlock, RichTextInline,
-    RichTextParagraph, RichTextRun, StackPanel, Stretch, TextBlock, TextWrapping, View,
+    Border, Button, ButtonStyle, Callback, ChildrenControl, ContentControl, EncodedImage,
+    FontWeight, Image, KeyedView, LayoutControl, Orientation, RichText, RichTextBlock,
+    RichTextInline, RichTextParagraph, RichTextRun, StackPanel, Stretch, TextBlock, TextWrapping,
+    View,
 };
 
 use super::reading::WindowsMarkdownRenderer;
@@ -489,21 +490,19 @@ fn inline_view_with_style(
                 // ExternalOpener, and failures surface on the error line.
                 // No navigate_uri: the control must not bypass the kernel.
                 let click = on_link(LinkNav::Url(url.clone()));
-                HyperlinkButton::new().on_click(click).content(styled_text(
-                    label,
-                    size,
-                    font_weight,
-                ))
+                Button::new()
+                    .style(ButtonStyle::TextLink)
+                    .on_click(click)
+                    .content(styled_text(label, size, font_weight))
             } else {
                 // Relative link: the shell resolves it through the vault
                 // index at click time (note tab, attachment open, or OS
                 // default — the Linux app's three-way split).
                 let click = on_link(LinkNav::Relative(url.clone()));
-                HyperlinkButton::new().on_click(click).content(styled_text(
-                    label,
-                    size,
-                    font_weight,
-                ))
+                Button::new()
+                    .style(ButtonStyle::TextLink)
+                    .on_click(click)
+                    .content(styled_text(label, size, font_weight))
             }
         }
         Inline::WikiLink(wl) => {
@@ -514,7 +513,8 @@ fn inline_view_with_style(
             // Invoking a wiki link asks the kernel to open (or focus) the
             // target note's tab — the same command the sidebar tree sends.
             let click = on_link(LinkNav::Note(wl.target.note.clone()));
-            HyperlinkButton::new()
+            Button::new()
+                .style(ButtonStyle::TextLink)
                 .on_click(click)
                 .content(styled_text(label, size, font_weight))
         }
@@ -523,11 +523,10 @@ fn inline_view_with_style(
             // selected (the Linux app's `tag:` link scheme): a
             // Hyperlink-equivalent callback, never a raw open.
             let click = on_link(LinkNav::Tag(t.clone()));
-            HyperlinkButton::new().on_click(click).content(styled_text(
-                format!("#{t}"),
-                size,
-                font_weight,
-            ))
+            Button::new()
+                .style(ButtonStyle::TextLink)
+                .on_click(click)
+                .content(styled_text(format!("#{t}"), size, font_weight))
         }
         Inline::FootnoteRef(r) => {
             // A footnote reference jumps to its definition: the shell
@@ -536,11 +535,10 @@ fn inline_view_with_style(
             match footnote_blocks.get(r) {
                 Some(&block) => {
                     let click = on_link(LinkNav::Footnote(block));
-                    HyperlinkButton::new().on_click(click).content(styled_text(
-                        format!("^{r}"),
-                        size,
-                        font_weight,
-                    ))
+                    Button::new()
+                        .style(ButtonStyle::TextLink)
+                        .on_click(click)
+                        .content(styled_text(format!("^{r}"), size, font_weight))
                 }
                 None => View::from(styled_text(format!("^{r}"), size, font_weight)),
             }
@@ -810,8 +808,7 @@ mod tests {
         // and the click event is active on its owner.
         let button = find_owner_of_label(rt, window, "the docs").expect("link button recorded");
         assert!(
-            pump.event_revision(button, EventId::HyperlinkButtonClick)
-                .is_some(),
+            pump.event_revision(button, EventId::ButtonClick).is_some(),
             "the external link's click wiring is active"
         );
     }
@@ -832,8 +829,7 @@ mod tests {
         let button =
             find_owner_of_label(rt, window, "Meeting Notes").expect("wiki link button recorded");
         assert!(
-            pump.event_revision(button, EventId::HyperlinkButtonClick)
-                .is_some(),
+            pump.event_revision(button, EventId::ButtonClick).is_some(),
             "the wiki link's click wiring is active"
         );
     }
@@ -924,8 +920,7 @@ mod tests {
         // the tags panel by the shell.
         let button = find_owner_of_label(rt, window, "#rust").expect("tag button recorded");
         assert!(
-            pump.event_revision(button, EventId::HyperlinkButtonClick)
-                .is_some(),
+            pump.event_revision(button, EventId::ButtonClick).is_some(),
             "the tag's click wiring is active"
         );
     }
@@ -939,8 +934,7 @@ mod tests {
         assert!(find_text(rt, window, "^1").is_some());
         let owner = find_owner_of_label(rt, window, "^1").expect("footnote ref text recorded");
         assert!(
-            pump.event_revision(owner, EventId::HyperlinkButtonClick)
-                .is_none(),
+            pump.event_revision(owner, EventId::ButtonClick).is_none(),
             "a dangling footnote ref is not a button"
         );
     }
@@ -960,8 +954,7 @@ mod tests {
         assert!(find_text(rt, window, "^1").is_some());
         let button = find_owner_of_label(rt, window, "^1").expect("footnote ref button recorded");
         assert!(
-            pump.event_revision(button, EventId::HyperlinkButtonClick)
-                .is_some(),
+            pump.event_revision(button, EventId::ButtonClick).is_some(),
             "the footnote ref's click wiring is active"
         );
     }
@@ -978,8 +971,7 @@ mod tests {
         let button =
             find_owner_of_label(rt, window, "a sibling note").expect("relative link button");
         assert!(
-            pump.event_revision(button, EventId::HyperlinkButtonClick)
-                .is_some(),
+            pump.event_revision(button, EventId::ButtonClick).is_some(),
             "the relative link's click wiring is active"
         );
     }
