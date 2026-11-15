@@ -622,14 +622,16 @@ impl Component for Shell {
             let editor_text = active_buffer.map(|b| b.text.clone()).unwrap_or_default();
             *self.rendered_editor.borrow_mut() = editor_text.clone();
         }
-        // Stretch to fill the ScrollViewer's viewport so multi-line content
-        // is fully visible on first render (without it, the TextBox sizes to
-        // its measured content and shows only one line until a tab switch
-        // forces remeasure).
+        // Stretch to fill the bounded STAR grid cell so multi-line content
+        // is fully visible on first render. min_height guarantees at least
+        // several lines are visible even if the SplitView hasn't measured
+        // its content slot yet on the very first pass (a tab switch then
+        // re-measures and the cell fills).
         let source_editor = TextBox::new()
             .accepts_return(true)
             .text_wrapping(TextWrapping::Wrap)
             .vertical_alignment(VerticalAlignment::Stretch)
+            .min_height(300.0)
             .on_text_changed(context.callback(|text: String| {
                 WindowsMessage::Native(NativeEvent::EditorEdited { text })
             }))
