@@ -1444,3 +1444,127 @@ fn headless_shell_links_panel_shows_the_empty_state_without_a_note() {
         "the no-active-note hint is shown"
     );
 }
+
+// --- reading-view interactions (relative links, tags, footnotes) ------------
+
+#[test]
+fn headless_shell_reading_relative_link_click_opens_the_note() {
+    let app = shell_app_with(&[("a.md", "see [b](b.md)\n"), ("b.md", "b\n")]);
+    shell_open_tab(&app, "a.md", "see [b](b.md)\n", "see [b](b.md)\n");
+
+    let mut pump = mounted_shell(&app);
+    // Live (the boot default) renders the reading view with the link.
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "b").expect("relative link button recorded")
+    };
+    click(&mut pump, target, EventId::HyperlinkButtonClick);
+
+    assert_eq!(
+        app.borrow().shared.state.tabs.active_path(),
+        Some("b.md"),
+        "a relative link resolves through the index and opens the note"
+    );
+}
+
+#[test]
+fn headless_shell_reading_relative_link_to_attachment_opens_the_file() {
+    // An attachment (not a note in the index) is unresolved by the index,
+    // so the link is handed to the platform's default file handler.
+    let repo = Rc::new(RefCell::new(MemoryRepository::new()));
+    repo.borrow_mut().insert("a.md", "see [img](image.png)\n");
+    let opener = Rc::new(RecordingOpener::succeeding());
+    let app = Rc::new(RefCell::new(WindowsApp::new(
+        repo.clone() as Rc<RefCell<dyn NoteRepository>>,
+        repo.clone() as Rc<RefCell<dyn NoteIndex>>,
+        opener.clone(),
+        Rc::new(RefCell::new(MemorySettingsStore::default())),
+        std::env::temp_dir(),
+    )));
+    shell_open_tab(
+        &app,
+        "a.md",
+        "see [img](image.png)\n",
+        "see [img](image.png)\n",
+    );
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "img").expect("attachment link button recorded")
+    };
+    click(&mut pump, target, EventId::HyperlinkButtonClick);
+
+    assert_eq!(
+        opener.calls(),
+        vec![OpenCall::File(std::path::PathBuf::from("image.png"))],
+        "an unresolvable relative link is handed to the platform file opener"
+    );
+    assert_eq!(
+        app.borrow().shared.state.last_error,
+        None,
+        "a successful open raises nothing"
+    );
+}
+
+#[test]
+fn headless_shell_reading_tag_click_switches_to_the_tags_panel() {
+    // The note carries an inline `#work` tag and is indexed as tagged,
+    // so clicking it drills down to the note itself.
+    let (app, _repo) = shell_app_with_index(&[("a.md", "see #work\n")], &[("a.md", "work")], &[]);
+    shell_open_tab(&app, "a.md", "see #work\n", "see #work\n");
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "#work").expect("tag link button recorded")
+    };
+    click(&mut pump, target, EventId::HyperlinkButtonClick);
+
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert_eq!(
+        app.borrow().shared.state.panel,
+        vault_app::navigation::NavSection::Tags,
+        "a reading-view tag switches the sidebar to the tags panel"
+    );
+    // The tag was selected: the panel drills down to that tag's notes
+    // with a back row (the same shell-local drill-down the sidebar uses).
+    assert!(
+        find_owner_of_label(rt, window, "← #work").is_some(),
+        "the drill-down shows a back row"
+    );
+    assert!(
+        find_owner_of_label(rt, window, "a.md").is_some(),
+        "the drill-down lists the tagged note"
+    );
+}
+
+#[test]
+fn headless_shell_reading_footnote_ref_click_anchors_the_definition() {
+    // Block 0 is the paragraph, block 1 is the footnote definition.
+    let app = shell_app_with(&[("a.md", "text [^1]\n\n[^1]: definition\n")]);
+    shell_open_tab(
+        &app,
+        "a.md",
+        "text [^1]\n\n[^1]: definition\n",
+        "text [^1]\n\n[^1]: definition\n",
+    );
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_owner_of_label(rt, window, "^1").expect("footnote ref button recorded")
+    };
+    click(&mut pump, target, EventId::HyperlinkButtonClick);
+
+    assert_eq!(
+        app.borrow().shared.state.jump_anchor,
+        Some(1),
+        "a footnote ref anchors its definition block (the Border marker)"
+    );
+}

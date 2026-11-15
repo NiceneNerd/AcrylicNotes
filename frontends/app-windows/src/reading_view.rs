@@ -12,18 +12,20 @@
 //! module only builds the element tree. All functions are tested
 //! headlessly under Wine via the `RecordingRuntime`.
 
+use std::collections::HashMap;
 use vault_app::markdown::plain_inlines;
 use vault_md::{Block, Doc, Inline};
 use windows_reactor::{
-    Callback, ChildrenControl, ContentControl, FontWeight, HyperlinkButton, KeyedView, Orientation,
-    StackPanel, TextBlock, View,
+    Border, Callback, ChildrenControl, ContentControl, FontWeight, HyperlinkButton, KeyedView,
+    Orientation, StackPanel, TextBlock, View,
 };
 
 use super::reading::WindowsMarkdownRenderer;
 
 /// Where a clicked link navigates (plan §10.3's shared link commands,
 /// materialized): the renderer emits the decision, the shell maps it to
-/// kernel commands (`OpenExternal` for URLs, `OpenNote` for wiki links).
+/// kernel commands (`OpenExternal` for URLs, `OpenNote` for wiki links,
+/// resolution and jumps decided by the shell at click time).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkNav {
     /// An external URL — the kernel hands it to the platform's
@@ -31,52 +33,121 @@ pub enum LinkNav {
     Url(String),
     /// A wiki-link target note — the kernel opens or focuses its tab.
     Note(String),
+    /// A relative Markdown link's raw target (`notes/b.md`,
+    /// `../media/x.png`) — the shell resolves it through the vault index
+    /// at click time: a note opens a tab, an attachment goes to the
+    /// platform opener, an unresolved target to the OS default.
+    Relative(String),
+    /// A tag clicked in the reading view (`#work`) — the shell selects
+    /// it (shell-local filter) and switches the sidebar to the tags
+    /// panel, the same route the Linux app's `tag:` links take.
+    Tag(String),
+    /// A footnote reference clicked in the reading view — the shell
+    /// resolved the definition's block index at render time and the
+    /// click asks the kernel to anchor it (the Border marker). A
+    /// reference without a definition renders as plain text.
+    Footnote(usize),
 }
 
 /// Render a whole document into reading-mode WinUI elements.
 ///
 /// Each top-level block becomes a keyed child of a vertical stack, keyed
 /// by its block index so reconciliation preserves identity across edits.
-/// Footnote definitions are skipped: they are rendered inline via
-/// footnote references, not as standalone blocks. `on_link` turns a
-/// clicked link's navigation decision into the click callback the shell
-/// wires to kernel commands.
+/// Obsidian's order (and the Linux app's, `reading.rs::reading_order`):
+/// prose first, then the footnote definitions gathered under a rule —
+/// each definition keeps its own block index as key, so a footnote
+/// reference still jumps to it. Blocks matching `anchor` are wrapped in
+/// a `Border` (the kernel scroll anchor's visible marker; no toolkit
+/// scroll API exists yet). `on_link` turns a clicked link's navigation
+/// decision into the click callback the shell wires to kernel commands.
 pub fn doc_view(
     doc: &Doc,
     config: &WindowsMarkdownRenderer,
+    anchor: Option<usize>,
     on_link: &dyn Fn(LinkNav) -> Callback<()>,
 ) -> View {
-    let children: Vec<KeyedView> = doc
+    // Footnote label → definition block index, resolved once per render
+    // so references never dangle: a ref without a definition renders as
+    // plain text instead of a dead link.
+    let footnote_blocks: std::collections::HashMap<String, usize> = doc
         .blocks
         .iter()
         .enumerate()
-        .filter_map(|(i, block)| {
-            if matches!(block, Block::FootnoteDef { .. }) {
-                None
-            } else {
-                Some(KeyedView::new(
-                    i.to_string(),
-                    block_view(block, config, on_link),
-                ))
-            }
+        .filter_map(|(i, block)| match block {
+            Block::FootnoteDef { label, .. } => Some((label.clone(), i)),
+            _ => None,
         })
         .collect();
+    let prose: Vec<KeyedView> = doc
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| !matches!(block, Block::FootnoteDef { .. }))
+        .map(|(i, block)| {
+            KeyedView::new(
+                i.to_string(),
+                anchored(
+                    block_view(block, config, &footnote_blocks, on_link),
+                    anchor == Some(i),
+                ),
+            )
+        })
+        .collect();
+    let footnotes: Vec<KeyedView> = doc
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| matches!(block, Block::FootnoteDef { .. }))
+        .map(|(i, block)| {
+            KeyedView::new(
+                i.to_string(),
+                anchored(
+                    block_view(block, config, &footnote_blocks, on_link),
+                    anchor == Some(i),
+                ),
+            )
+        })
+        .collect();
+
+    let mut children = prose;
+    if !footnotes.is_empty() {
+        // The hairline between prose and the gathered footnotes.
+        children.push(KeyedView::new(
+            "footnote-rule",
+            View::from(TextBlock::new().text("─")),
+        ));
+        children.extend(footnotes);
+    }
     StackPanel::new()
         .orientation(Orientation::Vertical)
         .keyed_children(children)
+}
+
+/// Wrap a block in a marked-up Border when it is the jump anchor (the
+/// kernel scroll anchor's visible marker); a pass-through otherwise.
+fn anchored(view: View, is_anchor: bool) -> View {
+    if is_anchor {
+        Border::new().border_thickness(1.0).content(view)
+    } else {
+        view
+    }
 }
 
 /// Render a single block into WinUI elements.
 fn block_view(
     block: &Block,
     config: &WindowsMarkdownRenderer,
+    footnote_blocks: &HashMap<String, usize>,
     on_link: &dyn Fn(LinkNav) -> Callback<()>,
 ) -> View {
     match block {
         Block::Paragraph { content, .. } => StackPanel::new()
             .orientation(Orientation::Vertical)
             .keyed_children(content.iter().enumerate().map(|(i, inline)| {
-                KeyedView::new(i.to_string(), inline_view(inline, config, on_link))
+                KeyedView::new(
+                    i.to_string(),
+                    inline_view(inline, config, footnote_blocks, on_link),
+                )
             })),
         Block::Heading { level, content, .. } => {
             let size = match *level {
@@ -90,7 +161,14 @@ fn block_view(
                 .keyed_children(content.iter().enumerate().map(|(i, inline)| {
                     KeyedView::new(
                         i.to_string(),
-                        inline_view_with_style(inline, config, size, None, on_link),
+                        inline_view_with_style(
+                            inline,
+                            config,
+                            size,
+                            None,
+                            footnote_blocks,
+                            on_link,
+                        ),
                     )
                 }))
         }
@@ -106,16 +184,19 @@ fn block_view(
         Block::List { items, .. } => StackPanel::new()
             .orientation(Orientation::Vertical)
             .keyed_children(items.iter().enumerate().map(|(i, item)| {
-                KeyedView::new(i.to_string(), list_item_view(item, config, on_link))
+                KeyedView::new(
+                    i.to_string(),
+                    list_item_view(item, config, footnote_blocks, on_link),
+                )
             })),
         Block::Quote(inner) => StackPanel::new()
             .orientation(Orientation::Vertical)
-            .keyed_children(
-                inner
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| KeyedView::new(i.to_string(), block_view(b, config, on_link))),
-            ),
+            .keyed_children(inner.iter().enumerate().map(|(i, b)| {
+                KeyedView::new(
+                    i.to_string(),
+                    block_view(b, config, footnote_blocks, on_link),
+                )
+            })),
         Block::Callout { title, body, .. } => {
             let mut children: Vec<KeyedView> = title
                 .iter()
@@ -128,16 +209,18 @@ fn block_view(
                             config,
                             14.0,
                             Some(FontWeight::SEMI_BOLD),
+                            footnote_blocks,
                             on_link,
                         ),
                     )
                 })
                 .collect();
-            children.extend(
-                body.iter().enumerate().map(|(i, b)| {
-                    KeyedView::new(format!("body-{i}"), block_view(b, config, on_link))
-                }),
-            );
+            children.extend(body.iter().enumerate().map(|(i, b)| {
+                KeyedView::new(
+                    format!("body-{i}"),
+                    block_view(b, config, footnote_blocks, on_link),
+                )
+            }));
             StackPanel::new()
                 .orientation(Orientation::Vertical)
                 .keyed_children(children)
@@ -145,11 +228,16 @@ fn block_view(
         Block::Table { header, rows, .. } => StackPanel::new()
             .orientation(Orientation::Vertical)
             .keyed_children(
-                std::iter::once(KeyedView::new("header", table_row_view(header, config))).chain(
-                    rows.iter().enumerate().map(|(i, row)| {
-                        KeyedView::new(format!("row-{i}"), table_row_view(row, config))
-                    }),
-                ),
+                std::iter::once(KeyedView::new(
+                    "header",
+                    table_row_view(header, config, footnote_blocks),
+                ))
+                .chain(rows.iter().enumerate().map(|(i, row)| {
+                    KeyedView::new(
+                        format!("row-{i}"),
+                        table_row_view(row, config, footnote_blocks),
+                    )
+                })),
             ),
         Block::EmbedBlock(_) => TextBlock::new().text("(embedded note)").into(),
         // Defensive: doc_view filters footnote definitions out, but the
@@ -159,11 +247,12 @@ fn block_view(
                 "label",
                 View::from(TextBlock::new().text(format!("[^{label}]"))),
             )];
-            children.extend(
-                body.iter()
-                    .enumerate()
-                    .map(|(i, b)| KeyedView::new(i.to_string(), block_view(b, config, on_link))),
-            );
+            children.extend(body.iter().enumerate().map(|(i, b)| {
+                KeyedView::new(
+                    i.to_string(),
+                    block_view(b, config, footnote_blocks, on_link),
+                )
+            }));
             StackPanel::new()
                 .orientation(Orientation::Vertical)
                 .keyed_children(children)
@@ -176,6 +265,7 @@ fn block_view(
 fn list_item_view(
     item: &vault_md::ListItem,
     config: &WindowsMarkdownRenderer,
+    footnote_blocks: &HashMap<String, usize>,
     on_link: &dyn Fn(LinkNav) -> Callback<()>,
 ) -> View {
     let prefix = match item.task {
@@ -185,31 +275,39 @@ fn list_item_view(
     };
     let prefix_view: View = View::from(TextBlock::new().text(prefix));
     let mut children: Vec<KeyedView> = vec![KeyedView::new("prefix", prefix_view)];
-    children.extend(
-        item.body
-            .iter()
-            .enumerate()
-            .map(|(i, b)| KeyedView::new(i.to_string(), block_view(b, config, on_link))),
-    );
+    children.extend(item.body.iter().enumerate().map(|(i, b)| {
+        KeyedView::new(
+            i.to_string(),
+            block_view(b, config, footnote_blocks, on_link),
+        )
+    }));
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .keyed_children(children)
 }
 
 /// Render a table row (each cell inline-projected).
-fn table_row_view(cells: &[Vec<Inline>], config: &WindowsMarkdownRenderer) -> View {
+fn table_row_view(
+    cells: &[Vec<Inline>],
+    config: &WindowsMarkdownRenderer,
+    footnote_blocks: &HashMap<String, usize>,
+) -> View {
     StackPanel::new()
         .orientation(Orientation::Horizontal)
-        .keyed_children(
-            cells
-                .iter()
-                .enumerate()
-                .map(|(i, cell)| KeyedView::new(i.to_string(), inline_cells_view(cell, config))),
-        )
+        .keyed_children(cells.iter().enumerate().map(|(i, cell)| {
+            KeyedView::new(
+                i.to_string(),
+                inline_cells_view(cell, config, footnote_blocks),
+            )
+        }))
 }
 
 /// Render a cell's inlines as plain text.
-fn inline_cells_view(inlines: &[Inline], _config: &WindowsMarkdownRenderer) -> View {
+fn inline_cells_view(
+    inlines: &[Inline],
+    _config: &WindowsMarkdownRenderer,
+    _footnote_blocks: &HashMap<String, usize>,
+) -> View {
     let text = plain_inlines(inlines);
     TextBlock::new().text(text).into()
 }
@@ -218,9 +316,10 @@ fn inline_cells_view(inlines: &[Inline], _config: &WindowsMarkdownRenderer) -> V
 fn inline_view(
     inline: &Inline,
     config: &WindowsMarkdownRenderer,
+    footnote_blocks: &HashMap<String, usize>,
     on_link: &dyn Fn(LinkNav) -> Callback<()>,
 ) -> View {
-    inline_view_with_style(inline, config, 14.0, None, on_link)
+    inline_view_with_style(inline, config, 14.0, None, footnote_blocks, on_link)
 }
 
 /// A text block with the size and any explicit weight applied.
@@ -240,6 +339,7 @@ fn inline_view_with_style(
     config: &WindowsMarkdownRenderer,
     size: f64,
     font_weight: Option<FontWeight>,
+    footnote_blocks: &HashMap<String, usize>,
     on_link: &dyn Fn(LinkNav) -> Callback<()>,
 ) -> View {
     match inline {
@@ -260,7 +360,10 @@ fn inline_view_with_style(
         Inline::Math(t) => View::from(styled_text(t.clone(), size, font_weight)),
         Inline::Link { url, content, .. } => {
             let label = plain_inlines(content);
-            if url.starts_with("http://") || url.starts_with("https://") {
+            if url.starts_with("http://")
+                || url.starts_with("https://")
+                || url.starts_with("mailto:")
+            {
                 // The kernel owns the open (plan §10.3): the click emits
                 // `OpenExternal`, the effect runs against the injected
                 // ExternalOpener, and failures surface on the error line.
@@ -272,9 +375,15 @@ fn inline_view_with_style(
                     font_weight,
                 ))
             } else {
-                // Relative link: click handling is wired by the shell when
-                // reading mode is mounted.
-                View::from(styled_text(label, size, font_weight))
+                // Relative link: the shell resolves it through the vault
+                // index at click time (note tab, attachment open, or OS
+                // default — the Linux app's three-way split).
+                let click = on_link(LinkNav::Relative(url.clone()));
+                HyperlinkButton::new().on_click(click).content(styled_text(
+                    label,
+                    size,
+                    font_weight,
+                ))
             }
         }
         Inline::WikiLink(wl) => {
@@ -289,8 +398,33 @@ fn inline_view_with_style(
                 .on_click(click)
                 .content(styled_text(label, size, font_weight))
         }
-        Inline::Tag(t) => View::from(styled_text(format!("#{t}"), size, font_weight)),
-        Inline::FootnoteRef(r) => View::from(styled_text(format!("^{r}"), size, font_weight)),
+        Inline::Tag(t) => {
+            // A reading-view tag routes to the tags panel with the tag
+            // selected (the Linux app's `tag:` link scheme): a
+            // Hyperlink-equivalent callback, never a raw open.
+            let click = on_link(LinkNav::Tag(t.clone()));
+            HyperlinkButton::new().on_click(click).content(styled_text(
+                format!("#{t}"),
+                size,
+                font_weight,
+            ))
+        }
+        Inline::FootnoteRef(r) => {
+            // A footnote reference jumps to its definition: the shell
+            // resolved the block index at render time. A ref without a
+            // definition renders as plain text instead of a dead link.
+            match footnote_blocks.get(r) {
+                Some(&block) => {
+                    let click = on_link(LinkNav::Footnote(block));
+                    HyperlinkButton::new().on_click(click).content(styled_text(
+                        format!("^{r}"),
+                        size,
+                        font_weight,
+                    ))
+                }
+                None => View::from(styled_text(format!("^{r}"), size, font_weight)),
+            }
+        }
         Inline::Image { alt, .. } => {
             let label = if config.show_images {
                 format!("[img: {alt}]")
@@ -333,12 +467,22 @@ mod tests {
     }
 
     fn render(doc: &Doc) -> (Pump<RecordingRuntime>, NodeId) {
+        render_anchored(doc, None)
+    }
+
+    /// Render with an explicit jump anchor (the kernel scroll anchor).
+    fn render_anchored(doc: &Doc, anchor: Option<usize>) -> (Pump<RecordingRuntime>, NodeId) {
         let mut pump = Pump::new(RecordingRuntime::default());
         // Render tests only assert the tree, not click routing: the stub
         // factory hands back a do-nothing callback.
         let on_link = |_nav: LinkNav| Callback::new(|()| ());
-        pump.mount_view(doc_view(doc, &WindowsMarkdownRenderer::default(), &on_link))
-            .expect("mount");
+        pump.mount_view(doc_view(
+            doc,
+            &WindowsMarkdownRenderer::default(),
+            anchor,
+            &on_link,
+        ))
+        .expect("mount");
         let window = pump.window().expect("window node");
         (pump, window)
     }
@@ -580,18 +724,74 @@ mod tests {
         let (pump, window) = render(&doc);
         let rt = pump.runtime();
         assert!(find_text(rt, window, "#rust").is_some());
+        // Tags are Hyperlink-equivalent callbacks (plan §10.3), routed to
+        // the tags panel by the shell.
+        let button = find_owner_of_label(rt, window, "#rust").expect("tag button recorded");
+        assert!(
+            pump.event_revision(button, EventId::HyperlinkButtonClick)
+                .is_some(),
+            "the tag's click wiring is active"
+        );
     }
 
     #[test]
     fn footnote_ref_renders_with_caret() {
+        // A ref without a definition renders as plain text (not clickable).
         let doc = doc_with(vec![paragraph(vec![Inline::FootnoteRef("1".into())])]);
         let (pump, window) = render(&doc);
         let rt = pump.runtime();
         assert!(find_text(rt, window, "^1").is_some());
+        let owner = find_owner_of_label(rt, window, "^1").expect("footnote ref text recorded");
+        assert!(
+            pump.event_revision(owner, EventId::HyperlinkButtonClick)
+                .is_none(),
+            "a dangling footnote ref is not a button"
+        );
     }
 
     #[test]
-    fn footnote_defs_are_skipped() {
+    fn footnote_ref_with_definition_renders_clickable() {
+        // A ref with a matching definition renders as a jump button.
+        let doc = doc_with(vec![
+            paragraph(vec![Inline::FootnoteRef("1".into())]),
+            Block::FootnoteDef {
+                label: "1".into(),
+                body: vec![paragraph(vec![Inline::Text("definition".into())])],
+            },
+        ]);
+        let (pump, window) = render(&doc);
+        let rt = pump.runtime();
+        assert!(find_text(rt, window, "^1").is_some());
+        let button = find_owner_of_label(rt, window, "^1").expect("footnote ref button recorded");
+        assert!(
+            pump.event_revision(button, EventId::HyperlinkButtonClick)
+                .is_some(),
+            "the footnote ref's click wiring is active"
+        );
+    }
+
+    #[test]
+    fn relative_link_renders_clickable() {
+        let doc = doc_with(vec![paragraph(vec![Inline::Link {
+            url: "notes/b.md".into(),
+            title: None,
+            content: vec![Inline::Text("a sibling note".into())],
+        }])]);
+        let (pump, window) = render(&doc);
+        let rt = pump.runtime();
+        let button =
+            find_owner_of_label(rt, window, "a sibling note").expect("relative link button");
+        assert!(
+            pump.event_revision(button, EventId::HyperlinkButtonClick)
+                .is_some(),
+            "the relative link's click wiring is active"
+        );
+    }
+
+    #[test]
+    fn footnote_defs_render_at_the_end_under_a_rule() {
+        // Obsidian's order (and the Linux app's): prose first, then the
+        // footnote definitions gathered under a hairline.
         let doc = doc_with(vec![
             paragraph(vec![Inline::Text("prose".into())]),
             Block::FootnoteDef {
@@ -601,11 +801,63 @@ mod tests {
         ]);
         let (pump, window) = render(&doc);
         let rt = pump.runtime();
-        assert!(find_text(rt, window, "prose").is_some());
+        let mut texts = Vec::new();
+        collect_texts(rt, window, &mut texts);
+        let prose = texts
+            .iter()
+            .position(|t| t == "prose")
+            .expect("prose recorded");
+        let rule = texts
+            .iter()
+            .position(|t| t == "─")
+            .expect("the footnote rule is rendered");
+        let marker = texts
+            .iter()
+            .position(|t| t == "[^1]")
+            .expect("the definition's marker is rendered");
+        let def = texts
+            .iter()
+            .position(|t| t == "definition")
+            .expect("definition recorded");
+        assert!(prose < rule, "the rule separates prose from footnotes");
+        assert!(rule < marker && marker < def, "definitions follow the rule");
+    }
+
+    #[test]
+    fn the_jump_anchor_wraps_its_block_in_a_border() {
+        let doc = doc_with(vec![
+            paragraph(vec![Inline::Text("first".into())]),
+            paragraph(vec![Inline::Text("second".into())]),
+        ]);
+        let (pump, window) = render_anchored(&doc, Some(1));
+        let rt = pump.runtime();
         assert!(
-            find_text(rt, window, "definition").is_none(),
-            "footnote definitions are not standalone blocks"
+            find_border_wrapping(rt, window, "second"),
+            "the anchored block sits in a Border marker"
         );
+        assert!(
+            !find_border_wrapping(rt, window, "first"),
+            "non-anchored blocks are not wrapped"
+        );
+    }
+
+    /// Whether any node in the tree under `from` is a `Border` (detected
+    /// via its `BorderThickness` property — `MountedKind` is private in
+    /// the toolkit) whose subtree contains a TextBlock with exactly
+    /// `text`, i.e. the jump anchor's visible marker.
+    fn find_border_wrapping(rt: &RecordingRuntime, from: NodeId, text: &str) -> bool {
+        let node = match rt.node(from) {
+            Some(node) => node,
+            None => return false,
+        };
+        let is_anchor_marker = node.property(PropertyId::BorderBorderThickness).is_some()
+            && find_text(rt, from, text).is_some();
+        if is_anchor_marker {
+            return true;
+        }
+        node.children()
+            .iter()
+            .any(|&child| find_border_wrapping(rt, child, text))
     }
 
     #[test]

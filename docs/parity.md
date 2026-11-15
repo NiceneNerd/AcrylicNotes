@@ -31,12 +31,12 @@ scenarios.
 | TREE-* | File tree | — | — | Existing (reference) | Not started |
 | TAB-* | Tabs | — | — | Existing (reference) | Not started |
 | EDIT-* | Source editor | — | — | Existing (reference; pure editor text ops shared via `vault_app::editor` since Phase 6) | Not started |
-| PANE-* | Reading view | — | — | Existing (reference) | Not started |
+| PANE-* | Reading view | — | — | Existing (reference) | Functional: relative Markdown links render as clickable HyperlinkButtons (`resolve_relative` → `OpenNote` for notes, `OpenExternal::File` for attachments); tags render as tag-panel links (`TagToggled`); footnote refs and outline entries jump via `JumpOutline` (a visible Border marker anchors the block until the toolkit grows a scroll API); real-Windows visual confirmation user-side |
 | PANE-* | Split mode | — | — | Existing (reference) | Not started |
 | EDIT-*, PANE-* | Live mode | — | — | Existing (reference; word/offset math shared via `vault_app::editor` since Phase 6) | Not started |
 | NAV-* | Search | — | — | Existing (reference) | Not started |
 | NAV-* | Tags/backlinks | — | — | Existing (reference) | Functional: the shared `NoteIndex` adapter (kernel `vault_app::navigation`, real impl over vault-core's index, `MemoryRepository` fake for tests) feeds the shell's Tags panel (counts, shell-local drill-down) and Links panel (backlinks of the active note), rows open notes through `OpenNote` with index resolution of bare titles; headless-verified (Wine) |
-| NAV-* | Outline | — | — | Existing (reference) | Not started |
+| NAV-* | Outline | — | — | Existing (reference) | Functional: outline entries render in the sidebar panel (indented by level) and clicking one sets the kernel jump anchor (`JumpOutline`), rendered as a Border marker; real scrolling deferred to a toolkit scroll API; headless-verified (Wine) |
 | NAV-* | Quick switcher | — | — | Existing (reference; switcher/fuzzy/tags/backlinks/outline/tree view models shared via `vault_app::{navigation,tree,fuzzy}` since Phase 5) | Not started |
 | EDIT-* | Find/replace | — | — | Existing (reference; matching shared via `vault_app::editor` since Phase 6) | Not started |
 | DLG-* | Dialogs | — | — | Existing (reference) | Not started |

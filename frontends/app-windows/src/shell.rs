@@ -16,9 +16,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use windows_reactor::{
-    Button, ChildrenControl, Component, ComponentContext, ContentControl, KeyedView, Orientation,
-    StackPanel, TextBlock, TextBox, TreeNode, TreeView, TreeViewExt, TreeViewSelectionMode, View,
-    ViewContext, WindowBackdrop, WindowTheme, WindowVisuals,
+    Button, ChildrenControl, Component, ComponentContext, ContentControl, HyperlinkButton,
+    KeyedView, Orientation, StackPanel, TextBlock, TextBox, TreeNode, TreeView, TreeViewExt,
+    TreeViewSelectionMode, View, ViewContext, WindowBackdrop, WindowTheme, WindowVisuals,
 };
 
 use vault_app::commands::UiCommand;
@@ -100,14 +100,23 @@ impl Component for Shell {
     fn update(&mut self, message: Self::Message, _context: &ComponentContext<Self>) {
         // Tag drill-down is shell-local view state (never touches the
         // vault): selecting a tag shows its notes, clicking the selected
-        // tag again clears the filter. No kernel dispatch, and the
-        // re-render follows the handled message.
+        // tag again clears the filter — the filter stays out of the
+        // kernel (the same split the file tree's expansion state uses).
+        // Tag clicks also navigate the sidebar to the tags panel, the
+        // same route the Linux app's `tag:` links take, whether they
+        // come from the sidebar rows or from a reading-view tag link.
         if let WindowsMessage::Native(NativeEvent::TagToggled { tag }) = message {
             self.selected_tag = if self.selected_tag.as_deref() == Some(tag.as_str()) {
                 None
             } else {
                 Some(tag)
             };
+            self.handle
+                .0
+                .borrow_mut()
+                .handle_native(WindowsMessage::Command(UiCommand::SetNavSection {
+                    section: NavSection::Tags,
+                }));
             return;
         }
         if let WindowsMessage::Native(NativeEvent::EditorEdited { text }) = &message {
@@ -345,9 +354,10 @@ impl Component for Shell {
 
         // Outline panel: the active buffer's headings (the shared
         // `vault_app::navigation::outline` view model), indented by
-        // level. Parsed per render like the reading view; clicking an
-        // entry scrolls the reading pane in a later slice (the kernel has
-        // no scroll command yet).
+        // level. Clicking an entry anchors that block in the reading
+        // view via the kernel `JumpOutline` command (rendered as a
+        // Border marker; real scrolling deferred to a toolkit scroll
+        // API).
         let outline_panel = active_buffer
             .map(|buffer| {
                 let doc = parse_note(&buffer.text);
@@ -355,9 +365,15 @@ impl Component for Shell {
                     .iter()
                     .map(|entry| {
                         let indent = "  ".repeat(usize::from(entry.level.saturating_sub(1)));
+                        let text = format!("{indent}{}", entry.text);
+                        let block = entry.block;
                         KeyedView::new(
                             entry.block.to_string(),
-                            TextBlock::new().text(format!("{indent}{}", entry.text)),
+                            HyperlinkButton::new()
+                                .on_click(context.callback(move |()| {
+                                    WindowsMessage::Command(UiCommand::JumpOutline { block })
+                                }))
+                                .content(TextBlock::new().text(text)),
                         )
                     })
                     .collect();
@@ -532,6 +548,7 @@ impl Component for Shell {
                 // through `OpenExternal` (the ExternalOpener service owns
                 // the hand-off), wiki links open or focus their tab.
                 let on_link = |nav: LinkNav| {
+                    let handle = self.handle.clone();
                     context.callback(move |()| match nav.clone() {
                         LinkNav::Url(url) => WindowsMessage::Command(UiCommand::OpenExternal {
                             target: OpenTarget::Url(url),
@@ -539,9 +556,51 @@ impl Component for Shell {
                         LinkNav::Note(path) => {
                             WindowsMessage::Command(UiCommand::OpenNote { path })
                         }
+                        // Relative Markdown link: resolve against the
+                        // active note's folder through the vault index
+                        // (plan §10.3's `resolve_relative` flow). A
+                        // resolved note opens a tab; anything else
+                        // (attachments, unresolvable targets) is handed
+                        // to the platform's default file handler.
+                        LinkNav::Relative(target) => {
+                            let from = handle
+                                .0
+                                .borrow()
+                                .shared
+                                .state
+                                .tabs
+                                .active_path()
+                                .unwrap_or("")
+                                .to_string();
+                            if let Some(path) =
+                                handle.0.borrow().runner.resolve_relative(&target, &from)
+                            {
+                                WindowsMessage::Command(UiCommand::OpenNote { path })
+                            } else {
+                                WindowsMessage::Command(UiCommand::OpenExternal {
+                                    target: OpenTarget::File(std::path::PathBuf::from(&target)),
+                                })
+                            }
+                        }
+                        // A reading-view tag routes to the tags panel
+                        // with the tag selected (shell-local filter).
+                        LinkNav::Tag(tag) => {
+                            WindowsMessage::Native(NativeEvent::TagToggled { tag })
+                        }
+                        // A footnote reference jumps to its definition:
+                        // the block index was resolved at render time,
+                        // so just anchor it (the Border marker).
+                        LinkNav::Footnote(block) => {
+                            WindowsMessage::Command(UiCommand::JumpOutline { block })
+                        }
                     })
                 };
-                doc_view(&doc, &WindowsMarkdownRenderer::default(), &on_link)
+                doc_view(
+                    &doc,
+                    &WindowsMarkdownRenderer::default(),
+                    state.jump_anchor,
+                    &on_link,
+                )
             })
             .unwrap_or_else(|| View::from(TextBlock::new().text("(no note open)")));
 

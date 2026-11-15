@@ -31,6 +31,12 @@ pub struct AppState {
     pub theme: ThemeChoice,
     /// Whether to request the platform's frosted (blur) backdrop.
     pub glass_enabled: bool,
+    /// The top-level block index the reading view should highlight (the
+    /// kernel's scroll anchor, plan §5.2's `JumpOutline` command):
+    /// outline entries and footnote references set it, tab switches and
+    /// note opens clear it. Without a toolkit scroll API the frontends
+    /// render a visible marker at the anchored block.
+    pub jump_anchor: Option<usize>,
     /// The vault-wide search session (query, hits, current request).
     pub search: SearchSession,
     /// Tabs whose note changed on disk while they had unsaved edits
@@ -50,6 +56,7 @@ impl Default for AppState {
             panel: NavSection::default(),
             theme: ThemeChoice::default(),
             glass_enabled: true,
+            jump_anchor: None,
             search: SearchSession::default(),
             conflicts: Vec::new(),
             last_error: None,

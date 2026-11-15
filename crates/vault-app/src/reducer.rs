@@ -73,20 +73,29 @@ impl App {
                 let id = self.effect_ids.allocate();
                 vec![Effect::new(id, EffectKind::PersistSettings)]
             }
+            UiCommand::JumpOutline { block } => {
+                self.state.jump_anchor = Some(block);
+                Vec::new()
+            }
             UiCommand::OpenNote { path } => {
                 self.state.tabs.open_or_focus(&path);
+                // A fresh (or refocused) note view starts unanchored.
+                self.state.jump_anchor = None;
                 Vec::new()
             }
             UiCommand::ActivateTab { position } => {
                 if let Some(id) = self.state.tabs.id_at(position) {
                     self.state.tabs.activate(id);
                 }
+                // The anchor belongs to the previously active tab's view.
+                self.state.jump_anchor = None;
                 Vec::new()
             }
             UiCommand::CloseTab { position } => {
                 if let Some(id) = self.state.tabs.id_at(position) {
                     self.state.tabs.close(id);
                 }
+                self.state.jump_anchor = None;
                 Vec::new()
             }
             UiCommand::SaveActiveTab => {
@@ -295,6 +304,22 @@ mod tests {
             effects[0].kind,
             crate::effects::EffectKind::PersistSettings
         ));
+    }
+
+    #[test]
+    fn jump_outline_sets_the_anchor_and_tab_changes_clear_it() {
+        let mut app = app_with_tabs(&["a.md", "b.md"]);
+        app.dispatch(UiCommand::JumpOutline { block: 4 });
+        assert_eq!(app.state.jump_anchor, Some(4));
+
+        // Any tab change resets the anchor: it belongs to the previous
+        // tab's view.
+        app.dispatch(UiCommand::ActivateTab { position: 1 });
+        assert_eq!(app.state.jump_anchor, None);
+        app.dispatch(UiCommand::JumpOutline { block: 2 });
+        assert_eq!(app.state.jump_anchor, Some(2));
+        app.dispatch(UiCommand::CloseTab { position: 1 });
+        assert_eq!(app.state.jump_anchor, None);
     }
 
     #[test]

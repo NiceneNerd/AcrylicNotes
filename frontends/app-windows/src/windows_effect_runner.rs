@@ -114,6 +114,14 @@ impl WindowsEffectRunner {
         self.index.borrow().resolve_note(target, from)
     }
 
+    /// Resolve a folder-relative target (`Note.md`,
+    /// `../media/x.png`) against the source note's folder — standard
+    /// Markdown links, never shortest-unique-name. Attachment files
+    /// resolve too when they exist on disk.
+    pub fn resolve_relative(&self, target: &str, from: &str) -> Option<String> {
+        self.index.borrow().resolve_relative(target, from)
+    }
+
     /// Hand an open target to the platform's default handler. Success is
     /// fire-and-forget (the reducer drains the tracking on
     /// `OpenCompleted`); spawn-level failures surface as `OpenFailed`.

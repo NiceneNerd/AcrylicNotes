@@ -78,6 +78,12 @@ pub enum UiCommand {
     /// snapshot), emitting `EffectKind::PersistSettings`.
     #[serde(rename = "set-glass-enabled")]
     SetGlassEnabled { enabled: bool },
+    /// Jump the reading view to a top-level block (outline entries,
+    /// footnote references; plan §5.2's `JumpOutline`). The active tab's
+    /// anchor becomes `block`; the frontends render a visible marker
+    /// there until the tab changes.
+    #[serde(rename = "jump-outline")]
+    JumpOutline { block: usize },
     /// Hand a URL or file to the platform's default handler
     /// (`EffectKind::OpenExternal`, reported via `AppEvent::Open…`).
     #[serde(rename = "open-external")]
@@ -124,6 +130,7 @@ mod tests {
                 theme: crate::settings::ThemeChoice::Dark,
             },
             UiCommand::SetGlassEnabled { enabled: false },
+            UiCommand::JumpOutline { block: 3 },
         ];
         for command in commands {
             let json = serde_json::to_string(&command).unwrap();
