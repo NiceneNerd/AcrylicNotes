@@ -303,6 +303,7 @@ impl WindowsApp {
             // reach the host, they are no-ops here.
             NativeEvent::WindowResized { .. } => {}
             NativeEvent::LiveFocus { .. } => {}
+            NativeEvent::LiveBlockEdited { .. } => {}
             NativeEvent::LiveCommit => {}
         }
     }

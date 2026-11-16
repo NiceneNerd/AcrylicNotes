@@ -20,7 +20,7 @@ use windows_reactor::{
     Border, Button, ButtonStyle, Callback, ChildrenControl, ContentControl, EncodedImage,
     FontWeight, Image, KeyedView, LayoutControl, Orientation, RichText, RichTextBlock,
     RichTextInline, RichTextParagraph, RichTextRun, StackPanel, Stretch, TextBlock, TextWrapping,
-    View,
+    VerticalAlignment, View,
 };
 
 use super::reading::WindowsMarkdownRenderer;
@@ -244,7 +244,38 @@ fn block_view(
                     )
                 })),
             ),
-        Block::EmbedBlock(_) => TextBlock::new().text("(embedded note)").into(),
+        Block::EmbedBlock(embed) => {
+            // `![[image.png]]` alone on its line is an embed block. A local
+            // vault raster renders inline via a `file:///` URI; everything
+            // else (note transclusion, unresolvable targets) stays the
+            // placeholder until transclusion renders real note bodies.
+            if config.show_images {
+                if let Some(resolve) = config.image_resolver.as_ref() {
+                    if let Some(path) = resolve(&embed.target.note) {
+                        let uri = format!("file:///{}", path.replace('\\', "/"));
+                        return match Image::new().source(uri) {
+                            Ok(image) => View::from(
+                                image
+                                    .stretch(Stretch::Uniform)
+                                    .max_width(600.0)
+                                    .min_height(150.0),
+                            ),
+                            Err(_) => match fs::read(&path) {
+                                Ok(bytes) => View::from(
+                                    Image::new()
+                                        .source_data(EncodedImage::new(bytes))
+                                        .stretch(Stretch::Uniform)
+                                        .max_width(600.0)
+                                        .min_height(150.0),
+                                ),
+                                Err(_) => View::from(TextBlock::new().text("(embedded note)")),
+                            },
+                        };
+                    }
+                }
+            }
+            TextBlock::new().text("(embedded note)").into()
+        }
         // Defensive: doc_view filters footnote definitions out, but the
         // match must be total so block_view stays reusable.
         Block::FootnoteDef { label, body, .. } => {
@@ -492,6 +523,8 @@ fn inline_view_with_style(
                 let click = on_link(LinkNav::Url(url.clone()));
                 Button::new()
                     .style(ButtonStyle::TextLink)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .min_height(0.0)
                     .on_click(click)
                     .content(styled_text(label, size, font_weight))
             } else {
@@ -501,6 +534,8 @@ fn inline_view_with_style(
                 let click = on_link(LinkNav::Relative(url.clone()));
                 Button::new()
                     .style(ButtonStyle::TextLink)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .min_height(0.0)
                     .on_click(click)
                     .content(styled_text(label, size, font_weight))
             }
@@ -515,6 +550,8 @@ fn inline_view_with_style(
             let click = on_link(LinkNav::Note(wl.target.note.clone()));
             Button::new()
                 .style(ButtonStyle::TextLink)
+                .vertical_alignment(VerticalAlignment::Top)
+                .min_height(0.0)
                 .on_click(click)
                 .content(styled_text(label, size, font_weight))
         }
@@ -525,6 +562,8 @@ fn inline_view_with_style(
             let click = on_link(LinkNav::Tag(t.clone()));
             Button::new()
                 .style(ButtonStyle::TextLink)
+                .vertical_alignment(VerticalAlignment::Top)
+                .min_height(0.0)
                 .on_click(click)
                 .content(styled_text(format!("#{t}"), size, font_weight))
         }
@@ -537,6 +576,8 @@ fn inline_view_with_style(
                     let click = on_link(LinkNav::Footnote(block));
                     Button::new()
                         .style(ButtonStyle::TextLink)
+                        .vertical_alignment(VerticalAlignment::Top)
+                        .min_height(0.0)
                         .on_click(click)
                         .content(styled_text(format!("^{r}"), size, font_weight))
                 }
@@ -647,6 +688,7 @@ fn inline_view_with_style(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
     use vault_md::{ListItem, WikiLink, WikiTarget};
     use windows_reactor::test::{
         EventId, NodeId, PropertyId, PropertyValue, Pump, RecordingRuntime,
@@ -1062,5 +1104,78 @@ mod tests {
         let a = texts.iter().position(|t| t == "A").expect("header cell");
         let b = texts.iter().position(|t| t == "b").expect("body cell");
         assert!(a < b, "header renders before body rows");
+    }
+
+    #[test]
+    fn embed_block_with_resolver_renders_as_image() {
+        // `![[image.png]]` alone on its line is an EmbedBlock. With an
+        // image resolver that returns a local raster path, it renders as
+        // an Image with a `file:///` source, not the "(embedded note)"
+        // placeholder.
+        let doc = doc_with(vec![Block::EmbedBlock(vault_md::Embed {
+            target: WikiTarget {
+                note: "image.png".into(),
+                heading: None,
+                block: None,
+            },
+            size: None,
+            alias: None,
+        })]);
+        let mut renderer = WindowsMarkdownRenderer::default();
+        renderer.image_resolver = Some(Rc::new(|url| {
+            if url == "image.png" {
+                Some("C:\\Users\\Caleb Smith\\Desktop\\vault-test\\image.png".to_string())
+            } else {
+                None
+            }
+        }));
+        let mut pump = Pump::new(RecordingRuntime::default());
+        let on_link = |_nav: LinkNav| Callback::new(|()| ());
+        pump.mount_view(doc_view(&doc, &renderer, None, &on_link))
+            .expect("mount");
+        let window = pump.window().expect("window node");
+        let rt = pump.runtime();
+        // The placeholder text must not appear when the image resolves.
+        assert!(
+            find_text(rt, window, "(embedded note)").is_none(),
+            "no placeholder text when the image resolves"
+        );
+        // An Image node (with an ImageSource property) must be present.
+        fn find_image_source(rt: &RecordingRuntime, from: NodeId) -> Option<NodeId> {
+            let node = rt.node(from)?;
+            if node.property(PropertyId::ImageSource).is_some() {
+                return Some(from);
+            }
+            for &child in node.children() {
+                if let Some(found) = find_image_source(rt, child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        assert!(
+            find_image_source(rt, window).is_some(),
+            "embed block renders an Image node with a source"
+        );
+    }
+
+    #[test]
+    fn embed_block_without_resolver_renders_placeholder() {
+        // Without an image resolver, an EmbedBlock stays as the placeholder.
+        let doc = doc_with(vec![Block::EmbedBlock(vault_md::Embed {
+            target: WikiTarget {
+                note: "image.png".into(),
+                heading: None,
+                block: None,
+            },
+            size: None,
+            alias: None,
+        })]);
+        let (pump, window) = render(&doc);
+        let rt = pump.runtime();
+        assert!(
+            find_text(rt, window, "(embedded note)").is_some(),
+            "embed block renders placeholder without resolver"
+        );
     }
 }

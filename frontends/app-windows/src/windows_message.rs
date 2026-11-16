@@ -60,6 +60,11 @@ pub enum NativeEvent {
     /// The user clicked a rendered (non-focused) block in the Live pane;
     /// that region becomes a raw-source editor. Shell-local view state.
     LiveFocus { region: usize },
+    /// The Live-pane RichEditBox's text changed. The payload is the BLOCK's
+    /// source, not the whole note: the shell splices it into the region's
+    /// line range and hands the full note to the buffer (libcosmic's
+    /// `typing_in_live_mode_splices_into_the_note`). Shell-local.
+    LiveBlockEdited { text: String },
     /// Escape pressed in a Live-pane RichEditBox; the block's source is
     /// spliced back into the buffer and the block re-renders as rich text.
     LiveCommit,

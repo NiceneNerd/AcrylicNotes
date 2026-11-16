@@ -1118,6 +1118,133 @@ fn headless_shell_live_pane_renders_the_reading_view_only() {
 }
 
 #[test]
+fn headless_shell_live_click_focuses_a_block_editor() {
+    // Clicking a rendered block opens it as a raw-source RichEditBox over
+    // that region's source (the trailing blank line included, libcosmic's
+    // region contract). The buffer is untouched until an edit.
+    let app = shell_app_with(&[("a.md", "alpha\n\nbeta\n")]);
+    shell_open_tab(&app, "a.md", "alpha\n\nbeta\n", "alpha\n\nbeta\n");
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_node_with_property_text(rt, window, PropertyId::AutomationName, "edit region 0")
+            .expect("block click target recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    let editor = find_node_with_property(
+        rt,
+        window,
+        PropertyId::RichEditBoxDocument,
+        &|v| matches!(v, PropertyValue::Str(text) if text == "alpha\n"),
+    )
+    .expect("the focused block's editor is mounted");
+    // The editor carries the region's source (block + trailing blank line).
+    assert_eq!(
+        rt.node(editor)
+            .unwrap()
+            .property(PropertyId::RichEditBoxDocument),
+        Some(&PropertyValue::Str(String::from("alpha\n")))
+    );
+    // The buffer is untouched until an edit lands.
+    let borrowed = app.borrow();
+    let tab = borrowed.shared.state.tabs.id_of("a.md").unwrap();
+    assert_eq!(borrowed.buffers[&tab].text, "alpha\n\nbeta\n");
+}
+
+#[test]
+fn headless_shell_live_typing_splices_into_the_note() {
+    // Typing in the focused block's editor splices the region's source back
+    // into the note at its line range — the rest of the note is untouched
+    // (libcosmic's `typing_in_live_mode_splices_into_the_note`).
+    let app = shell_app_with(&[("a.md", "alpha\n\nbeta\n")]);
+    shell_open_tab(&app, "a.md", "alpha\n\nbeta\n", "alpha\n\nbeta\n");
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_node_with_property_text(rt, window, PropertyId::AutomationName, "edit region 0")
+            .expect("block click target recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    // The user types in the focused block's editor.
+    let window = pump.window().expect("window node");
+    let editor = {
+        let rt = pump.runtime();
+        find_node_with_property(
+            rt,
+            window,
+            PropertyId::RichEditBoxDocument,
+            &|v| matches!(v, PropertyValue::Str(text) if text.starts_with("alpha")),
+        )
+        .expect("focused editor recorded")
+    };
+    let revision = pump
+        .event_revision(editor, EventId::RichEditBoxTextChanged)
+        .expect("rich-edit text-changed event active");
+    pump.queue_event(QueuedEvent::new(
+        editor,
+        EventId::RichEditBoxTextChanged,
+        revision,
+        EventPayload::Str(String::from("alphas\n")),
+    ));
+    pump.dispatch_events().expect("dispatch events");
+    pump.dispatch_components(10).expect("dispatch components");
+
+    // The edit landed in the active buffer, spliced at the region's lines:
+    // the second block survives.
+    let borrowed = app.borrow();
+    let tab = borrowed.shared.state.tabs.id_of("a.md").unwrap();
+    assert_eq!(
+        borrowed.buffers[&tab].text, "alphas\n\nbeta\n",
+        "the region splice keeps the rest of the note"
+    );
+}
+
+#[test]
+fn headless_shell_live_clicking_another_block_moves_the_editor() {
+    // Edits splice live, so moving focus needs no commit step: clicking a
+    // second block just re-renders it as the editor.
+    let app = shell_app_with(&[("a.md", "alpha\n\nbeta\n")]);
+    shell_open_tab(&app, "a.md", "alpha\n\nbeta\n", "alpha\n\nbeta\n");
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let first = {
+        let rt = pump.runtime();
+        find_node_with_property_text(rt, window, PropertyId::AutomationName, "edit region 0")
+            .expect("block click target recorded")
+    };
+    click(&mut pump, first, EventId::ButtonClick);
+    let window = pump.window().expect("window node");
+    let second = {
+        let rt = pump.runtime();
+        find_node_with_property_text(rt, window, PropertyId::AutomationName, "edit region 1")
+            .expect("second block click target recorded")
+    };
+    click(&mut pump, second, EventId::ButtonClick);
+
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    assert!(
+        find_node_with_property(
+            rt,
+            window,
+            PropertyId::RichEditBoxDocument,
+            &|v| matches!(v, PropertyValue::Str(text) if text.starts_with("beta")),
+        )
+        .is_some(),
+        "the editor moved to the second block"
+    );
+}
+
+#[test]
 fn headless_shell_pane_split_shows_source_and_reading() {
     let app = shell_app_with(&[("a.md", "# Title\n\nbody text\n")]);
     shell_open_tab(

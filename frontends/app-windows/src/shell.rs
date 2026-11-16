@@ -17,13 +17,14 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use windows_reactor::{
-    AutomationExt, Border, Brush, Button, ChildrenControl, Component, ComponentContext,
-    ContentControl, CornerRadius, FontWeight, Grid, GridChildExt, GridLength, HorizontalAlignment,
-    HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, LayoutControl, Orientation, RichEditBox,
-    ScrollBarVisibility, ScrollViewer, SlotView, SlotsControl, SplitView, SplitViewDisplayMode,
-    SplitViewSlot, StackPanel, TextBlock, TextBox, TextWrapping, ThemeBrush, Thickness, TitleBar,
-    TitleBarSlot, TreeNode, TreeView, TreeViewExt, TreeViewSelectionMode, VerticalAlignment, View,
-    ViewContext, WindowBackdrop, WindowSize, WindowTheme, WindowTitleBarHeight, WindowVisuals,
+    AutomationExt, Border, Brush, Button, ButtonStyle, ChildrenControl, Component,
+    ComponentContext, ContentControl, CornerRadius, FontWeight, Grid, GridChildExt, GridLength,
+    HorizontalAlignment, HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, LayoutControl,
+    Orientation, RichEditBox, ScrollBarVisibility, ScrollViewer, SlotView, SlotsControl, SplitView,
+    SplitViewDisplayMode, SplitViewSlot, StackPanel, TextBlock, TextBox, TextWrapping, ThemeBrush,
+    Thickness, TitleBar, TitleBarSlot, TreeNode, TreeView, TreeViewExt, TreeViewSelectionMode,
+    VerticalAlignment, View, ViewContext, WindowBackdrop, WindowSize, WindowTheme,
+    WindowTitleBarHeight, WindowVisuals,
 };
 
 use vault_app::commands::UiCommand;
@@ -192,6 +193,10 @@ pub struct Shell {
     /// Which region index is being edited in the Live pane (RichEditBox).
     /// Shell-local view state; `None` means all blocks render as rich text.
     live_focused: Cell<Option<usize>>,
+    /// The note path the focused region belongs to. A tab switch invalidates
+    /// the focus (the region index belongs to the previous note's slices),
+    /// so typing can never splice into the wrong note.
+    live_path: RefCell<Option<String>>,
     /// The note's editable regions, cached per render. `BlockSlice` tiling
     /// comes from `vault_app::live::slices`.
     live_slices: RefCell<Vec<vault_app::live::BlockSlice>>,
@@ -216,6 +221,7 @@ impl Component for Shell {
             image_cache: Rc::new(RefCell::new(HashMap::new())),
             last_pane: Cell::new(None),
             live_focused: Cell::new(None),
+            live_path: RefCell::new(None),
             live_slices: RefCell::new(Vec::new()),
             live_editor_text: RefCell::new(String::new()),
         }
@@ -273,6 +279,48 @@ impl Component for Shell {
         // Live pane: clicking a rendered block opens it for editing.
         if let WindowsMessage::Native(NativeEvent::LiveFocus { region }) = message {
             self.live_focused.set(Some(region));
+            *self.live_path.borrow_mut() = self
+                .handle
+                .0
+                .borrow()
+                .shared
+                .state
+                .tabs
+                .active_path()
+                .map(String::from);
+            return;
+        }
+        // Live pane: the focused block's editor text changed. The payload is
+        // the BLOCK's source, not the whole note: splice it into the region's
+        // line range and hand the full note to the buffer (libcosmic's
+        // `typing_in_live_mode_splices_into_the_note` — the buffer stays live,
+        // so focusing another block needs no commit step). An incoming text
+        // equal to the last rendered editor text is the echo of our own
+        // programmatic sync (the mount's SetText) and is suppressed.
+        if let WindowsMessage::Native(NativeEvent::LiveBlockEdited { text }) = &message {
+            if *text == *self.live_editor_text.borrow() {
+                return;
+            }
+            let region = match self.live_focused.get() {
+                Some(region) => region,
+                None => return,
+            };
+            let slice = match self.live_slices.borrow().get(region) {
+                Some(&slice) => slice,
+                None => return,
+            };
+            let spliced = {
+                let app = self.handle.0.borrow();
+                let Some(tab) = app.shared.state.tabs.active() else {
+                    return;
+                };
+                let Some(buffer) = app.buffers.get(&tab) else {
+                    return;
+                };
+                vault_app::live::replace_lines(&buffer.text, slice.start_line, slice.end_line, text)
+            };
+            *self.live_editor_text.borrow_mut() = text.clone();
+            self.handle.0.borrow_mut().set_active_buffer_text(spliced);
             return;
         }
         // Live pane: Escape commits the edited block's source back into
@@ -819,6 +867,20 @@ impl Component for Shell {
             self.source_text_seeded.set(false);
         }
         self.last_pane.set(Some(state.pane));
+        // Live focus is per-pane and per-note: leaving Live (or switching to
+        // a different note) drops the editor. The region index belongs to the
+        // note whose slices were current when it was focused; typing after a
+        // tab switch must never splice into the wrong note. Edits are already
+        // spliced live, so there is nothing to commit — the block just
+        // renders as rich text again.
+        if state.pane != PaneMode::Live {
+            self.live_focused.set(None);
+        } else {
+            let active_path = state.tabs.active_path().map(String::from);
+            if self.live_path.borrow().as_deref() != active_path.as_deref() {
+                self.live_focused.set(None);
+            }
+        }
         // windows-reactor applies `TextBoxText` before `TextBoxAcceptsReturn`
         // (fixed enum order, not builder-call order), so on the very first
         // render multiline text is truncated to one line while
@@ -972,41 +1034,40 @@ impl Component for Shell {
                         let key = format!("live-region-{region_idx}");
 
                         if is_focused {
-                            // Raw-source editor for the focused block.
+                            // Raw-source editor for the focused block. Its
+                            // text changes splice into the region (see the
+                            // LiveBlockEdited handler), so the buffer stays
+                            // live and no commit step is needed.
                             let source = slice.source(&buffer.text);
-                            let display_text = if *self.live_editor_text.borrow() == source {
-                                self.live_editor_text.borrow().clone()
-                            } else {
-                                source.clone()
-                            };
-                            *self.live_editor_text.borrow_mut() = display_text.clone();
+                            *self.live_editor_text.borrow_mut() = source.clone();
 
                             KeyedView::new(
                                 key,
-                                View::from(
-                                    RichEditBox::new()
-                                        .text(display_text)
-                                        .on_text_changed(context.callback(|text: String| {
-                                            WindowsMessage::Native(NativeEvent::EditorEdited {
-                                                text,
-                                            })
-                                        }))
-                                        .vertical_alignment(VerticalAlignment::Stretch)
-                                        .min_height(60.0),
-                                ),
+                                RichEditBox::new()
+                                    .text(source)
+                                    .on_text_changed(context.callback(|text: String| {
+                                        WindowsMessage::Native(NativeEvent::LiveBlockEdited {
+                                            text,
+                                        })
+                                    }))
+                                    .vertical_alignment(VerticalAlignment::Stretch)
+                                    .min_height(60.0),
                             )
                         } else {
                             match slice.block {
                                 Some(block_idx) => {
-                                    let handle = self.handle.clone();
                                     let region = region_idx;
                                     let on_link = |nav: LinkNav| {
-                                        let handle = handle.clone();
+                                        let handle = self.handle.clone();
                                         context.callback(move |()| link_callback(&handle, &nav))
                                     };
                                     KeyedView::new(
                                         key,
                                         Button::new()
+                                            .style(ButtonStyle::Subtle)
+                                            .horizontal_content_alignment(HorizontalAlignment::Left)
+                                            .vertical_content_alignment(VerticalAlignment::Top)
+                                            .automation_name(format!("edit region {region}"))
                                             .on_click(context.callback(move |()| {
                                                 WindowsMessage::Native(NativeEvent::LiveFocus {
                                                     region,
@@ -1021,18 +1082,28 @@ impl Component for Shell {
                                     )
                                 }
                                 None => {
-                                    // Frontmatter or empty body region:
-                                    // raw text, muted.
+                                    // Frontmatter or empty body region: raw
+                                    // text, muted, still clickable to edit.
                                     let text = slice.source(&buffer.text);
                                     KeyedView::new(
                                         key,
-                                        View::from(
-                                            TextBlock::new()
-                                                .text(text)
-                                                .font_size(12.0)
-                                                .opacity(0.6)
-                                                .text_wrapping(TextWrapping::Wrap),
-                                        ),
+                                        Button::new()
+                                            .style(ButtonStyle::Subtle)
+                                            .horizontal_content_alignment(HorizontalAlignment::Left)
+                                            .vertical_content_alignment(VerticalAlignment::Top)
+                                            .automation_name(format!("edit region {region_idx}"))
+                                            .on_click(context.callback(move |()| {
+                                                WindowsMessage::Native(NativeEvent::LiveFocus {
+                                                    region: region_idx,
+                                                })
+                                            }))
+                                            .content(
+                                                TextBlock::new()
+                                                    .text(text)
+                                                    .font_size(12.0)
+                                                    .opacity(0.6)
+                                                    .text_wrapping(TextWrapping::Wrap),
+                                            ),
                                     )
                                 }
                             }
