@@ -2,10 +2,11 @@
 //!
 //! Converts a [`vault_md::Doc`] into WinUI elements ([`View`]) for the
 //! reading renderer. Block-level structure (paragraphs, headings, lists,
-//! quotes, callouts, code, ...) becomes nested [`StackPanel`]s of
-//! [`TextBlock`]s; inline formatting (strong, code, links, tags) becomes
-//! per-inline [`TextBlock`]s with semantic font weight or
-//! [`HyperlinkButton`]s.
+//! quotes, callouts, code, ...) becomes vertical stacks of wrapping
+//! [`TextBlock`] rows; inline formatting (strong, code, links, tags)
+//! becomes [`TextBlock`]s with semantic font weight or text-link
+//! [`Button`]s. The Live pane renders the same blocks non-interactively
+//! (see [`live_block_view`]): editing owns every click there.
 //!
 //! This is pure rendering: no shell state, no commands. Link click
 //! handling is wired by the shell when reading mode is mounted; this
@@ -18,9 +19,9 @@ use vault_app::markdown::plain_inlines;
 use vault_md::{Block, Doc, Inline};
 use windows_reactor::{
     Border, Button, ButtonStyle, Callback, ChildrenControl, ContentControl, EncodedImage,
-    FontWeight, Image, KeyedView, LayoutControl, Orientation, RichText, RichTextBlock,
-    RichTextInline, RichTextParagraph, RichTextRun, StackPanel, Stretch, TextBlock, TextWrapping,
-    VerticalAlignment, View,
+    FontWeight, Grid, GridChildExt, GridLength, Image, KeyedView, LayoutControl, Orientation,
+    RichText, RichTextBlock, RichTextInline, RichTextParagraph, RichTextRun, StackPanel, Stretch,
+    TextBlock, TextWrapping, VerticalAlignment, View,
 };
 
 use super::reading::WindowsMarkdownRenderer;
@@ -90,7 +91,7 @@ pub fn doc_view(
             KeyedView::new(
                 i.to_string(),
                 anchored(
-                    block_view(block, config, &footnote_blocks, on_link),
+                    block_view(block, config, &footnote_blocks, true, on_link),
                     anchor == Some(i),
                 ),
             )
@@ -105,7 +106,7 @@ pub fn doc_view(
             KeyedView::new(
                 i.to_string(),
                 anchored(
-                    block_view(block, config, &footnote_blocks, on_link),
+                    block_view(block, config, &footnote_blocks, true, on_link),
                     anchor == Some(i),
                 ),
             )
@@ -136,55 +137,102 @@ fn anchored(view: View, is_anchor: bool) -> View {
     }
 }
 
+/// Render inlines as full-width rows in reading order: consecutive text
+/// inlines (soft and hard breaks included, as spaces) merge into one
+/// wrapping [`TextBlock`]; every other inline gets its own row.
+///
+/// The old per-inline horizontal StackPanel measured each child with
+/// unbounded width — long text never wrapped, and inline buttons/images
+/// were given no layout space at all (Empty rects on real Windows). A
+/// vertical stack of bounded rows fixes both; each text row wraps because
+/// [`styled_text`] sets `TextWrapping::Wrap`.
+fn inline_rows(
+    content: &[Inline],
+    size: f64,
+    font_weight: Option<FontWeight>,
+    interactive: bool,
+    config: &WindowsMarkdownRenderer,
+    footnote_blocks: &HashMap<String, usize>,
+    on_link: &dyn Fn(LinkNav) -> Callback<()>,
+) -> Vec<KeyedView> {
+    let mut rows: Vec<KeyedView> = Vec::new();
+    let mut text_buf = String::new();
+    let mut text_key = 0;
+    for (i, inline) in content.iter().enumerate() {
+        match inline {
+            Inline::Text(t) => {
+                if text_buf.is_empty() {
+                    text_key = i;
+                }
+                text_buf.push_str(t);
+            }
+            Inline::SoftBreak | Inline::HardBreak => {
+                // A break inside flowing text stays a space in the same
+                // text run: its own row would end the paragraph line.
+                if !text_buf.is_empty() && !text_buf.ends_with(' ') {
+                    text_buf.push(' ');
+                }
+            }
+            _ => {
+                if !text_buf.is_empty() {
+                    rows.push(KeyedView::new(
+                        format!("text-{text_key}"),
+                        View::from(styled_text(
+                            std::mem::take(&mut text_buf),
+                            size,
+                            font_weight,
+                        )),
+                    ));
+                }
+                rows.push(KeyedView::new(
+                    format!("inline-{i}"),
+                    inline_view_with_style(
+                        inline,
+                        config,
+                        size,
+                        font_weight,
+                        interactive,
+                        footnote_blocks,
+                        on_link,
+                    ),
+                ));
+            }
+        }
+    }
+    if !text_buf.is_empty() {
+        rows.push(KeyedView::new(
+            format!("text-{text_key}"),
+            View::from(styled_text(text_buf, size, font_weight)),
+        ));
+    }
+    rows
+}
+
 /// Render a single block into WinUI elements.
+///
+/// `interactive == false` (the Live pane) renders clickable inlinks
+/// (links, tags, footnote refs) as plain text so any click lands on the
+/// block's edit button instead of a nested control — Reading mode is the
+/// navigation surface.
 fn block_view(
     block: &Block,
     config: &WindowsMarkdownRenderer,
     footnote_blocks: &HashMap<String, usize>,
+    interactive: bool,
     on_link: &dyn Fn(LinkNav) -> Callback<()>,
 ) -> View {
     match block {
-        Block::Paragraph { content, .. } => {
-            // Group consecutive Text inlines into wrapping TextBlocks, and
-            // give each non-text inline (link button, image) its own row.
-            // A horizontal StackPanel does not give layout space to inline
-            // UI elements (buttons, images), so we render each inline as a
-            // full-width row in a vertical StackPanel instead.
-            let mut rows: Vec<KeyedView> = Vec::new();
-            let mut text_buf = String::new();
-            let mut text_key = 0;
-            for (i, inline) in content.iter().enumerate() {
-                match inline {
-                    Inline::Text(t) => {
-                        if text_buf.is_empty() {
-                            text_key = i;
-                        }
-                        text_buf.push_str(t);
-                    }
-                    _ => {
-                        if !text_buf.is_empty() {
-                            rows.push(KeyedView::new(
-                                format!("text-{text_key}"),
-                                View::from(styled_text(std::mem::take(&mut text_buf), 14.0, None)),
-                            ));
-                        }
-                        rows.push(KeyedView::new(
-                            format!("inline-{i}"),
-                            inline_view(inline, config, footnote_blocks, on_link),
-                        ));
-                    }
-                }
-            }
-            if !text_buf.is_empty() {
-                rows.push(KeyedView::new(
-                    format!("text-{text_key}"),
-                    View::from(styled_text(text_buf, 14.0, None)),
-                ));
-            }
-            StackPanel::new()
-                .orientation(Orientation::Vertical)
-                .keyed_children(rows)
-        }
+        Block::Paragraph { content, .. } => StackPanel::new()
+            .orientation(Orientation::Vertical)
+            .keyed_children(inline_rows(
+                content,
+                14.0,
+                None,
+                interactive,
+                config,
+                footnote_blocks,
+                on_link,
+            )),
         Block::Heading { level, content, .. } => {
             let size = match *level {
                 1 => 28.0,
@@ -193,21 +241,16 @@ fn block_view(
                 _ => 16.0,
             };
             StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(4.0)
-                .keyed_children(content.iter().enumerate().map(|(i, inline)| {
-                    KeyedView::new(
-                        i.to_string(),
-                        inline_view_with_style(
-                            inline,
-                            config,
-                            size,
-                            None,
-                            footnote_blocks,
-                            on_link,
-                        ),
-                    )
-                }))
+                .orientation(Orientation::Vertical)
+                .keyed_children(inline_rows(
+                    content,
+                    size,
+                    None,
+                    interactive,
+                    config,
+                    footnote_blocks,
+                    on_link,
+                ))
         }
         Block::Code { text, lang, .. } => {
             let label = match lang {
@@ -223,7 +266,7 @@ fn block_view(
             .keyed_children(items.iter().enumerate().map(|(i, item)| {
                 KeyedView::new(
                     i.to_string(),
-                    list_item_view(item, config, footnote_blocks, on_link),
+                    list_item_view(item, config, footnote_blocks, interactive, on_link),
                 )
             })),
         Block::Quote(inner) => StackPanel::new()
@@ -231,31 +274,23 @@ fn block_view(
             .keyed_children(inner.iter().enumerate().map(|(i, b)| {
                 KeyedView::new(
                     i.to_string(),
-                    block_view(b, config, footnote_blocks, on_link),
+                    block_view(b, config, footnote_blocks, interactive, on_link),
                 )
             })),
         Block::Callout { title, body, .. } => {
-            let mut children: Vec<KeyedView> = title
-                .iter()
-                .enumerate()
-                .map(|(i, inline)| {
-                    KeyedView::new(
-                        format!("title-{i}"),
-                        inline_view_with_style(
-                            inline,
-                            config,
-                            14.0,
-                            Some(FontWeight::SEMI_BOLD),
-                            footnote_blocks,
-                            on_link,
-                        ),
-                    )
-                })
-                .collect();
+            let mut children = inline_rows(
+                title,
+                14.0,
+                Some(FontWeight::SEMI_BOLD),
+                interactive,
+                config,
+                footnote_blocks,
+                on_link,
+            );
             children.extend(body.iter().enumerate().map(|(i, b)| {
                 KeyedView::new(
                     format!("body-{i}"),
-                    block_view(b, config, footnote_blocks, on_link),
+                    block_view(b, config, footnote_blocks, interactive, on_link),
                 )
             }));
             StackPanel::new()
@@ -302,7 +337,7 @@ fn block_view(
             children.extend(body.iter().enumerate().map(|(i, b)| {
                 KeyedView::new(
                     i.to_string(),
-                    block_view(b, config, footnote_blocks, on_link),
+                    block_view(b, config, footnote_blocks, interactive, on_link),
                 )
             }));
             StackPanel::new()
@@ -314,10 +349,15 @@ fn block_view(
 }
 
 /// Render a list item (task checkbox marker + body blocks).
+///
+/// A two-column Grid (marker auto-sized, body star-sized) bounds the
+/// body's width: in a horizontal StackPanel the body is measured with
+/// unbounded width and its text never wraps.
 fn list_item_view(
     item: &vault_md::ListItem,
     config: &WindowsMarkdownRenderer,
     footnote_blocks: &HashMap<String, usize>,
+    interactive: bool,
     on_link: &dyn Fn(LinkNav) -> Callback<()>,
 ) -> View {
     let prefix = match item.task {
@@ -325,17 +365,32 @@ fn list_item_view(
         Some(false) => "[ ] ",
         None => "- ",
     };
-    let prefix_view: View = View::from(TextBlock::new().text(prefix));
-    let mut children: Vec<KeyedView> = vec![KeyedView::new("prefix", prefix_view)];
-    children.extend(item.body.iter().enumerate().map(|(i, b)| {
-        KeyedView::new(
-            i.to_string(),
-            block_view(b, config, footnote_blocks, on_link),
-        )
-    }));
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .keyed_children(children)
+    let body: Vec<KeyedView> = item
+        .body
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            KeyedView::new(
+                i.to_string(),
+                block_view(b, config, footnote_blocks, interactive, on_link),
+            )
+        })
+        .collect();
+    Grid::new()
+        .columns([GridLength::Auto, GridLength::STAR])
+        .keyed_children([
+            KeyedView::new(
+                "prefix",
+                View::from(TextBlock::new().text(prefix).grid_column(0)),
+            ),
+            KeyedView::new(
+                "body",
+                StackPanel::new()
+                    .grid_column(1)
+                    .orientation(Orientation::Vertical)
+                    .keyed_children(body),
+            ),
+        ])
 }
 
 /// Render a table row (each cell inline-projected).
@@ -364,19 +419,17 @@ fn inline_cells_view(
     TextBlock::new().text(text).into()
 }
 
-/// Render a single inline into WinUI elements (body text size).
-fn inline_view(
-    inline: &Inline,
-    config: &WindowsMarkdownRenderer,
-    footnote_blocks: &HashMap<String, usize>,
-    on_link: &dyn Fn(LinkNav) -> Callback<()>,
-) -> View {
-    inline_view_with_style(inline, config, 14.0, None, footnote_blocks, on_link)
-}
-
 /// A text block with the size and any explicit weight applied.
+///
+/// Wrapping matters everywhere prose can appear: the renderer only
+/// produces bounded-width text inside vertical stacks and Grid cells, and
+/// `TextWrapping::Wrap` is what turns that width into line breaks
+/// (reading mode's missing wraps came from the default `NoWrap`).
 fn styled_text(text: String, size: f64, font_weight: Option<FontWeight>) -> TextBlock {
-    let mut block = TextBlock::new().text(text).font_size(size);
+    let mut block = TextBlock::new()
+        .text(text)
+        .font_size(size)
+        .text_wrapping(TextWrapping::Wrap);
     if let Some(weight) = font_weight {
         block = block.font_weight(weight);
     }
@@ -416,10 +469,14 @@ fn local_image_view(path: &str, fallback: impl FnOnce(&str) -> View) -> View {
 }
 
 /// Render a block for the Live pane. Prose (paragraphs, headings) renders
-/// via RichTextBlock so runs flow inline on one line with text wrapping.
-/// Complex blocks (callouts, lists, tables, quotes, code, ...) fall back to
-/// the existing block_view. Images embedded within a paragraph also fall
-/// back since RichTextBlock has no inline-UI slot.
+/// via RichTextBlock so runs flow inline with text wrapping; complex
+/// blocks (callouts, lists, tables, quotes, code, ...) fall back to the
+/// existing block_view. Paragraphs carrying media (images, embeds) also
+/// fall back since RichTextBlock has no inline-UI slot.
+///
+/// Everything here renders non-interactive: the Live pane is an edit
+/// surface, so links, tags, and footnote refs are plain text and every
+/// click reaches the block's edit button (Reading mode navigates).
 pub fn live_block_view(
     block: &Block,
     config: &WindowsMarkdownRenderer,
@@ -428,8 +485,8 @@ pub fn live_block_view(
 ) -> View {
     match block {
         Block::Paragraph { content, .. } => {
-            if has_non_prose_inline(content) {
-                return block_view(block, config, footnote_blocks, on_link);
+            if has_media_inline(content) {
+                return block_view(block, config, footnote_blocks, false, on_link);
             }
             let runs: Vec<RichTextInline> = content.iter().map(inline_to_rich_run).collect();
             View::from(
@@ -445,8 +502,8 @@ pub fn live_block_view(
                 3 => 20.0,
                 _ => 16.0,
             };
-            if has_non_prose_inline(content) {
-                return block_view(block, config, footnote_blocks, on_link);
+            if has_media_inline(content) {
+                return block_view(block, config, footnote_blocks, false, on_link);
             }
             let runs: Vec<RichTextInline> = content.iter().map(inline_to_rich_run).collect();
             View::from(
@@ -456,25 +513,18 @@ pub fn live_block_view(
                     .text_wrapping(Some(TextWrapping::Wrap)),
             )
         }
-        _ => block_view(block, config, footnote_blocks, on_link),
+        _ => block_view(block, config, footnote_blocks, false, on_link),
     }
 }
 
-/// True if any inline in `content` cannot be represented as a RichTextRun
-/// (image, embed, link, wiki link, tag, footnote ref). Those fall back to
-/// block_view so they stay clickable via HyperlinkButton.
-fn has_non_prose_inline(content: &[Inline]) -> bool {
-    content.iter().any(|i| {
-        matches!(
-            i,
-            Inline::Image { .. }
-                | Inline::Embed(_)
-                | Inline::Link { .. }
-                | Inline::WikiLink(_)
-                | Inline::Tag(_)
-                | Inline::FootnoteRef(_)
-        )
-    })
+/// True if any inline in `content` needs a real UI element (an image or
+/// an embed): RichTextBlock has no inline-UI slot, so such paragraphs
+/// fall back to [`block_view`]. Links, tags, and footnote refs render as
+/// plain runs in live prose — the Live pane is an edit surface.
+fn has_media_inline(content: &[Inline]) -> bool {
+    content
+        .iter()
+        .any(|i| matches!(i, Inline::Image { .. } | Inline::Embed(_)))
 }
 
 /// Convert a prose inline to a RichTextInline run. Links are rendered as
@@ -534,11 +584,16 @@ fn inline_to_rich_run(inline: &Inline) -> RichTextInline {
 /// Render a single inline with a given font size and an explicit font
 /// weight (headings scale the size; callout titles set a weight).
 /// `Strong` always forces bold regardless of the explicit weight.
+///
+/// `interactive == false` renders the clickable inlines (links, wiki
+/// links, tags, footnote refs) as plain text: the Live pane's edit
+/// buttons must own every click.
 fn inline_view_with_style(
     inline: &Inline,
     config: &WindowsMarkdownRenderer,
     size: f64,
     font_weight: Option<FontWeight>,
+    interactive: bool,
     footnote_blocks: &HashMap<String, usize>,
     on_link: &dyn Fn(LinkNav) -> Callback<()>,
 ) -> View {
@@ -550,6 +605,7 @@ fn inline_view_with_style(
                 TextBlock::new()
                     .text(text)
                     .font_size(size)
+                    .text_wrapping(TextWrapping::Wrap)
                     .font_weight(FontWeight::BOLD),
             )
         }
@@ -560,6 +616,9 @@ fn inline_view_with_style(
         Inline::Math(t) => View::from(styled_text(t.clone(), size, font_weight)),
         Inline::Link { url, content, .. } => {
             let label = plain_inlines(content);
+            if !interactive {
+                return View::from(styled_text(label, size, font_weight));
+            }
             if url.starts_with("http://")
                 || url.starts_with("https://")
                 || url.starts_with("mailto:")
@@ -593,6 +652,9 @@ fn inline_view_with_style(
                 Some(alias) => plain_inlines(alias),
                 None => wl.target.note.clone(),
             };
+            if !interactive {
+                return View::from(styled_text(label, size, font_weight));
+            }
             // Invoking a wiki link asks the kernel to open (or focus) the
             // target note's tab — the same command the sidebar tree sends.
             let click = on_link(LinkNav::Note(wl.target.note.clone()));
@@ -604,6 +666,9 @@ fn inline_view_with_style(
                 .content(styled_text(label, size, font_weight))
         }
         Inline::Tag(t) => {
+            if !interactive {
+                return View::from(styled_text(format!("#{t}"), size, font_weight));
+            }
             // A reading-view tag routes to the tags panel with the tag
             // selected (the Linux app's `tag:` link scheme): a
             // Hyperlink-equivalent callback, never a raw open.
@@ -616,6 +681,9 @@ fn inline_view_with_style(
                 .content(styled_text(format!("#{t}"), size, font_weight))
         }
         Inline::FootnoteRef(r) => {
+            if !interactive {
+                return View::from(styled_text(format!("^{r}"), size, font_weight));
+            }
             // A footnote reference jumps to its definition: the shell
             // resolved the block index at render time. A ref without a
             // definition renders as plain text instead of a dead link.

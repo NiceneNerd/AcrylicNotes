@@ -19,8 +19,8 @@ use std::rc::Rc;
 
 use windows_reactor::test::{NodeId, PropertyId, PropertyValue, Pump, RecordingRuntime, SlotId};
 use windows_reactor::{
-    ChildrenControl, Component, ComponentContext, FontWeight, KeyedView, LocalSender, Orientation,
-    StackPanel, Stretch, TextBlock, VerticalAlignment, View, ViewContext,
+    Brush, ButtonStyle, ChildrenControl, Color, Component, ComponentContext, FontWeight, KeyedView,
+    LocalSender, Orientation, StackPanel, Stretch, TextBlock, VerticalAlignment, View, ViewContext,
 };
 
 /// The sidebar file-tree view (kernel state, see `file_tree.rs`).
@@ -355,6 +355,30 @@ fn find_owner_of_label(rt: &RecordingRuntime, from: NodeId, label: &str) -> Opti
             if let Some(found) = find_owner_of_label(rt, child, label) {
                 return Some(found);
             }
+        }
+    }
+    None
+}
+
+/// Find the text-link Button labeled exactly `label`.
+///
+/// Text-link buttons are the only Buttons carrying
+/// `ButtonStyle::TextLink`, which pins the result to a reading-view
+/// inline. The plain label walk would also match a file-tree row now
+/// that sidebar labels are bare names (`b.md` is both a tree row and a
+/// wiki-link label).
+fn find_text_link_label(rt: &RecordingRuntime, from: NodeId, label: &str) -> Option<NodeId> {
+    let node = rt.node(from)?;
+    if matches!(
+        node.property(PropertyId::ButtonStyle),
+        Some(PropertyValue::ButtonStyle(ButtonStyle::TextLink))
+    ) && find_node_with_property_text(rt, from, PropertyId::TextBlockText, label).is_some()
+    {
+        return Some(from);
+    }
+    for child in child_ids(rt, from) {
+        if let Some(found) = find_text_link_label(rt, child, label) {
+            return Some(found);
         }
     }
     None
@@ -934,6 +958,36 @@ fn find_tree_view(rt: &RecordingRuntime, from: NodeId) -> Option<NodeId> {
     None
 }
 
+/// Invoke the file-tree row labeled `label` and return the active note.
+fn invoke_tree_row(
+    pump: &mut Pump<RecordingRuntime>,
+    app: &Rc<RefCell<WindowsApp>>,
+    label: &str,
+) -> Option<String> {
+    let window = pump.window().expect("window node");
+    let tree_view = {
+        let rt = pump.runtime();
+        find_tree_view(rt, window).expect("tree view recorded")
+    };
+    let revision = pump
+        .event_revision(tree_view, EventId::TreeViewItemInvoked)
+        .expect("item-invoked event active");
+    pump.queue_event(QueuedEvent::new(
+        tree_view,
+        EventId::TreeViewItemInvoked,
+        revision,
+        EventPayload::Str(String::from(label)),
+    ));
+    pump.dispatch_events().expect("dispatch events");
+    pump.dispatch_components(10).expect("dispatch components");
+    app.borrow()
+        .shared
+        .state
+        .tabs
+        .active_path()
+        .map(str::to_string)
+}
+
 #[test]
 fn headless_shell_tree_renders_vault_notes_and_folders() {
     let app = shell_app_with(&[("notes/b.md", "b\n"), ("a.md", "a\n")]);
@@ -983,9 +1037,9 @@ fn headless_shell_invoke_note_row_opens_it() {
 #[test]
 fn headless_shell_tree_duplicate_basenames_open_the_exact_note() {
     // Two notes share the basename "b.md". The native TreeView echoes the
-    // row's label, so the shell labels each row with its full path;
-    // invoking one must open that exact note, not a proximity-ranked
-    // basename match.
+    // row's label, so the shell keeps both rows labeled with the bare
+    // name plus an invisible disambiguator; invoking each must open that
+    // exact note, not a proximity-ranked basename match.
     let app = shell_app_with(&[
         ("notes/b.md", "b in notes\n"),
         ("archive/b.md", "b in archive\n"),
@@ -994,41 +1048,57 @@ fn headless_shell_tree_duplicate_basenames_open_the_exact_note() {
     // exactly the trap exact-path routing removes.
     shell_open_tab(&app, "notes/b.md", "b in notes\n", "b in notes\n");
 
-    let mut pump = mounted_shell(&app);
+    let pump = mounted_shell(&app);
     let window = pump.window().expect("window node");
     let tree_view = {
         let rt = pump.runtime();
         find_tree_view(rt, window).expect("tree view recorded")
     };
-    // Both rows are labeled with their full paths (the shared basename is
-    // ambiguous, so neither row keeps the bare name).
+    // Both rows show the bare name; a duplicate carries an invisible
+    // zero-width space so the TreeView can route each row exactly.
     {
         let rt = pump.runtime();
         let debug = format!("{:?}", rt.tree_nodes(tree_view).expect("tree nodes"));
         assert!(
-            debug.contains("text: \"notes/b.md\""),
-            "the notes row is labeled with its path: {debug}"
+            debug.contains("text: \"b.md\""),
+            "the first row keeps the bare name: {debug}"
         );
         assert!(
-            debug.contains("text: \"archive/b.md\""),
-            "the archive row is labeled with its path: {debug}"
+            debug.contains("\\u{200b}") || debug.contains('\u{200b}'),
+            "the duplicate row is distinguished invisibly: {debug}"
+        );
+        assert!(
+            !debug.contains("text: \"notes/b.md\"") && !debug.contains("text: \"archive/b.md\""),
+            "no row label shows a partial path: {debug}"
         );
     }
-    let revision = pump
-        .event_revision(tree_view, EventId::TreeViewItemInvoked)
-        .expect("item-invoked event active");
-    pump.queue_event(QueuedEvent::new(
-        tree_view,
-        EventId::TreeViewItemInvoked,
-        revision,
-        EventPayload::Str(String::from("archive/b.md")),
-    ));
-    pump.dispatch_events().expect("dispatch events");
-    pump.dispatch_components(10).expect("dispatch components");
+    // Each label opens its own note — never a basename guess. A fresh
+    // vault per invoke keeps the checks independent (and models a cold
+    // click on either row; the recording runtime accepts one tree
+    // invocation per mount).
+    let opened_for = |label: &str| -> Option<String> {
+        let app = shell_app_with(&[
+            ("notes/b.md", "b in notes\n"),
+            ("archive/b.md", "b in archive\n"),
+        ]);
+        let mut pump = mounted_shell(&app);
+        invoke_tree_row(&mut pump, &app, label)
+    };
+    let bare_opened = opened_for("b.md");
+    let marked_opened = opened_for("b.md\u{200b}");
+    assert_ne!(
+        bare_opened, marked_opened,
+        "the two labels must route to different notes"
+    );
+    let mut opened = [bare_opened, marked_opened];
+    opened.sort();
     assert_eq!(
-        app.borrow().shared.state.tabs.active_path(),
-        Some("archive/b.md"),
-        "the exact clicked note opens despite the shared basename"
+        opened,
+        [
+            Some(String::from("archive/b.md")),
+            Some(String::from("notes/b.md")),
+        ],
+        "each row opens its own note despite the shared basename"
     );
 }
 
@@ -1528,11 +1598,13 @@ fn headless_shell_reading_link_click_opens_the_url_through_the_kernel() {
     );
 
     let mut pump = mounted_shell(&app);
-    // Live (the boot default) renders the reading view with the link.
+    // Links navigate in Reading mode; the Live pane is the edit surface
+    // (its inlines render inert so every click opens the block editor).
+    switch_pane(&mut pump, "reading");
     let window = pump.window().expect("window node");
     let target = {
         let rt = pump.runtime();
-        find_owner_of_label(rt, window, "the docs").expect("link button recorded")
+        find_text_link_label(rt, window, "the docs").expect("link button recorded")
     };
     click(&mut pump, target, EventId::ButtonClick);
 
@@ -1554,10 +1626,12 @@ fn headless_shell_reading_wiki_link_click_opens_the_note() {
     shell_open_tab(&app, "a.md", "see [[b.md]]\n", "see [[b.md]]\n");
 
     let mut pump = mounted_shell(&app);
+    // Wiki links navigate in Reading mode (Live is the edit surface).
+    switch_pane(&mut pump, "reading");
     let window = pump.window().expect("window node");
     let target = {
         let rt = pump.runtime();
-        find_owner_of_label(rt, window, "b.md").expect("wiki link button recorded")
+        find_text_link_label(rt, window, "b.md").expect("wiki link button recorded")
     };
     click(&mut pump, target, EventId::ButtonClick);
 
@@ -2129,6 +2203,41 @@ fn headless_shell_links_panel_shows_the_empty_state_without_a_note() {
     );
 }
 
+#[test]
+fn headless_shell_live_regions_carry_a_full_row_hit_surface() {
+    // Clicking empty space in a Live row must edit the block too. A Subtle
+    // button only hit-tests where its content paints, and a RichTextBlock
+    // swallows presses on its own blank areas, so every region button
+    // layers a transparent border over the rendered content: the whole
+    // content area hit-tests (real-Windows clicks proved both failures).
+    let app = shell_app_with(&[("a.md", "alpha\n\nbeta\n")]);
+    shell_open_tab(&app, "a.md", "alpha\n\nbeta\n", "alpha\n\nbeta\n");
+    let pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let rt = pump.runtime();
+    let button =
+        find_node_with_property_text(rt, window, PropertyId::AutomationName, "edit region 0")
+            .expect("block click target recorded");
+    fn find_transparent_border(rt: &RecordingRuntime, from: NodeId) -> Option<NodeId> {
+        let node = rt.node(from)?;
+        if node.property(PropertyId::BorderBackground)
+            == Some(&PropertyValue::Brush(Brush::Solid(Color::transparent())))
+        {
+            return Some(from);
+        }
+        for &child in node.children() {
+            if let Some(found) = find_transparent_border(rt, child) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    assert!(
+        find_transparent_border(rt, button).is_some(),
+        "the region carries a transparent full-row hit surface"
+    );
+}
+
 // --- reading-view interactions (relative links, tags, footnotes) ------------
 
 #[test]
@@ -2137,11 +2246,12 @@ fn headless_shell_reading_relative_link_click_opens_the_note() {
     shell_open_tab(&app, "a.md", "see [b](b.md)\n", "see [b](b.md)\n");
 
     let mut pump = mounted_shell(&app);
-    // Live (the boot default) renders the reading view with the link.
+    // Links navigate in Reading mode (Live is the edit surface).
+    switch_pane(&mut pump, "reading");
     let window = pump.window().expect("window node");
     let target = {
         let rt = pump.runtime();
-        find_owner_of_label(rt, window, "b").expect("relative link button recorded")
+        find_text_link_label(rt, window, "b").expect("relative link button recorded")
     };
     click(&mut pump, target, EventId::ButtonClick);
 
@@ -2174,10 +2284,12 @@ fn headless_shell_reading_relative_link_to_attachment_opens_the_file() {
     );
 
     let mut pump = mounted_shell(&app);
+    // Links navigate in Reading mode (Live is the edit surface).
+    switch_pane(&mut pump, "reading");
     let window = pump.window().expect("window node");
     let target = {
         let rt = pump.runtime();
-        find_owner_of_label(rt, window, "img").expect("attachment link button recorded")
+        find_text_link_label(rt, window, "img").expect("attachment link button recorded")
     };
     click(&mut pump, target, EventId::ButtonClick);
 
@@ -2201,10 +2313,12 @@ fn headless_shell_reading_tag_click_switches_to_the_tags_panel() {
     shell_open_tab(&app, "a.md", "see #work\n", "see #work\n");
 
     let mut pump = mounted_shell(&app);
+    // Tags navigate in Reading mode (Live is the edit surface).
+    switch_pane(&mut pump, "reading");
     let window = pump.window().expect("window node");
     let target = {
         let rt = pump.runtime();
-        find_owner_of_label(rt, window, "#work").expect("tag link button recorded")
+        find_text_link_label(rt, window, "#work").expect("tag link button recorded")
     };
     click(&mut pump, target, EventId::ButtonClick);
 
@@ -2239,10 +2353,12 @@ fn headless_shell_reading_footnote_ref_click_anchors_the_definition() {
     );
 
     let mut pump = mounted_shell(&app);
+    // Footnote refs navigate in Reading mode (Live is the edit surface).
+    switch_pane(&mut pump, "reading");
     let window = pump.window().expect("window node");
     let target = {
         let rt = pump.runtime();
-        find_owner_of_label(rt, window, "^1").expect("footnote ref button recorded")
+        find_text_link_label(rt, window, "^1").expect("footnote ref button recorded")
     };
     click(&mut pump, target, EventId::ButtonClick);
 

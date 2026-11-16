@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use windows_reactor::{
-    AutomationExt, Border, Brush, Button, ButtonStyle, ChildrenControl, Component,
+    AutomationExt, Border, Brush, Button, ButtonStyle, ChildrenControl, Color, Component,
     ComponentContext, ContentControl, CornerRadius, FontWeight, Grid, GridChildExt, GridLength,
     HorizontalAlignment, HyperlinkButton, InfoBar, InfoBarSeverity, KeyedView, LayoutControl,
     Orientation, RichEditBox, ScrollBarVisibility, ScrollViewer, SlotView, SlotsControl, SplitView,
@@ -1126,20 +1126,44 @@ impl Component for Shell {
                                         key,
                                         Button::new()
                                             .style(ButtonStyle::Subtle)
-                                            .horizontal_content_alignment(HorizontalAlignment::Left)
-                                            .vertical_content_alignment(VerticalAlignment::Top)
+                                            .horizontal_content_alignment(
+                                                HorizontalAlignment::Stretch,
+                                            )
+                                            .vertical_content_alignment(VerticalAlignment::Stretch)
                                             .automation_name(format!("edit region {region}"))
                                             .on_click(context.callback(move |()| {
                                                 WindowsMessage::Native(NativeEvent::LiveFocus {
                                                     region,
                                                 })
                                             }))
-                                            .content(live_block_view(
-                                                &doc.blocks[block_idx],
-                                                &renderer,
-                                                &footnote_blocks,
-                                                &on_link,
-                                            )),
+                                            .content(
+                                                // A transparent surface layered over the
+                                                // rendered block makes the whole row
+                                                // clickable. A Subtle button only
+                                                // hit-tests where its content paints, and a
+                                                // RichTextBlock swallows pointer presses on
+                                                // its own blank areas — so without the
+                                                // overlay, clicking empty space in a row did
+                                                // nothing (the "random" click-to-edit).
+                                                // Live content is inert, so the overlay
+                                                // blocks nothing interactive.
+                                                Grid::new().keyed_children([
+                                                    KeyedView::new(
+                                                        "content",
+                                                        live_block_view(
+                                                            &doc.blocks[block_idx],
+                                                            &renderer,
+                                                            &footnote_blocks,
+                                                            &on_link,
+                                                        ),
+                                                    ),
+                                                    KeyedView::new(
+                                                        "hit",
+                                                        Border::new()
+                                                            .background(Color::transparent()),
+                                                    ),
+                                                ]),
+                                            ),
                                     )
                                 }
                                 None => {
@@ -1150,8 +1174,10 @@ impl Component for Shell {
                                         key,
                                         Button::new()
                                             .style(ButtonStyle::Subtle)
-                                            .horizontal_content_alignment(HorizontalAlignment::Left)
-                                            .vertical_content_alignment(VerticalAlignment::Top)
+                                            .horizontal_content_alignment(
+                                                HorizontalAlignment::Stretch,
+                                            )
+                                            .vertical_content_alignment(VerticalAlignment::Stretch)
                                             .automation_name(format!("edit region {region_idx}"))
                                             .on_click(context.callback(move |()| {
                                                 WindowsMessage::Native(NativeEvent::LiveFocus {
@@ -1159,11 +1185,24 @@ impl Component for Shell {
                                                 })
                                             }))
                                             .content(
-                                                TextBlock::new()
-                                                    .text(text)
-                                                    .font_size(12.0)
-                                                    .opacity(0.6)
-                                                    .text_wrapping(TextWrapping::Wrap),
+                                                // Same transparent overlay as the rendered
+                                                // blocks above: blank space around the raw
+                                                // text must click to edit too.
+                                                Grid::new().keyed_children([
+                                                    KeyedView::new(
+                                                        "content",
+                                                        TextBlock::new()
+                                                            .text(text)
+                                                            .font_size(12.0)
+                                                            .opacity(0.6)
+                                                            .text_wrapping(TextWrapping::Wrap),
+                                                    ),
+                                                    KeyedView::new(
+                                                        "hit",
+                                                        Border::new()
+                                                            .background(Color::transparent()),
+                                                    ),
+                                                ]),
                                             ),
                                     )
                                 }
@@ -1427,16 +1466,14 @@ enum TreeRowTarget {
 /// `TreeState`) into the hierarchy the native TreeView renders, plus the
 /// label→row map `on_item_invoked` routes through.
 ///
-/// A row's label must identify it exactly, but paths make poor labels
-/// (the sidebar showed `Journal/2026/07/06.md` for every journal note
-/// once the old label rule kicked in). A name that appears once in the
-/// vault stays bare; a shared name is shown as its shortest trailing
-/// path suffix that no other row with that name shares — `07/06.md`
-/// when the month is enough, `2026/07/06.md` when the month repeats
-/// across years, and the full path only as the last resort. Suffix
-/// labels of two or more components cannot collide with bare names (a
-/// filename never contains a separator), and different names end in
-/// different components, so the labels are all distinct.
+/// A row's label must identify it exactly, but paths make poor labels:
+/// the sidebar must show bare filenames only (`06.md`, `07`, `Journal`),
+/// never a partial path. The native TreeView reports just the invoked
+/// row's content string, so labels still have to be unique — when a name
+/// is shared (journal basenames repeat across months), every later
+/// duplicate carries one more invisible zero-width space (`\u{200b}`).
+/// The visible text is the bare name either way, and the label→target
+/// map stays exact.
 fn build_tree_nodes(tree: &FileTree) -> (Vec<TreeNode>, Rc<HashMap<String, TreeRowTarget>>) {
     /// Collect every row as (path, name, is-folder), depth-first.
     fn flatten(node: &kernel_tree::TreeNode, rows: &mut Vec<(String, String, bool)>) {
@@ -1461,48 +1498,16 @@ fn build_tree_nodes(tree: &FileTree) -> (Vec<TreeNode>, Rc<HashMap<String, TreeR
     for node in &tree.nodes {
         flatten(node, &mut rows);
     }
-    // A name shared by two or more rows is ambiguous on its own.
-    let mut name_counts: HashMap<&str, usize> = HashMap::new();
-    for (_, name, _) in &rows {
-        *name_counts.entry(name.as_str()).or_default() += 1;
-    }
-    let components: Vec<Vec<&str>> = rows
-        .iter()
-        .map(|(path, _, _)| {
-            path.split(['/', '\\'])
-                .filter(|segment| !segment.is_empty())
-                .collect()
-        })
-        .collect();
-    // path → label: bare name when unique in the vault, otherwise the
-    // shortest trailing component suffix that is unique among the rows
-    // sharing the name.
+    // path → label: the bare name, plus one zero-width space per earlier
+    // row with the same name, so duplicates stay distinct to the TreeView
+    // while looking identical on screen.
+    let mut seen: HashMap<&str, usize> = HashMap::new();
     let labels: HashMap<String, String> = rows
         .iter()
-        .enumerate()
-        .map(|(row, (path, name, _))| {
-            let label = if name_counts[name.as_str()] == 1 {
-                name.clone()
-            } else {
-                let mut label = path.clone();
-                for depth in 2..=components[row].len() {
-                    let candidate = components[row][components[row].len() - depth..].join("/");
-                    let unique = rows
-                        .iter()
-                        .enumerate()
-                        .filter(|&(other, (_, other_name, _))| other != row && other_name == name)
-                        .all(|(other, _)| {
-                            components[other].len() < depth
-                                || components[other][components[other].len() - depth..].join("/")
-                                    != candidate
-                        });
-                    if unique {
-                        label = candidate;
-                        break;
-                    }
-                }
-                label
-            };
+        .map(|(path, name, _)| {
+            let duplicates = seen.entry(name.as_str()).or_default();
+            let label = format!("{name}{}", "\u{200b}".repeat(*duplicates));
+            *duplicates += 1;
             (path.clone(), label)
         })
         .collect();
@@ -1604,10 +1609,11 @@ mod tests {
     }
 
     #[test]
-    fn tree_labels_use_minimal_distinguishing_suffixes() {
+    fn tree_labels_show_bare_names_and_route_duplicates_exactly() {
         // Journal notes repeat their basenames across months and years;
-        // the sidebar must stay compact, so a shared name is labeled with
-        // the shortest trailing path suffix that distinguishes it.
+        // the sidebar must show bare filenames only, so later duplicates
+        // carry invisible zero-width spaces — distinct labels for the
+        // native TreeView's click routing, identical text on screen.
         let paths: Vec<String> = [
             "Journal/2026/07/05.md",
             "Journal/2026/07/06.md",
@@ -1620,7 +1626,16 @@ mod tests {
         .collect();
         let tree = FileTree::from_paths(&paths);
         let (_, targets) = build_tree_nodes(&tree);
-        // A name that appears once stays bare.
+        // No label may show a partial path: the visible text (everything
+        // before the zero-width disambiguators) is a bare name.
+        for label in targets.keys() {
+            let visible = label.trim_end_matches('\u{200b}');
+            assert!(
+                !visible.contains('/') && !visible.contains('\\'),
+                "label {label:?} leaks a partial path"
+            );
+        }
+        // A name that appears once stays exactly bare.
         assert_eq!(
             targets.get("unique.md"),
             Some(&TreeRowTarget::Note(String::from("unique.md")))
@@ -1629,62 +1644,59 @@ mod tests {
             targets.get("05.md"),
             Some(&TreeRowTarget::Note(String::from("Journal/2026/07/05.md")))
         );
-        // "06.md" appears three times: the unique month suffix is enough
-        // for the August note, while the two July notes need their year.
+        // "06.md" appears three times: bare, one zero-width space, two —
+        // each routing to a different note.
+        let mut routed: Vec<&String> = ["06.md", "06.md\u{200b}", "06.md\u{200b}\u{200b}"]
+            .iter()
+            .map(|label| match targets.get(*label) {
+                Some(TreeRowTarget::Note(path)) => path,
+                other => panic!("label {label:?} must route to a note, got {other:?}"),
+            })
+            .collect();
+        routed.sort();
+        routed.dedup();
         assert_eq!(
-            targets.get("08/06.md"),
-            Some(&TreeRowTarget::Note(String::from("Journal/2026/08/06.md")))
+            routed.len(),
+            3,
+            "the three 06.md rows must route to three distinct notes"
         );
-        assert_eq!(
-            targets.get("2025/07/06.md"),
-            Some(&TreeRowTarget::Note(String::from("Journal/2025/07/06.md")))
-        );
-        assert_eq!(
-            targets.get("2026/07/06.md"),
-            Some(&TreeRowTarget::Note(String::from("Journal/2026/07/06.md")))
+        // Folders follow the same rule: the two shared `07` month folders
+        // get distinct labels, unique names stay bare.
+        assert!(
+            matches!(targets.get("07"), Some(TreeRowTarget::Folder(_))),
+            "the first 07 folder is labeled with its bare name"
         );
         assert!(
-            !targets.contains_key("Journal/2026/08/06.md"),
-            "a minimal suffix replaces the full path"
-        );
-        // Folders follow the same rule: the shared month keeps its year,
-        // the unique year stays bare.
-        assert_eq!(
-            targets.get("2025/07"),
-            Some(&TreeRowTarget::Folder(String::from("Journal/2025/07")))
+            matches!(targets.get("07\u{200b}"), Some(TreeRowTarget::Folder(_))),
+            "the second 07 folder is distinguished invisibly"
         );
         assert_eq!(
-            targets.get("2026/07"),
-            Some(&TreeRowTarget::Folder(String::from("Journal/2026/07")))
-        );
-        assert_eq!(
-            targets.get("2026"),
-            Some(&TreeRowTarget::Folder(String::from("Journal/2026")))
-        );
-        assert_eq!(
-            targets.get("Journal"),
-            Some(&TreeRowTarget::Folder(String::from("Journal")))
+            targets.get("08"),
+            Some(&TreeRowTarget::Folder(String::from("Journal/2026/08")))
         );
     }
 
     #[test]
     fn tree_labels_keep_a_root_level_duplicate_distinct() {
-        // The root note has no folder to shorten to; the nested one takes
-        // its parent as the distinguishing suffix.
+        // A root note and a nested note share the bare name; both display
+        // it, and the invisible disambiguator keeps their routing apart.
         let paths: Vec<String> = ["06.md", "Journal/2026/07/06.md"]
             .iter()
             .map(|path| (*path).to_string())
             .collect();
         let tree = FileTree::from_paths(&paths);
         let (_, targets) = build_tree_nodes(&tree);
-        assert_eq!(
-            targets.get("06.md"),
-            Some(&TreeRowTarget::Note(String::from("06.md")))
-        );
-        assert_eq!(
-            targets.get("07/06.md"),
-            Some(&TreeRowTarget::Note(String::from("Journal/2026/07/06.md")))
-        );
+        let bare = targets.get("06.md").expect("the bare label routes");
+        let marked = targets
+            .get("06.md\u{200b}")
+            .expect("the disambiguated label routes");
+        assert_ne!(bare, marked, "the two rows must stay distinct");
+        for target in [bare, marked] {
+            assert!(
+                matches!(target, TreeRowTarget::Note(path) if path.ends_with("06.md")),
+                "both rows are notes named 06.md, got {target:?}"
+            );
+        }
     }
 
     #[test]
