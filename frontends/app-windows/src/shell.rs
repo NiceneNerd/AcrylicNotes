@@ -203,6 +203,15 @@ pub struct Shell {
     /// Last programmatic text rendered into the Live-pane RichEditBox
     /// (echo suppression, same pattern as `rendered_editor`).
     live_editor_text: RefCell<String>,
+    /// The raw document text the Live-pane RichEditBox last reported (the
+    /// WinRT text model: `\r` paragraph marks). Re-declared on every
+    /// render while the region stays focused: the toolkit's setter skips
+    /// a document that already matches, which keeps the caret where the
+    /// user left it. Declaring the `\n`-shaped source instead never
+    /// matched, so each keystroke's re-render re-set the document and
+    /// dropped the caret to the start (typed characters arrived reversed).
+    /// `None` on a fresh focus: the first render seeds the region source.
+    live_editor_raw: RefCell<Option<String>>,
 }
 
 impl Component for Shell {
@@ -224,6 +233,7 @@ impl Component for Shell {
             live_path: RefCell::new(None),
             live_slices: RefCell::new(Vec::new()),
             live_editor_text: RefCell::new(String::new()),
+            live_editor_raw: RefCell::new(None),
         }
     }
 
@@ -279,6 +289,7 @@ impl Component for Shell {
         // Live pane: clicking a rendered block opens it for editing.
         if let WindowsMessage::Native(NativeEvent::LiveFocus { region }) = message {
             self.live_focused.set(Some(region));
+            *self.live_editor_raw.borrow_mut() = None;
             *self.live_path.borrow_mut() = self
                 .handle
                 .0
@@ -297,8 +308,18 @@ impl Component for Shell {
         // so focusing another block needs no commit step). An incoming text
         // equal to the last rendered editor text is the echo of our own
         // programmatic sync (the mount's SetText) and is suppressed.
+        //
+        // The payload is normalized first: WinRT text controls report line
+        // breaks as `\r`/`\r\n` (the `ITextDocument` text model), so the echo
+        // of a `\n`-shaped SetText arrives `\r`-shaped and would otherwise
+        // look like a real edit — every echo then spliced a `\r`-laden copy
+        // back, progressively merging the following paragraphs into the
+        // edited block (real-Windows bug: clicking a block "swallowed" the
+        // rest of the file).
         if let WindowsMessage::Native(NativeEvent::LiveBlockEdited { text }) = &message {
-            if *text == *self.live_editor_text.borrow() {
+            *self.live_editor_raw.borrow_mut() = Some(text.clone());
+            let text = normalize_rich_edit_text(text);
+            if text == *self.live_editor_text.borrow() {
                 return;
             }
             let region = match self.live_focused.get() {
@@ -309,7 +330,7 @@ impl Component for Shell {
                 Some(&slice) => slice,
                 None => return,
             };
-            let spliced = {
+            let (current, spliced) = {
                 let app = self.handle.0.borrow();
                 let Some(tab) = app.shared.state.tabs.active() else {
                     return;
@@ -317,8 +338,24 @@ impl Component for Shell {
                 let Some(buffer) = app.buffers.get(&tab) else {
                     return;
                 };
-                vault_app::live::replace_lines(&buffer.text, slice.start_line, slice.end_line, text)
+                let spliced = vault_app::live::replace_lines(
+                    &buffer.text,
+                    slice.start_line,
+                    slice.end_line,
+                    &text,
+                );
+                (buffer.text.clone(), spliced)
             };
+            if spliced == current {
+                // The splice is a no-op: the text differs from the last
+                // rendered source only in a shape the region contract
+                // erases (e.g. the native control dropping the trailing
+                // paragraph break). It cannot be a real edit, so it is
+                // the programmatic-sync echo — do not dirty the buffer,
+                // but accept the shape so later echoes stay suppressed.
+                *self.live_editor_text.borrow_mut() = text;
+                return;
+            }
             *self.live_editor_text.borrow_mut() = text.clone();
             self.handle.0.borrow_mut().set_active_buffer_text(spliced);
             return;
@@ -357,10 +394,21 @@ impl Component for Shell {
         if let WindowsMessage::Native(NativeEvent::EditorEdited { text }) = &message {
             // Echo suppression: equal to the last rendered text means
             // the echo of our own programmatic sync (initial text set,
-            // tab switch, reload), not a user edit.
-            if *text == *self.rendered_editor.borrow() {
+            // tab switch, reload), not a user edit. Normalized first,
+            // like the live editor: the TextBox reports `\r\n` breaks
+            // for the `\n`-shaped buffer text we set, and an
+            // unsuppressed echo would flip the whole note to CRLF.
+            let normalized = normalize_edit_text(text);
+            if normalized == *self.rendered_editor.borrow() {
                 return;
             }
+            return self
+                .handle
+                .0
+                .borrow_mut()
+                .handle_native(WindowsMessage::Native(NativeEvent::EditorEdited {
+                    text: normalized,
+                }));
         }
         if let WindowsMessage::Command(UiCommand::SetSearchQuery { query }) = &message {
             // The search box is controlled by the kernel session; a real
@@ -875,10 +923,12 @@ impl Component for Shell {
         // renders as rich text again.
         if state.pane != PaneMode::Live {
             self.live_focused.set(None);
+            *self.live_editor_raw.borrow_mut() = None;
         } else {
             let active_path = state.tabs.active_path().map(String::from);
             if self.live_path.borrow().as_deref() != active_path.as_deref() {
                 self.live_focused.set(None);
+                *self.live_editor_raw.borrow_mut() = None;
             }
         }
         // windows-reactor applies `TextBoxText` before `TextBoxAcceptsReturn`
@@ -1037,14 +1087,25 @@ impl Component for Shell {
                             // Raw-source editor for the focused block. Its
                             // text changes splice into the region (see the
                             // LiveBlockEdited handler), so the buffer stays
-                            // live and no commit step is needed.
+                            // live and no commit step is needed. The declared
+                            // text re-states the document's own last payload
+                            // (WinRT `\r` marks): the setter skips an
+                            // already-current document, so a re-render while
+                            // the user types does not reset the caret. A
+                            // fresh focus has no payload yet and seeds the
+                            // region source (`\n` → the model's `\r`).
                             let source = slice.source(&buffer.text);
                             *self.live_editor_text.borrow_mut() = source.clone();
+                            let document_text = self
+                                .live_editor_raw
+                                .borrow()
+                                .clone()
+                                .unwrap_or_else(|| rich_edit_document_text(&source));
 
                             KeyedView::new(
                                 key,
                                 RichEditBox::new()
-                                    .text(source)
+                                    .text(document_text)
                                     .on_text_changed(context.callback(|text: String| {
                                         WindowsMessage::Native(NativeEvent::LiveBlockEdited {
                                             text,
@@ -1306,6 +1367,50 @@ impl Component for Shell {
     }
 }
 
+/// Native editors report line breaks in the WinRT text model: `\r\n`
+/// between lines (TextBox.Text) and lone `\r` between paragraphs (the
+/// RichEditBox `ITextDocument`), while the note buffer's canonical form
+/// is `\n`. Normalize every editor payload before echo-suppression and
+/// before it reaches the buffer — the programmatic-sync echo of a
+/// `\n`-shaped SetText must be recognized as the echo, and user edits
+/// must keep the note's LF line endings.
+fn normalize_edit_text(text: &str) -> String {
+    if !text.contains('\r') {
+        return String::from(text);
+    }
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// The RichEditBox payload, on top of [`normalize_edit_text`]: drop the
+/// document's final paragraph mark. A text document always terminates
+/// its last paragraph, so `GetText` of a `"para\n"` document reports
+/// `"para\r\r"` — one break more than was set. Keeping that extra break
+/// made every echo look like a real edit; each splice then appended a
+/// blank line, re-rendered with a longer source, and fed back a longer
+/// echo (real-Windows bug: opening a block editor grew the block by a
+/// line per cycle until paragraphs merged).
+///
+/// Only a raw payload ended by the mark loses its break: the mark is a
+/// `\r` in the text model, so a payload that arrived without one was
+/// not truncated by the document.
+fn normalize_rich_edit_text(text: &str) -> String {
+    let ends_with_mark = text.ends_with('\r');
+    let mut text = normalize_edit_text(text);
+    if ends_with_mark && text.ends_with('\n') {
+        text.pop();
+    }
+    text
+}
+
+/// A region source in the RichEditBox document's own shape: paragraph
+/// breaks are `\r`. The setter appends the final paragraph mark itself
+/// (`GetText(SetText(V)) == V + "\r"`), so a seeded source must not
+/// carry one — otherwise the mount's echo normalizes one line too long
+/// and the splice gains a blank line.
+fn rich_edit_document_text(source: &str) -> String {
+    source.replace('\n', "\r")
+}
+
 /// What invoking a file-tree row means. The native TreeView reports the
 /// invoked row's label (its content string), not its key, so the shell
 /// maps each label back to the row it rendered. Labels are made unique
@@ -1322,11 +1427,16 @@ enum TreeRowTarget {
 /// `TreeState`) into the hierarchy the native TreeView renders, plus the
 /// label→row map `on_item_invoked` routes through.
 ///
-/// A row's label must identify it exactly: a name that appears once in
-/// the vault stays bare, while a shared name is shown as its full
-/// vault-relative path. Paths cannot collide with single-segment names
-/// (a filename never contains a separator) and are unique among
-/// themselves, so the resulting labels are all distinct.
+/// A row's label must identify it exactly, but paths make poor labels
+/// (the sidebar showed `Journal/2026/07/06.md` for every journal note
+/// once the old label rule kicked in). A name that appears once in the
+/// vault stays bare; a shared name is shown as its shortest trailing
+/// path suffix that no other row with that name shares — `07/06.md`
+/// when the month is enough, `2026/07/06.md` when the month repeats
+/// across years, and the full path only as the last resort. Suffix
+/// labels of two or more components cannot collide with bare names (a
+/// filename never contains a separator), and different names end in
+/// different components, so the labels are all distinct.
 fn build_tree_nodes(tree: &FileTree) -> (Vec<TreeNode>, Rc<HashMap<String, TreeRowTarget>>) {
     /// Collect every row as (path, name, is-folder), depth-first.
     fn flatten(node: &kernel_tree::TreeNode, rows: &mut Vec<(String, String, bool)>) {
@@ -1356,14 +1466,42 @@ fn build_tree_nodes(tree: &FileTree) -> (Vec<TreeNode>, Rc<HashMap<String, TreeR
     for (_, name, _) in &rows {
         *name_counts.entry(name.as_str()).or_default() += 1;
     }
-    // path → label: the bare name when unique, the full path when shared.
+    let components: Vec<Vec<&str>> = rows
+        .iter()
+        .map(|(path, _, _)| {
+            path.split(['/', '\\'])
+                .filter(|segment| !segment.is_empty())
+                .collect()
+        })
+        .collect();
+    // path → label: bare name when unique in the vault, otherwise the
+    // shortest trailing component suffix that is unique among the rows
+    // sharing the name.
     let labels: HashMap<String, String> = rows
         .iter()
-        .map(|(path, name, _)| {
+        .enumerate()
+        .map(|(row, (path, name, _))| {
             let label = if name_counts[name.as_str()] == 1 {
                 name.clone()
             } else {
-                path.clone()
+                let mut label = path.clone();
+                for depth in 2..=components[row].len() {
+                    let candidate = components[row][components[row].len() - depth..].join("/");
+                    let unique = rows
+                        .iter()
+                        .enumerate()
+                        .filter(|&(other, (_, other_name, _))| other != row && other_name == name)
+                        .all(|(other, _)| {
+                            components[other].len() < depth
+                                || components[other][components[other].len() - depth..].join("/")
+                                    != candidate
+                        });
+                    if unique {
+                        label = candidate;
+                        break;
+                    }
+                }
+                label
             };
             (path.clone(), label)
         })
@@ -1408,8 +1546,6 @@ fn build_tree_nodes(tree: &FileTree) -> (Vec<TreeNode>, Rc<HashMap<String, TreeR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-    use tempfile::tempdir;
 
     #[test]
     fn narrow_fold_collapses_split_and_restores_it_when_wide() {
@@ -1445,6 +1581,109 @@ mod tests {
         assert_eq!(
             narrow_fold(PaneMode::Live, NARROW_WINDOW_WIDTH + 1.0, &mut restore),
             None
+        );
+    }
+
+    #[test]
+    fn rich_edit_payloads_normalize_to_lf_and_drop_the_final_mark() {
+        // The WinRT text model: paragraphs separated by \r, and the last
+        // paragraph always terminated — so an echo of a `"alpha\n"`
+        // SetText is `"alpha\r\r"` and must normalize back to exactly
+        // `"alpha\n"` (the shape the shell set), or every echo would
+        // splice as an edit.
+        assert_eq!(normalize_rich_edit_text("alpha\r\r"), "alpha\n");
+        assert_eq!(normalize_rich_edit_text("a\rb\r\r"), "a\nb\n");
+        // A lone final paragraph mark means one line and no break.
+        assert_eq!(normalize_rich_edit_text("alpha\r"), "alpha");
+        assert_eq!(normalize_rich_edit_text(""), "");
+        assert_eq!(normalize_rich_edit_text("plain"), "plain");
+        // Plain TextBox payloads keep their final break (no phantom
+        // paragraph mark exists there).
+        assert_eq!(normalize_edit_text("a\r\nb\r\n"), "a\nb\n");
+        assert_eq!(normalize_edit_text("a\nb\n"), "a\nb\n");
+    }
+
+    #[test]
+    fn tree_labels_use_minimal_distinguishing_suffixes() {
+        // Journal notes repeat their basenames across months and years;
+        // the sidebar must stay compact, so a shared name is labeled with
+        // the shortest trailing path suffix that distinguishes it.
+        let paths: Vec<String> = [
+            "Journal/2026/07/05.md",
+            "Journal/2026/07/06.md",
+            "Journal/2025/07/06.md",
+            "Journal/2026/08/06.md",
+            "unique.md",
+        ]
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect();
+        let tree = FileTree::from_paths(&paths);
+        let (_, targets) = build_tree_nodes(&tree);
+        // A name that appears once stays bare.
+        assert_eq!(
+            targets.get("unique.md"),
+            Some(&TreeRowTarget::Note(String::from("unique.md")))
+        );
+        assert_eq!(
+            targets.get("05.md"),
+            Some(&TreeRowTarget::Note(String::from("Journal/2026/07/05.md")))
+        );
+        // "06.md" appears three times: the unique month suffix is enough
+        // for the August note, while the two July notes need their year.
+        assert_eq!(
+            targets.get("08/06.md"),
+            Some(&TreeRowTarget::Note(String::from("Journal/2026/08/06.md")))
+        );
+        assert_eq!(
+            targets.get("2025/07/06.md"),
+            Some(&TreeRowTarget::Note(String::from("Journal/2025/07/06.md")))
+        );
+        assert_eq!(
+            targets.get("2026/07/06.md"),
+            Some(&TreeRowTarget::Note(String::from("Journal/2026/07/06.md")))
+        );
+        assert!(
+            !targets.contains_key("Journal/2026/08/06.md"),
+            "a minimal suffix replaces the full path"
+        );
+        // Folders follow the same rule: the shared month keeps its year,
+        // the unique year stays bare.
+        assert_eq!(
+            targets.get("2025/07"),
+            Some(&TreeRowTarget::Folder(String::from("Journal/2025/07")))
+        );
+        assert_eq!(
+            targets.get("2026/07"),
+            Some(&TreeRowTarget::Folder(String::from("Journal/2026/07")))
+        );
+        assert_eq!(
+            targets.get("2026"),
+            Some(&TreeRowTarget::Folder(String::from("Journal/2026")))
+        );
+        assert_eq!(
+            targets.get("Journal"),
+            Some(&TreeRowTarget::Folder(String::from("Journal")))
+        );
+    }
+
+    #[test]
+    fn tree_labels_keep_a_root_level_duplicate_distinct() {
+        // The root note has no folder to shorten to; the nested one takes
+        // its parent as the distinguishing suffix.
+        let paths: Vec<String> = ["06.md", "Journal/2026/07/06.md"]
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect();
+        let tree = FileTree::from_paths(&paths);
+        let (_, targets) = build_tree_nodes(&tree);
+        assert_eq!(
+            targets.get("06.md"),
+            Some(&TreeRowTarget::Note(String::from("06.md")))
+        );
+        assert_eq!(
+            targets.get("07/06.md"),
+            Some(&TreeRowTarget::Note(String::from("Journal/2026/07/06.md")))
         );
     }
 

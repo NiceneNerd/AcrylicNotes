@@ -144,15 +144,47 @@ fn block_view(
     on_link: &dyn Fn(LinkNav) -> Callback<()>,
 ) -> View {
     match block {
-        Block::Paragraph { content, .. } => StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(4.0)
-            .keyed_children(content.iter().enumerate().map(|(i, inline)| {
-                KeyedView::new(
-                    i.to_string(),
-                    inline_view(inline, config, footnote_blocks, on_link),
-                )
-            })),
+        Block::Paragraph { content, .. } => {
+            // Group consecutive Text inlines into wrapping TextBlocks, and
+            // give each non-text inline (link button, image) its own row.
+            // A horizontal StackPanel does not give layout space to inline
+            // UI elements (buttons, images), so we render each inline as a
+            // full-width row in a vertical StackPanel instead.
+            let mut rows: Vec<KeyedView> = Vec::new();
+            let mut text_buf = String::new();
+            let mut text_key = 0;
+            for (i, inline) in content.iter().enumerate() {
+                match inline {
+                    Inline::Text(t) => {
+                        if text_buf.is_empty() {
+                            text_key = i;
+                        }
+                        text_buf.push_str(t);
+                    }
+                    _ => {
+                        if !text_buf.is_empty() {
+                            rows.push(KeyedView::new(
+                                format!("text-{text_key}"),
+                                View::from(styled_text(std::mem::take(&mut text_buf), 14.0, None)),
+                            ));
+                        }
+                        rows.push(KeyedView::new(
+                            format!("inline-{i}"),
+                            inline_view(inline, config, footnote_blocks, on_link),
+                        ));
+                    }
+                }
+            }
+            if !text_buf.is_empty() {
+                rows.push(KeyedView::new(
+                    format!("text-{text_key}"),
+                    View::from(styled_text(text_buf, 14.0, None)),
+                ));
+            }
+            StackPanel::new()
+                .orientation(Orientation::Vertical)
+                .keyed_children(rows)
+        }
         Block::Heading { level, content, .. } => {
             let size = match *level {
                 1 => 28.0,
@@ -246,31 +278,15 @@ fn block_view(
             ),
         Block::EmbedBlock(embed) => {
             // `![[image.png]]` alone on its line is an embed block. A local
-            // vault raster renders inline via a `file:///` URI; everything
-            // else (note transclusion, unresolvable targets) stays the
-            // placeholder until transclusion renders real note bodies.
+            // vault raster renders inline; everything else (note
+            // transclusion, unresolvable targets) stays the placeholder
+            // until transclusion renders real note bodies.
             if config.show_images {
                 if let Some(resolve) = config.image_resolver.as_ref() {
                     if let Some(path) = resolve(&embed.target.note) {
-                        let uri = format!("file:///{}", path.replace('\\', "/"));
-                        return match Image::new().source(uri) {
-                            Ok(image) => View::from(
-                                image
-                                    .stretch(Stretch::Uniform)
-                                    .max_width(600.0)
-                                    .min_height(150.0),
-                            ),
-                            Err(_) => match fs::read(&path) {
-                                Ok(bytes) => View::from(
-                                    Image::new()
-                                        .source_data(EncodedImage::new(bytes))
-                                        .stretch(Stretch::Uniform)
-                                        .max_width(600.0)
-                                        .min_height(150.0),
-                                ),
-                                Err(_) => View::from(TextBlock::new().text("(embedded note)")),
-                            },
-                        };
+                        return local_image_view(&path, |_| {
+                            TextBlock::new().text("(embedded note)").into()
+                        });
                     }
                 }
             }
@@ -365,6 +381,38 @@ fn styled_text(text: String, size: f64, font_weight: Option<FontWeight>) -> Text
         block = block.font_weight(weight);
     }
     block
+}
+
+/// A local vault raster as an [`Image`].
+///
+/// `Image::source_file` builds the `file:///` URI the way WinUI expects:
+/// the path's separators become `/` and every character the URI grammar
+/// reserves — spaces above all — is percent-encoded. Hand-building the URI
+/// left `Nothing Tweet.png` as a literal space, so the bitmap never loaded
+/// and the control kept its reserved height while painting nothing (the
+/// Windows frontend's blank inline images). The encoded-bytes fallback
+/// covers a URI the runtime refuses and paths whose bytes it cannot open.
+fn local_image_view(path: &str, fallback: impl FnOnce(&str) -> View) -> View {
+    fn sized(image: Image) -> View {
+        View::from(
+            image
+                .stretch(Stretch::Uniform)
+                .max_width(600.0)
+                .min_height(150.0)
+                .width(300.0)
+                .height(200.0),
+        )
+    }
+    // `source_file` builds a percent-encoded `file:///` URI. On real Windows
+    // the bitmap loads asynchronously; `source_data` is the fallback when the
+    // URI is refused or the file can't be read as bytes.
+    match Image::new().source_file(path) {
+        Ok(image) => sized(image),
+        Err(_) => match fs::read(path) {
+            Ok(bytes) => sized(Image::new().source_data(EncodedImage::new(bytes))),
+            Err(_) => fallback(path),
+        },
+    }
 }
 
 /// Render a block for the Live pane. Prose (paragraphs, headings) renders
@@ -585,43 +633,21 @@ fn inline_view_with_style(
             }
         }
         Inline::Image { url, alt } => {
-            // A local vault raster renders inline via a `file:///` URI — the
-            // WinUI backend handles `ImageValue::Uri` (not `EncodedImage`),
-            // so `source_data` is a no-op on real Windows. The resolver
-            // returns a canonical path; we build the URI and try `source`
-            // first, falling back to `source_data` (which works in test
-            // environments where `Uri::CreateUri` is unavailable).
+            // A local vault raster renders inline; the fallback keeps the
+            // alt text visible when the bytes cannot be read. Remote URLs
+            // and non-raster targets stay text placeholders.
             match config
                 .show_images
                 .then_some(config.image_resolver.as_ref())
                 .flatten()
             {
                 Some(resolve) => match resolve(url) {
-                    Some(path) => {
-                        let uri = format!("file:///{}", path.replace('\\', "/"));
-                        match Image::new().source(uri) {
-                            Ok(image) => View::from(
-                                image
-                                    .stretch(Stretch::Uniform)
-                                    .max_width(600.0)
-                                    .min_height(150.0),
-                            ),
-                            Err(_) => match fs::read(&path) {
-                                Ok(bytes) => View::from(
-                                    Image::new()
-                                        .source_data(EncodedImage::new(bytes))
-                                        .stretch(Stretch::Uniform)
-                                        .max_width(600.0)
-                                        .min_height(150.0),
-                                ),
-                                Err(_) => View::from(styled_text(
-                                    format!("[img: {alt}]"),
-                                    size,
-                                    font_weight,
-                                )),
-                            },
-                        }
-                    }
+                    Some(path) => local_image_view(&path, |resolved| {
+                        // A raster that resolved but cannot be read still
+                        // says so, with the file name for context.
+                        let name = resolved.rsplit(['/', '\\']).next().unwrap_or(resolved);
+                        View::from(styled_text(format!("[img: {name}]"), size, font_weight))
+                    }),
                     None => View::from(styled_text(format!("[img: {alt}]"), size, font_weight)),
                 },
                 None => {
@@ -641,29 +667,9 @@ fn inline_view_with_style(
             if config.show_images {
                 if let Some(resolve) = config.image_resolver.as_ref() {
                     if let Some(path) = resolve(&embed.target.note) {
-                        let uri = format!("file:///{}", path.replace('\\', "/"));
-                        return match Image::new().source(uri) {
-                            Ok(image) => View::from(
-                                image
-                                    .stretch(Stretch::Uniform)
-                                    .max_width(600.0)
-                                    .min_height(150.0),
-                            ),
-                            Err(_) => match fs::read(&path) {
-                                Ok(bytes) => View::from(
-                                    Image::new()
-                                        .source_data(EncodedImage::new(bytes))
-                                        .stretch(Stretch::Uniform)
-                                        .max_width(600.0)
-                                        .min_height(150.0),
-                                ),
-                                Err(_) => View::from(styled_text(
-                                    String::from("(embed)"),
-                                    size,
-                                    font_weight,
-                                )),
-                            },
-                        };
+                        return local_image_view(&path, |_| {
+                            View::from(styled_text(String::from("(embed)"), size, font_weight))
+                        });
                     }
                 }
             }
@@ -1121,14 +1127,16 @@ mod tests {
             size: None,
             alias: None,
         })]);
-        let mut renderer = WindowsMarkdownRenderer::default();
-        renderer.image_resolver = Some(Rc::new(|url| {
-            if url == "image.png" {
-                Some("C:\\Users\\Caleb Smith\\Desktop\\vault-test\\image.png".to_string())
-            } else {
-                None
-            }
-        }));
+        let renderer = WindowsMarkdownRenderer {
+            image_resolver: Some(Rc::new(|url| {
+                if url == "image.png" {
+                    Some("C:\\Users\\Caleb Smith\\Desktop\\vault-test\\image.png".to_string())
+                } else {
+                    None
+                }
+            })),
+            ..Default::default()
+        };
         let mut pump = Pump::new(RecordingRuntime::default());
         let on_link = |_nav: LinkNav| Callback::new(|()| ());
         pump.mount_view(doc_view(&doc, &renderer, None, &on_link))
@@ -1156,6 +1164,19 @@ mod tests {
         assert!(
             find_image_source(rt, window).is_some(),
             "embed block renders an Image node with a source"
+        );
+        // The URI must encode reserved characters: the resolver's path has
+        // a space in it, and a literal space made the bitmap fail to load
+        // (blank images on real Windows).
+        let image = find_image_source(rt, window).expect("image node");
+        assert_eq!(
+            rt.node(image)
+                .expect("image node")
+                .property(PropertyId::ImageSource),
+            Some(&PropertyValue::Str(String::from(
+                "file:///C:/Users/Caleb%20Smith/Desktop/vault-test/image.png"
+            ))),
+            "the image URI percent-encodes the path"
         );
     }
 

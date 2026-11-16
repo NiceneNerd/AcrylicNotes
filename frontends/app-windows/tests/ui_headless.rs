@@ -1140,7 +1140,7 @@ fn headless_shell_live_click_focuses_a_block_editor() {
         rt,
         window,
         PropertyId::RichEditBoxDocument,
-        &|v| matches!(v, PropertyValue::Str(text) if text == "alpha\n"),
+        &|v| matches!(v, PropertyValue::Str(text) if text == "alpha\r"),
     )
     .expect("the focused block's editor is mounted");
     // The editor carries the region's source (block + trailing blank line).
@@ -1148,12 +1148,127 @@ fn headless_shell_live_click_focuses_a_block_editor() {
         rt.node(editor)
             .unwrap()
             .property(PropertyId::RichEditBoxDocument),
-        Some(&PropertyValue::Str(String::from("alpha\n")))
+        Some(&PropertyValue::Str(String::from("alpha\r")))
     );
     // The buffer is untouched until an edit lands.
     let borrowed = app.borrow();
     let tab = borrowed.shared.state.tabs.id_of("a.md").unwrap();
     assert_eq!(borrowed.buffers[&tab].text, "alpha\n\nbeta\n");
+}
+
+#[test]
+fn headless_shell_live_crlf_echo_of_the_programmatic_sync_is_suppressed() {
+    // Real WinRT text controls report the document's line breaks as `\r`
+    // (the `ITextDocument` model): the echo of the `\n`-shaped SetText at
+    // focus arrives `\r`-shaped and must not be spliced back as a real
+    // edit — the echo used to progressively merge the paragraphs after
+    // the edited block into it (real-Windows: clicking a block "swallowed"
+    // the rest of the file). The echo payload is also dropped whole so
+    // lone-\r paragraphs (GetText joins paragraphs with \r) normalize to
+    // the note's LF shape.
+    let app = shell_app_with(&[("a.md", "alpha\n\nbeta\n\ngamma\n")]);
+    shell_open_tab(
+        &app,
+        "a.md",
+        "alpha\n\nbeta\n\ngamma\n",
+        "alpha\n\nbeta\n\ngamma\n",
+    );
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_node_with_property_text(rt, window, PropertyId::AutomationName, "edit region 0")
+            .expect("block click target recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    let window = pump.window().expect("window node");
+    let editor = {
+        let rt = pump.runtime();
+        find_node_with_property(
+            rt,
+            window,
+            PropertyId::RichEditBoxDocument,
+            &|v| matches!(v, PropertyValue::Str(text) if text.starts_with("alpha")),
+        )
+        .expect("focused editor recorded")
+    };
+    // The native echo of the mount's SetText: `\r`-shaped line breaks,
+    // plus the document's final paragraph mark (set `"alpha\r"`, get
+    // `"alpha\r\r"` back).
+    let revision = pump
+        .event_revision(editor, EventId::RichEditBoxTextChanged)
+        .expect("rich-edit text-changed event active");
+    pump.queue_event(QueuedEvent::new(
+        editor,
+        EventId::RichEditBoxTextChanged,
+        revision,
+        EventPayload::Str(String::from("alpha\r\r")),
+    ));
+    pump.dispatch_events().expect("dispatch events");
+    pump.dispatch_components(10).expect("dispatch components");
+
+    // The buffer is untouched — the echo was recognized and dropped.
+    let borrowed = app.borrow();
+    let tab = borrowed.shared.state.tabs.id_of("a.md").unwrap();
+    assert_eq!(
+        borrowed.buffers[&tab].text, "alpha\n\nbeta\n\ngamma\n",
+        "the programmatic-sync echo must not reach the buffer"
+    );
+}
+
+#[test]
+fn headless_shell_live_a_real_crlf_edit_lands_normalized() {
+    // A genuine user edit arrives `\r`-shaped (the WinRT text model) and
+    // must land in the buffer with the note's `\n` line endings: the
+    // multi-paragraph region's lines stay separate lines.
+    let app = shell_app_with(&[("a.md", "- one\n- two\n\npara\n")]);
+    shell_open_tab(
+        &app,
+        "a.md",
+        "- one\n- two\n\npara\n",
+        "- one\n- two\n\npara\n",
+    );
+
+    let mut pump = mounted_shell(&app);
+    let window = pump.window().expect("window node");
+    let target = {
+        let rt = pump.runtime();
+        find_node_with_property_text(rt, window, PropertyId::AutomationName, "edit region 0")
+            .expect("block click target recorded")
+    };
+    click(&mut pump, target, EventId::ButtonClick);
+
+    let window = pump.window().expect("window node");
+    let editor = {
+        let rt = pump.runtime();
+        find_node_with_property(
+            rt,
+            window,
+            PropertyId::RichEditBoxDocument,
+            &|v| matches!(v, PropertyValue::Str(text) if text.starts_with("- one")),
+        )
+        .expect("focused editor recorded")
+    };
+    let revision = pump
+        .event_revision(editor, EventId::RichEditBoxTextChanged)
+        .expect("rich-edit text-changed event active");
+    pump.queue_event(QueuedEvent::new(
+        editor,
+        EventId::RichEditBoxTextChanged,
+        revision,
+        EventPayload::Str(String::from("- one\r- two edited\r\r")),
+    ));
+    pump.dispatch_events().expect("dispatch events");
+    pump.dispatch_components(10).expect("dispatch components");
+
+    let borrowed = app.borrow();
+    let tab = borrowed.shared.state.tabs.id_of("a.md").unwrap();
+    assert_eq!(
+        borrowed.buffers[&tab].text, "- one\n- two edited\n\npara\n",
+        "the edit landed normalized: LF breaks, other blocks intact"
+    );
 }
 
 #[test]
@@ -1205,6 +1320,7 @@ fn headless_shell_live_typing_splices_into_the_note() {
         borrowed.buffers[&tab].text, "alphas\n\nbeta\n",
         "the region splice keeps the rest of the note"
     );
+    drop(borrowed);
 }
 
 #[test]
