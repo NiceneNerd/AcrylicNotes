@@ -1,13 +1,14 @@
 # AGENTS.md — Vault Notes (AcrylicNotes)
 
 Guidance for coding agents working in this repository. Read this before touching code,
-alongside `HANDOFF.md`, `COMPAT.md`, and `docs/feature-inventory.md` / `docs/parity.md`.
+alongside `HANDOFF.md` and `COMPAT.md`.
 
 ## 1. Project identity
 
 **Vault Notes** is a lightweight, Obsidian-compatible Markdown notes app written in Rust.
 It opens an existing Obsidian vault and renders notes, wikilinks, tags, footnotes,
-callouts, embeds, etc. Out of scope for v1: graph view, plugin system, live preview (M6).
+callouts, embeds, etc. Graph view and the plugin system are intentionally not planned
+as part of the lightweight goals.
 
 Three layers; only the last depends on a GUI toolkit:
 
@@ -15,9 +16,9 @@ Three layers; only the last depends on a GUI toolkit:
 2. `vault-md` — comrak parse + Obsidian extensions → IR (`Doc`/`Block`/`Inline`). The IR
    is the contract between frontends: an IR→HTML renderer (web) and an IR→widgets
    renderer (GUI) both consume `Doc`.
-3. Frontends: `app` (libcosmic GUI), `vault-web` (axum, server-rendered HTML, no JS),
-   `frontends/app-windows` (WinUI 3). Glass lives in the small `vault-glass` crate behind
-   a `Backdrop` trait.
+3. Frontends: `app` (libcosmic GUI, built on Linux and Windows) and `vault-web`
+   (axum, server-rendered HTML, no JS). Glass lives in the small `vault-glass` crate
+   behind a `Backdrop` trait.
 
 ## 2. Repository layout (workspace)
 
@@ -31,10 +32,9 @@ Three layers; only the last depends on a GUI toolkit:
 | `vault-glass` | Backdrop trait + per-OS impls. |
 | `vault-core` | UI-free vault. |
 | `vault-md` | Markdown pipeline. |
-| `app` | libcosmic GUI (network/git deps). |
+| `app` | libcosmic GUI (network/git deps; Linux and Windows). |
 | `vault-web` | Read-only web server. |
 | `xtask` | Maintenance tasks. |
-| `frontends/app-windows` | WinUI 3 frontend. |
 
 `default-members` excludes `app` (libcosmic/iced git deps), so plain `cargo` commands
 build/test the UI-free layers only. Use `--workspace` where network/git deps are available.
@@ -65,7 +65,7 @@ Toolchain: Rust 1.100 (no rust-toolchain pin checked in; CI uses `dtolnay/rust-t
 - Format: `cargo fmt --all -- --check` (CI). The historical gate uses a subset:
   `cargo fmt -p vault-glass -p vault-core -p vault-md -p app -p vault-web`.
 - Clippy: `cargo clippy --workspace -- -D warnings`
-  (cross-target: `cargo clippy --target x86_64-pc-windows-gnu -p app-windows --tests -- -D warnings`).
+  (cross-target: `cargo clippy --target x86_64-pc-windows-gnu -p vault-core -p vault-md -p vault-app -p vault-platform --tests -- -D warnings`).
 - Tests (UI-free): `cargo test --workspace --no-fail-fast` (default members exclude `app`).
 - Tests including GUI: `cargo test -p app` (needs network/git).
 - Windows cross-compile shared crates:
@@ -75,17 +75,14 @@ xtask (`cargo run -p xtask -- <cmd>`):
 
 - `check-shared` / `test-shared` / `test-linux` / `build-linux`
 - `test-windows-core [target]`
-- `check-windows-ui [target]`
-- `test-windows-ui [target]` (builds app-windows tests, runs under Wine)
-- `test-windows-native [target] [ui]` (real Windows over SSH)
+- `test-windows-native [target]` (real Windows over SSH)
 - `parity-report`
 
 Binaries:
 
 - `cargo run -p vault-core --bin vault -- index|resolve|backlinks <dir> ...`
 - `cargo run -p vault-web -- [VAULT_PATH] [--port N] [--bind ADDR] [--token T] [--no-auth]`
-- `cargo run -p app` (libcosmic GUI)
-- `cargo run -p app-windows` (Windows; compiles to a skeleton off-Windows)
+- `cargo run -p app` (libcosmic GUI; Linux and Windows)
 
 Windows cross tooling: `cross` (Docker, `:main` windows-gnu image) or local mingw + wine
 (`.cargo/config.toml` sets linker/runner). `Cross.toml` pins the windows-gnu image to `:main`.
@@ -94,8 +91,8 @@ Windows cross tooling: `cross` (Docker, `:main` windows-gnu image) or local ming
 
 - Linux: libcosmic with `wayland` feature; glass via Wayland `ext-background-effect-v1`
   (compositor-dependent; X11 probes Opaque).
-- Windows: `window-vibrancy` Mica/Acrylic/blur; app-windows needs Windows 11 for WinUI
-  (hard-links `AddPackageDependency`).
+- Windows: the same libcosmic app builds with `winit` and `accesskit` dropped;
+  `window-vibrancy` Mica/Acrylic/blur; requires Windows 11 for glass.
 - macOS: untested (no machine/SDK).
 - libcosmic pinned commit `95236a944bfd51c63a2fc65fe50a592c47168d40` (2026-10-27);
   vendors iced (pinned submodule). Per-target feature selection: `wayland` on Linux,
@@ -114,14 +111,14 @@ Windows cross tooling: `cross` (Docker, `:main` windows-gnu image) or local ming
 - `vault-md/tests/golden/` holds input `.md` → expected `.html` pairs; regenerate with
   `UPDATE_EXPECT=1`.
 - The NFD-filename test is `#[cfg_attr(windows, ignore)]` (Wine rejects combining chars).
-- Headless Windows UI tests run under Wine via `RecordingRuntime`; real rendering/IME/DPI/
-  packaging verification is user-side only.
+- Windows builds the same libcosmic GUI; cross-target checks run under `cargo
+  xtask test-windows-core`. Real rendering/IME/DPI/packaging verification on
+  Windows is user-side only.
 
 ## 7. Configuration & paths
 
 - App settings: `$XDG_CONFIG_HOME/vault-handoff/settings.json` (pretty, atomic tmp+rename,
   corrupt/missing → defaults, unknown keys ignored, per-change load-modify-store).
-  Fields documented in `docs/feature-inventory.md` (SET-*).
 - Vault's `.obsidian/daily-notes.json` drives daily notes; `.obsidian/app.json`
   `strictLineBreaks` is honored at render time.
 - `last_vault` is restored on startup if the dir exists.
@@ -134,16 +131,12 @@ Windows cross tooling: `cross` (Docker, `:main` windows-gnu image) or local ming
   no links in math, raw HTML literal, block refs, tag boundaries, heading anchors,
   math vs currency, sanitization, embed depth 3, etc.).
 - `HANDOFF.md` — original architecture decisions, milestones M0–M6, working rules.
-- `docs/feature-inventory.md` — parity IDs (WIN/VAULT/PLAT/TAB/EDIT/PANE/NAV/TREE/LINK/
-  SAVE/SET/DLG/MISC/STATUS) with source references.
-- `docs/parity.md` — cross-platform parity matrix (Linux reference vs Windows status).
 
 ## 9. Agent-specific guidance
 
 - Prefer editing shared crates (`vault-app`, `vault-core`, `vault-md`, `vault-platform`) so
   both frontends benefit; frontend shells should only orchestrate.
-- When adding behavior, add to `vault_app` view models/reducer and update both the cosmic
-  and Windows shells.
+- When adding behavior, add to `vault_app` view models/reducer and update the shell.
 - Keep the `vault-md` IR stable; renderers consume `Doc`.
 - Web security: every user-controlled path goes through the single guard (`..`/dotfile
   rejection + canonicalize + must stay in vault root); CSP + `nosniff`; raw HTML through

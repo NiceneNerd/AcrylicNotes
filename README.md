@@ -1,10 +1,14 @@
-# Acrylic Notes
+# Vault Notes (AcrylicNotes)
 
-![Rust](https://img.shields.io/badge/language-Rust-orange?style=flat-square)
-![Status](https://img.shields.io/badge/status-vibe--coded--slop-red?style=flat-square)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue?style=flat-square)
+A lightweight, Obsidian-compatible Markdown notes app written in Rust. It opens
+an existing Obsidian vault and renders notes, wikilinks, tags, footnotes,
+callouts, embeds, and more — with frosted-glass ("glass") window backdrops on
+Linux (COSMIC/Wayland) and Windows (Mica/Acrylic).
 
-## ⚠️🛑🚨 VIBE-CODED SLOP WARNING 🚨🛑⚠️
+Graph view and the plugin system are intentionally not planned as part of the
+lightweight goals.
+
+# ⚠️🛑🚨 VIBE-CODED SLOP WARNING 🚨🛑⚠️
 
 This software is **almost entirely** produced by LLMs. As I have long said, AI agents are very curious tools: it's like having a highly talented assistant with ADD and substance abuse issues. So why do I use them? Well, they can accomplish quite a bit, even if poorly, and my condition of life no longer permits me quite so much time for involved programming projects as I once had. In particular, I have an excellent wife, seven children, several chickens (fewer every week, though), and an honestly-more-than-full-time job as a humanities teacher at a classical Christian school. I love this life and render thanks to God for it daily, but it does put limits on how much code I can crank out.
 
@@ -12,59 +16,106 @@ Thus, clankers to the rescue. They can do an awful lot in the time it would take
 
 Do be suspicious of this work. Feel free to add human review. You don't have to trust the clankers. My only assurance is that, if I bothered posting a README, it probably means the output was good enough to satisfy my own daily use.
 
----
-
-### What is this?
-
-Acrylic Notes is a lightweight, Obsidian-compatible Markdown notes app written in Rust. It opens an existing Obsidian vault and renders notes, wikilinks, tags, footnotes, callouts, embeds, etc.
-
-Specifically chosen exclusions: **graph view, plugin system.**
+## Architecture
 
 Three layers; only the last depends on a GUI toolkit:
 
-1. `vault-core` — scan, watch, index, resolve, frontmatter, atomic writes, CLI. UI-free.
-2. `vault-md` — comrak parse + Obsidian extensions → IR (`Doc`/`Block`/`Inline`). The IR is the contract between frontends.
-3. Frontends: `app` (libcosmic GUI), `vault-web` (axum, server-rendered HTML, no JS), `frontends/app-windows` (WinUI 3).
+1. **`vault-core`** — UI-free vault: scan, file watching (`notify`), in-memory
+   index, wikilink resolution, frontmatter handling, atomic/safe writes, CLI.
+2. **`vault-md`** — comrak parse plus Obsidian extensions, lowered into a
+   frontend-neutral IR (`Doc`/`Block`/`Inline`). The IR is the contract between
+   frontends: an IR→HTML renderer (web) and an IR→widgets renderer (GUI).
+3. **Frontends**:
+   - `app` — libcosmic GUI, built on Linux (Wayland glass via
+     `ext-background-effect-v1`) and Windows (Mica/Acrylic via
+     `window-vibrancy`; build with `accesskit` dropped)
+   - `vault-web` — read-only axum web server (server-rendered HTML, no JS, no webview)
 
----
+Supporting crates: `vault-glass` (a `Backdrop` trait with per-OS impls),
+`crates/vault-app` (GUI-free application kernel: state, commands, view models),
+`crates/vault-platform` + `crates/vault-platform-linux` (platform service
+contracts as traits + plain-data DTOs), and `xtask` (maintenance tasks).
 
-### Key features
+### Core principles
 
-- **Obsidian-compatible vault reader.** Points at your existing `.md` vault. Does not touch `.obsidian/`.
-- **Wikilinks, tags, footnotes, callouts, embeds.** Rendered through a shared intermediate representation (`Doc`/`Block`/`Inline`).
-- **Atomic writes.** Temp file in same directory, then rename. Frontmatter bytes preserved verbatim. Line endings preserved (CRLF vs LF).
-- **In-memory index.** Rebuilt at startup, kept fresh by a `notify` watcher. No database in v1.
-- **No graph view.** Out of scope.
-- **No plugin system.** Out of scope.
-- **Settings** at `$XDG_CONFIG_HOME/vault-handoff/settings.json` (pretty, atomic tmp+rename, corrupt/missing → defaults, unknown keys ignored).
-- **CLI:** `cargo run -p vault-core --bin vault -- index|resolve|backlinks <dir> ...`
-- **Web server:** `cargo run -p vault-web -- [VAULT_PATH] [--port N] [--bind ADDR] [--token T] [--no-auth]`
+- **Files are the source of truth.** Never re-serialize what the user did not
+  edit: frontmatter bytes are kept verbatim, line endings (CRLF/LF) preserved,
+  writes are atomic (temp file + rename), and external modification is detected
+  before saving (mtime/size/hash).
+- **Never write into `.obsidian/`** — read it selectively (attachment folder,
+  link format, daily-notes settings). App UI state lives in the OS config dir.
+- **Index in memory**, rebuilt at startup, kept fresh by a watcher. No database.
+- **No webview** for rendering.
 
----
+## Workspace layout
 
-### Architecture
+| Member | Purpose |
+| --- | --- |
+| `crates/vault-app` | GUI-free application kernel (state, commands, effects, view models) |
+| `crates/vault-platform` | Platform service contracts (traits + DTOs) |
+| `crates/vault-platform-linux` | Linux adapters (xdg-open, Wayland glass probe) |
+| `vault-glass` | `Backdrop` trait + per-OS implementations |
+| `vault-core` | UI-free vault (scan/watch/index/resolve/save/CLI) |
+| `vault-md` | Markdown pipeline: comrak + Obsidian extensions → IR + HTML renderer |
+| `app` | libcosmic GUI |
+| `vault-web` | Read-only web server |
+| `xtask` | Maintenance tasks (cross-tests, parity report) |
 
-- Files are the source of truth. Never re-serialize what the user did not edit.
-- `vault-core` and `vault-md` stay free of GUI dependencies.
-- `vault-app` never depends on libcosmic, iced, windows, windows-reactor, HWND/COM types, or any frontend message enum.
-- Platform services cross `vault-platform` traits only: DTOs are plain data, signatures are synchronous, every fallible op returns an explicit `Result`.
-- Avoid a webview for rendering.
+`default-members` excludes `app` (libcosmic/iced git dependencies), so plain
+`cargo` commands build and test the UI-free layers only. Use `--workspace` where
+network/git dependencies are available.
 
----
+## Requirements
 
-### Build / test / lint commands
+- Rust 1.100 (stable toolchain)
+- Linux GUI: libcosmic with the `wayland` feature (pinned commit); glass on
+  Wayland is compositor-dependent (X11 probes Opaque)
+- Windows GUI: the same libcosmic app builds on Windows (with `winit` and
+  `accesskit` dropped); requires Windows 11 for Mica/Acrylic glass
+- Key dependency versions: comrak 0.59, axum 0.8, nucleo 0.5
 
-Toolchain: Rust 1.100.
+## Building and running
 
+```sh
+# UI-free layers (default members)
+cargo build
+cargo test --workspace --no-fail-fast
+
+# GUI app (needs network for git deps)
+cargo run -p app                 # libcosmic GUI (Linux and Windows)
+
+# Read-only web server (defaults to the GUI's last-used vault)
+cargo run -p vault-web -- [VAULT_PATH] [--port N] [--bind ADDR] [--token T] [--no-auth]
+
+# CLI
+cargo run -p vault-core --bin vault -- index|resolve|backlinks <dir> ...
 ```
+
+Formatting and linting:
+
+```sh
 cargo fmt --all -- --check
 cargo clippy --workspace -- -D warnings
-cargo test --workspace --no-fail-fast
-cargo test -p app-windows
-cargo run -p app-windows
-cargo run -p vault-web -- [VAULT_PATH]
 ```
 
-Note: `cargo test --workspace --no-fail-fast` fails for two pre-existing, unrelated reasons: `vault-md --test golden` (CRLF vs LF golden mismatch) and `vault-platform-linux --lib` (`true` program not found on Windows). Use default members instead; `app` (libcosmic) fails to compile due to a pre-existing `accesskit_winit` git dependency error.
+Windows cross-compilation of the shared crates uses `cross` (Docker) or local
+mingw + Wine; see `.cargo/config.toml`, `Cross.toml`, and the `xtask` commands
+(`cargo run -p xtask -- check-shared|test-shared|test-linux|build-linux|test-windows-core|parity-report`).
 
-Windows cross-compile: `cross` (Docker, `:main` windows-gnu image) or local mingw + wine. `.cargo/config.toml` sets linker/runner.
+## Compatibility
+
+- `COMPAT.md` — confirmed Obsidian behaviors (verified against real Obsidian)
+  vs. documented assumptions: footnote numbering, tag indexing, ambiguous
+  basename resolution, aliases, escaped wikilinks, embed depth, sanitization,
+  and more.
+- `HANDOFF.md` — original architecture decisions and milestones M0–M6.
+- `AGENTS.md` — guidance for coding agents working in this repository.
+
+## Testing
+
+- Fixtures in `tests/fixtures/` are golden data — copy to a temp dir before
+  mutating.
+- `vault-md/tests/golden/` holds input `.md` → expected `.html` pairs;
+  regenerate with `UPDATE_EXPECT=1`.
+- Headless Windows UI tests run under Wine; real rendering/IME/DPI/packaging
+  verification on Windows is user-side.

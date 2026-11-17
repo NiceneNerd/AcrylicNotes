@@ -9,13 +9,14 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use cosmic::app::ApplicationExt;
 use cosmic::app::{Core, Task};
 use cosmic::iced::core::widget::Id;
 use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
 use cosmic::iced::widget::image::Handle as ImageHandle;
 use cosmic::iced::widget::text_editor::{self, Action, Content, Cursor, Edit, Motion, Position};
-use cosmic::iced::Color;
 use cosmic::iced::window::{Icon, Id as WindowId};
+use cosmic::iced::Color;
 use cosmic::widget::{icon, nav_bar, segmented_button};
 use vault_app::commands::UiCommand;
 
@@ -1597,10 +1598,17 @@ impl VaultNotes {
     }
 
     /// Push the current window title to the platform.
+    ///
+    /// Must go through the `Application::set_window_title` trait method so
+    /// the title reaches the xdg-toplevel (and thus the app switcher).
+    /// `core.set_title` is a no-op in this libcosmic build.
     fn sync_window_title(&mut self) -> Task<Message> {
         let title = self.window_title();
         self.core.set_header_title(title.clone());
-        self.core.set_title(None, title)
+        match self.core.main_window_id() {
+            Some(id) => self.set_window_title(title, id),
+            None => Task::none(),
+        }
     }
 
     /// The path being renamed inline in the sidebar tree, if any.
@@ -3696,16 +3704,20 @@ impl cosmic::Application for VaultNotes {
         let persisted = settings::load();
 
         // Load and set the window icon from embedded bytes.
-        let icon_task = Task::perform(async {
-            // Embedded PNG bytes (1254x1254); decode and downscale to 256x256 for the
-            // window icon (typical taskbar/titlebar size).
-            let png_bytes = include_bytes!("../icon.png");
-            let img = image::load_from_memory(png_bytes).expect("valid icon png");
-            let img = img.resize(256, 256, image::imageops::FilterType::Lanczos3);
-            let rgba = img.to_rgba8();
-            let (width, height) = rgba.dimensions();
-            cosmic::iced::window::icon::from_rgba(rgba.into_raw(), width, height).expect("valid icon rgba")
-        }, |icon| cosmic::Action::App(Message::SetWindowIcon(icon)));
+        let icon_task = Task::perform(
+            async {
+                // Embedded PNG bytes (1254x1254); decode and downscale to 256x256 for the
+                // window icon (typical taskbar/titlebar size).
+                let png_bytes = include_bytes!("../icon.png");
+                let img = image::load_from_memory(png_bytes).expect("valid icon png");
+                let img = img.resize(256, 256, image::imageops::FilterType::Lanczos3);
+                let rgba = img.to_rgba8();
+                let (width, height) = rgba.dimensions();
+                cosmic::iced::window::icon::from_rgba(rgba.into_raw(), width, height)
+                    .expect("valid icon rgba")
+            },
+            |icon| cosmic::Action::App(Message::SetWindowIcon(icon)),
+        );
 
         let mut app = Self {
             core,
@@ -3763,7 +3775,6 @@ impl cosmic::Application for VaultNotes {
             nav_model: build_nav_model(),
             pane_model: build_pane_model(persisted.default_pane),
         };
-        app.core.set_header_title("Vault Notes".to_string());
         // The rendered pane starts at the persisted default (the shared
         // kernel owns the pane state; this routes through the reducer).
         app.set_pane(persisted.default_pane);
@@ -3776,6 +3787,9 @@ impl cosmic::Application for VaultNotes {
             crate::glass::plan(persisted.glass_enabled, app.appearance.preferred_backdrop());
 
         let mut tasks = Vec::new();
+        // Set the initial window title via the trait method so it reaches
+        // the xdg-toplevel and the app switcher (core.set_title is a no-op).
+        tasks.push(app.sync_window_title());
         tasks.push(icon_task);
         tasks.push(theme_task(persisted.theme));
         if app.glass_style == vault_glass::GlassStyle::Blur {

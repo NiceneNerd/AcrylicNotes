@@ -38,14 +38,14 @@ Three layers; only the last depends on a GUI toolkit.
 3. Frontends: `app` (libcosmic GUI), `serve` (axum, server-rendered HTML,
    no JS). Glass lives in a small `vault-glass` crate behind a trait.
 
-Target workspace layout (the current code is a single crate, `acrylic-notes`):
+Target workspace layout:
 
 ```
 vault-core/   scan, watch, index, resolve, frontmatter, atomic writes, CLI
 vault-md/     ir.rs, inline.rs (extract/lower), ast lowering, html renderer
 vault-glass/  trait Backdrop + per-platform impls
-app/          libcosmic GUI
-serve/        axum read-only server (separate bin or --serve flag)
+app/          libcosmic GUI (Linux and Windows)
+vault-web/    axum read-only web server (server-rendered HTML, no JS)
 ```
 
 Key principles (do not violate):
@@ -260,9 +260,6 @@ Elm-style `Message/update/view`; all logic calls `vault-core`/`vault-md`.
 4. Glass applied through `vault-glass` to chrome only.
 5. Autosave via the safe write path; external-change reload prompt.
 
-Do NOT build Obsidian-style live preview here; it needs a custom editor
-widget and is a separate later project (M6).
-
 ### M5. Read-only web server
 
 axum, same core and IR, server-rendered HTML, no JS. Routes: `/n/*path`,
@@ -271,10 +268,10 @@ confine every path to the vault root; deny dotfiles and `.obsidian`; bind
 127.0.0.1 by default; optional token auth; sanitize HTML; add tests for path
 traversal (`..`, encoded `..`, symlinks out of the vault).
 
-### M6. Optional: live preview
+### M6. Live preview (implemented)
 
 Custom editor widget that renders Markdown inline when the cursor is not on
-a line. Only after M0-M5 are solid.
+a line. Ships with v1; no longer optional or deferred.
 
 ## 6. Obsidian features to cover (checklist for tests)
 
