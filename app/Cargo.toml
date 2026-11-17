@@ -28,6 +28,8 @@ serde-saphyr = "2"
 # word delete finds the same word boundaries the editor's own motion
 # finds. Already in the tree through cosmic-text.
 unicode-segmentation = "1"
+# For decoding the app icon at runtime (embedded via include_bytes!).
+image = { version = "0.25", features = ["png"] }
 
 # libcosmic (and its vendored iced submodule) come from git so the build does
 # not depend on a local checkout. Pinned libcosmic commit:
@@ -43,21 +45,29 @@ unicode-segmentation = "1"
 # libcosmic exposes no `iced/image` feature, so image *decoding* for
 # `cosmic::iced::widget::image` is not available at this pinned commit.
 [dependencies.libcosmic]
+# TEMPORARY TEST: original pop-os libcosmic at 95236a9 (with .expect())
 git = "https://github.com/pop-os/libcosmic.git"
 rev = "95236a944bfd51c63a2fc65fe50a592c47168d40"
 default-features = false
-features = ["wgpu", "tokio", "a11y", "highlighter"]
+# NOTE: `a11y` (accesskit) is intentionally NOT in the base feature set.
+# Cargo unifies (cannot subtract) features across the base + target-specific
+# libcosmic specs, so `a11y` must live only under the Linux target override.
+# This keeps accessibility on Linux while disabling it on Windows, where
+# accesskit is the suspected blocker for a working build/run under Wine.
+features = ["wgpu", "tokio", "highlighter"]
 
-# Per-target feature selection (see HANDOFF.md 4.1): Wayland on Linux,
-# winit everywhere else. `cargo tree --target <triple> -e features` shows the
-# result.
+# Per-target feature selection (see HANDOFF.md 4.1): Wayland + a11y on Linux,
+# winit everywhere else (a11y/accesskit disabled on Windows).
+# `cargo tree --target <triple> -e features` shows the result.
 [target.'cfg(target_os = "linux")'.dependencies.libcosmic]
+# TEMPORARY TEST: original pop-os libcosmic at 95236a9 (with .expect())
 git = "https://github.com/pop-os/libcosmic.git"
 rev = "95236a944bfd51c63a2fc65fe50a592c47168d40"
 default-features = false
-features = ["wayland", "dbus-config", "highlighter"]
+features = ["wayland", "dbus-config", "a11y", "highlighter"]
 
 [target.'cfg(not(target_os = "linux"))'.dependencies.libcosmic]
+# TEMPORARY TEST: original pop-os libcosmic at 95236a9 (with .expect())
 git = "https://github.com/pop-os/libcosmic.git"
 rev = "95236a944bfd51c63a2fc65fe50a592c47168d40"
 default-features = false

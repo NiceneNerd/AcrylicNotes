@@ -15,6 +15,7 @@ use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
 use cosmic::iced::widget::image::Handle as ImageHandle;
 use cosmic::iced::widget::text_editor::{self, Action, Content, Cursor, Edit, Motion, Position};
 use cosmic::iced::Color;
+use cosmic::iced::window::{Icon, Id as WindowId};
 use cosmic::widget::{icon, nav_bar, segmented_button};
 use vault_app::commands::UiCommand;
 
@@ -456,6 +457,8 @@ pub enum Message {
     WindowResized(f32),
     /// The reading view was clicked: the zoom shortcuts now act on it.
     ReadingClicked,
+    /// Set the window icon (fired once at startup from init).
+    SetWindowIcon(Icon),
     SettingsTheme(settings::ThemeChoice),
     SettingsDefaultPane(PaneMode),
     SettingsHideMdExt(bool),
@@ -1594,8 +1597,10 @@ impl VaultNotes {
     }
 
     /// Push the current window title to the platform.
-    fn sync_window_title(&self) -> Task<Message> {
-        self.core.set_title(None, self.window_title())
+    fn sync_window_title(&mut self) -> Task<Message> {
+        let title = self.window_title();
+        self.core.set_header_title(title.clone());
+        self.core.set_title(None, title)
     }
 
     /// The path being renamed inline in the sidebar tree, if any.
@@ -3689,6 +3694,19 @@ impl cosmic::Application for VaultNotes {
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
         // One settings read feeds every persisted field.
         let persisted = settings::load();
+
+        // Load and set the window icon from embedded bytes.
+        let icon_task = Task::perform(async {
+            // Embedded PNG bytes (1254x1254); decode and downscale to 256x256 for the
+            // window icon (typical taskbar/titlebar size).
+            let png_bytes = include_bytes!("../icon.png");
+            let img = image::load_from_memory(png_bytes).expect("valid icon png");
+            let img = img.resize(256, 256, image::imageops::FilterType::Lanczos3);
+            let rgba = img.to_rgba8();
+            let (width, height) = rgba.dimensions();
+            cosmic::iced::window::icon::from_rgba(rgba.into_raw(), width, height).expect("valid icon rgba")
+        }, |icon| cosmic::Action::App(Message::SetWindowIcon(icon)));
+
         let mut app = Self {
             core,
             vault: None,
@@ -3758,6 +3776,7 @@ impl cosmic::Application for VaultNotes {
             crate::glass::plan(persisted.glass_enabled, app.appearance.preferred_backdrop());
 
         let mut tasks = Vec::new();
+        tasks.push(icon_task);
         tasks.push(theme_task(persisted.theme));
         if app.glass_style == vault_glass::GlassStyle::Blur {
             // Ask the compositor for the frosted window; visibility still
@@ -3906,6 +3925,11 @@ impl cosmic::Application for VaultNotes {
             Message::WindowResized(width) => {
                 self.apply_window_width(width);
                 Task::none()
+            }
+            Message::SetWindowIcon(icon) => {
+                // Set the window icon using iced's runtime. The main window
+                // uses the reserved ID (see libcosmic's iced_settings).
+                cosmic::iced::window::set_icon(WindowId::RESERVED, icon)
             }
             Message::ReadingClicked => {
                 // The reading view has the focus now: the zoom shortcuts
