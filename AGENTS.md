@@ -76,7 +76,6 @@ xtask (`cargo run -p xtask -- <cmd>`):
 - `check-shared` / `test-shared` / `test-linux` / `build-linux`
 - `test-windows-core [target]`
 - `test-windows-native [target]` (real Windows over SSH)
-- `parity-report`
 
 Binaries:
 

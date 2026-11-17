@@ -100,7 +100,7 @@ cargo clippy --workspace -- -D warnings
 
 Windows cross-compilation of the shared crates uses `cross` (Docker) or local
 mingw + Wine; see `.cargo/config.toml`, `Cross.toml`, and the `xtask` commands
-(`cargo run -p xtask -- check-shared|test-shared|test-linux|build-linux|test-windows-core|parity-report`).
+(`cargo run -p xtask -- check-shared|test-shared|test-linux|build-linux|test-windows-core|test-windows-native`).
 
 ## Compatibility
 
